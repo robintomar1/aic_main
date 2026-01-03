@@ -560,6 +560,7 @@ bool Engine::task_completed_successfully() {
   return true;
 }
 
+//==============================================================================
 void Engine::reset_after_trial() {
   RCLCPP_INFO(node_->get_logger(), "Resetting after trial completion...");
 
@@ -603,15 +604,142 @@ Engine::~Engine() {
 //==============================================================================
 bool Engine::spawn_task_board(double x, double y, double z, double roll,
                               double pitch, double yaw) {
+  if (!active_trial_.has_value()) {
+    RCLCPP_ERROR(node_->get_logger(), "No active trial to get config from");
+    return false;
+  }
+
   // Get the task board xacro file path
   const std::string aic_description_share =
       ament_index_cpp::get_package_share_directory("aic_description");
   const std::string xacro_file =
       aic_description_share + "/urdf/task_board.urdf.xacro";
 
-  // Convert xacro to URDF using xacro command (without pose args)
+  // Read task board limits from config
+  const auto& config_root = active_trial_->config;
+  double nic_rail_min = -0.048;  // Default values
+  double nic_rail_max = 0.036;
+  double sc_rail_min = -0.055;
+  double sc_rail_max = 0.055;
+  double mount_rail_min = -0.09625;
+  double mount_rail_max = 0.09625;
+
+  if (config_root["task_board_limits"]) {
+    const auto& limits = config_root["task_board_limits"];
+    if (limits["nic_rail"]) {
+      nic_rail_min = limits["nic_rail"]["min_translation"].as<double>();
+      nic_rail_max = limits["nic_rail"]["max_translation"].as<double>();
+    }
+    if (limits["sc_rail"]) {
+      sc_rail_min = limits["sc_rail"]["min_translation"].as<double>();
+      sc_rail_max = limits["sc_rail"]["max_translation"].as<double>();
+    }
+    if (limits["mount_rail"]) {
+      mount_rail_min = limits["mount_rail"]["min_translation"].as<double>();
+      mount_rail_max = limits["mount_rail"]["max_translation"].as<double>();
+    }
+  }
+
+  // Build xacro command with parameters from config
   std::stringstream cmd;
   cmd << "xacro " << xacro_file;
+
+  const auto& task_board_config = active_trial_->config["scene"]["task_board"];
+
+  // Add NIC rail parameters (nic_rail_0 through nic_rail_4)
+  for (int i = 0; i < 5; ++i) {
+    std::string rail_key = "nic_rail_" + std::to_string(i);
+    std::string mount_prefix = "nic_card_mount_" + std::to_string(i);
+
+    if (task_board_config[rail_key] &&
+        task_board_config[rail_key]["entity_present"] &&
+        task_board_config[rail_key]["entity_present"].as<bool>()) {
+      cmd << " " << mount_prefix << "_present:=true";
+
+      if (task_board_config[rail_key]["entity_pose"]) {
+        const auto& pose = task_board_config[rail_key]["entity_pose"];
+
+        double translation = pose["translation"].as<double>();
+        // Clamp translation to NIC rail limits
+        translation = std::clamp(translation, nic_rail_min, nic_rail_max);
+        cmd << " " << mount_prefix << "_translation:=" << translation;
+
+        // Add orientation parameters
+        double roll = pose["roll"].as<double>();
+        double pitch = pose["pitch"].as<double>();
+        double yaw = pose["yaw"].as<double>();
+        cmd << " " << mount_prefix << "_roll:=" << roll;
+        cmd << " " << mount_prefix << "_pitch:=" << pitch;
+        cmd << " " << mount_prefix << "_yaw:=" << yaw;
+      }
+    } else {
+      cmd << " " << mount_prefix << "_present:=false";
+    }
+  }
+
+  // Add SC rail parameters (sc_rail_0 and sc_rail_1)
+  for (int i = 0; i < 2; ++i) {
+    std::string rail_key = "sc_rail_" + std::to_string(i);
+    std::string port_prefix = "sc_port_" + std::to_string(i);
+
+    if (task_board_config[rail_key] &&
+        task_board_config[rail_key]["entity_present"] &&
+        task_board_config[rail_key]["entity_present"].as<bool>()) {
+      cmd << " " << port_prefix << "_present:=true";
+
+      if (task_board_config[rail_key]["entity_pose"]) {
+        const auto& pose = task_board_config[rail_key]["entity_pose"];
+
+        double translation = pose["translation"].as<double>();
+        // Clamp translation to SC rail limits
+        translation = std::clamp(translation, sc_rail_min, sc_rail_max);
+        cmd << " " << port_prefix << "_translation:=" << translation;
+
+        // Add orientation parameters
+        double roll = pose["roll"].as<double>();
+        double pitch = pose["pitch"].as<double>();
+        double yaw = pose["yaw"].as<double>();
+        cmd << " " << port_prefix << "_roll:=" << roll;
+        cmd << " " << port_prefix << "_pitch:=" << pitch;
+        cmd << " " << port_prefix << "_yaw:=" << yaw;
+      }
+    } else {
+      cmd << " " << port_prefix << "_present:=false";
+    }
+  }
+
+  // Add rail parameters (type-specific rails: lc_mount_rail_0/1,
+  // sfp_mount_rail_0/1, sc_mount_rail_0/1)
+  std::vector<std::string> rail_keys = {"lc_mount_rail_0",  "sfp_mount_rail_0",
+                                        "sc_mount_rail_0",  "lc_mount_rail_1",
+                                        "sfp_mount_rail_1", "sc_mount_rail_1"};
+
+  for (const auto& rail_key : rail_keys) {
+    if (task_board_config[rail_key] &&
+        task_board_config[rail_key]["entity_present"] &&
+        task_board_config[rail_key]["entity_present"].as<bool>()) {
+      cmd << " " << rail_key << "_present:=true";
+
+      if (task_board_config[rail_key]["entity_pose"]) {
+        const auto& pose = task_board_config[rail_key]["entity_pose"];
+
+        double translation = pose["translation"].as<double>();
+        // Clamp translation to mount rail limits
+        translation = std::clamp(translation, mount_rail_min, mount_rail_max);
+        cmd << " " << rail_key << "_translation:=" << translation;
+
+        // Add orientation parameters
+        double roll = pose["roll"].as<double>();
+        double pitch = pose["pitch"].as<double>();
+        double yaw = pose["yaw"].as<double>();
+        cmd << " " << rail_key << "_roll:=" << roll;
+        cmd << " " << rail_key << "_pitch:=" << pitch;
+        cmd << " " << rail_key << "_yaw:=" << yaw;
+      }
+    } else {
+      cmd << " " << rail_key << "_present:=false";
+    }
+  }
 
   FILE* pipe = popen(cmd.str().c_str(), "r");
   if (!pipe) {
