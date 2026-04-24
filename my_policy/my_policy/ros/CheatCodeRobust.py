@@ -37,33 +37,41 @@ from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
 class CheatCodeRobust(Policy):
     """Ground-truth-TF insertion oracle tuned for randomized configs."""
 
-    # Primary XY correction is now feedforward from the measured
-    # plug-to-gripper offset (mirrors how Z has always worked in upstream
-    # CheatCode). Integrator only handles small residuals from cable
-    # settling dynamics.
+    # XY correction is integrator-only. Do NOT feedforward
+    # plug_tip_gripper_offset: in XY, the offset tracks cable *lag* during
+    # motion, so commanding gripper=port+offset creates a moving target
+    # that feeds back on itself — gripper runs, cable lags more, offset
+    # grows, command more motion. Z is fine (offset is static / gravity).
     INTEGRATOR_GAIN = 0.15
-    MAX_INTEGRATOR_WINDUP = 0.02     # ~3 mm max correction — residuals only
+    MAX_INTEGRATOR_WINDUP = 0.10     # 15 mm max correction — covers typical
+                                     # cable offsets under randomization
 
     # Timing / kinematics.
     APPROACH_Z_OFFSET = 0.2          # start this far above the port along port Z
-    HOVER_Z_OFFSET = 0.05            # hover height during ALIGN phase
+    HOVER_Z_OFFSET = 0.10            # hover height during ALIGN phase — gives
+                                     # genuine clearance above port rim once
+                                     # gripper->plug offset is accounted for
     INSERT_Z_OFFSET = -0.015         # final descent depth (upstream value)
     APPROACH_STEPS = 100
     APPROACH_SLEEP = 0.05            # 100 * 0.05 = 5 s approach
     DESCENT_STEP = 0.0002            # 0.2 mm per tick
     DESCENT_SLEEP = 0.05             # -> 4 mm/s
 
-    # ALIGN phase: gate descent on actual XY convergence, not a fixed dwell.
-    # Scoring tolerance for "inside port" is 5 mm (see docs/scoring.md); we
-    # require plug within 3 mm so the 5 mm chamfer is comfortably inside
-    # reach. The error must stay under the threshold for ALIGN_STABLE_S
-    # consecutive seconds (guards against a transient dip during cable
-    # oscillation). If convergence doesn't happen by ALIGN_TIMEOUT_S we
-    # descend anyway — better a partial insertion than a stall.
-    ALIGN_XY_THRESHOLD_M = 0.003
-    ALIGN_STABLE_S = 0.5
-    ALIGN_TIMEOUT_S = 6.0
+    # ALIGN phase: gate descent on actual XY convergence. Scoring tolerance
+    # is 5 mm; require 5 mm at hover so we're inside the chamfer as we
+    # enter. Stable 1 s to ignore transient oscillation dips.
+    ALIGN_XY_THRESHOLD_M = 0.005
+    ALIGN_STABLE_S = 1.0
+    ALIGN_TIMEOUT_S = 10.0
     ALIGN_POLL_S = 0.05
+
+    # INSERT phase force gate: if contact force exceeds this, pause the
+    # descent so the integrator + cable dynamics re-settle before resuming.
+    # Prevents the "smash and hold" behaviour where the admittance
+    # controller pushes the plug into the port rim at 100+ N.
+    FORCE_STOP_N = 10.0
+    FORCE_RESUME_N = 6.0
+    FORCE_HOLD_MAX_S = 2.0
 
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
@@ -74,6 +82,20 @@ class CheatCodeRobust(Policy):
     # ------------------------------------------------------------------
     # TF helpers
     # ------------------------------------------------------------------
+    def _refresh_port_transform(
+        self, port_frame: str, last_good: Transform
+    ) -> Transform:
+        """Re-read the port transform from TF so alignment follows any pose
+        changes (board jitter, residual orientation drift). Falls back to
+        last_good on transient TF failure so the descent loop keeps running.
+        """
+        try:
+            stamped = self._parent_node._tf_buffer.lookup_transform(
+                "base_link", port_frame, Time())
+            return stamped.transform
+        except TransformException:
+            return last_good
+
     def _wait_for_tf(
         self, target_frame: str, source_frame: str, timeout_sec: float = 10.0
     ) -> bool:
@@ -177,19 +199,11 @@ class CheatCodeRobust(Policy):
                 self.MAX_INTEGRATOR_WINDUP,
             )
 
-        # Feedforward: cancel the gripper->plug lever so the plug lands at
-        # the port. Same principle as target_z has always used. Integrator
-        # handles residuals only (cable settling / motion lag).
-        target_x = (
-            port_xy[0]
-            + plug_tip_gripper_offset[0]
-            + self.INTEGRATOR_GAIN * self._tip_x_error_integrator
-        )
-        target_y = (
-            port_xy[1]
-            + plug_tip_gripper_offset[1]
-            + self.INTEGRATOR_GAIN * self._tip_y_error_integrator
-        )
+        # Z feedforward: static offset (gravity-dominated), safe to apply.
+        # XY: integrator only — see MAX_INTEGRATOR_WINDUP comment above for
+        # why feedforward is unstable in XY.
+        target_x = port_xy[0] + self.INTEGRATOR_GAIN * self._tip_x_error_integrator
+        target_y = port_xy[1] + self.INTEGRATOR_GAIN * self._tip_y_error_integrator
         target_z = port_transform.translation.z + z_offset - plug_tip_gripper_offset[2]
 
         blend_xyz = (
@@ -265,6 +279,7 @@ class CheatCodeRobust(Policy):
         stable_since = None
         converged = False
         while self.time_now() < align_timeout:
+            port_transform = self._refresh_port_transform(port_frame, port_transform)
             try:
                 self.set_pose_target(
                     move_robot=move_robot,
@@ -301,14 +316,51 @@ class CheatCodeRobust(Policy):
                 f"ALIGN timeout after {self.ALIGN_TIMEOUT_S}s — descending anyway. "
                 f"Last xy_err: {xy_err * 1000:.1f} mm")
 
-        # --- INSERT: slow descent with continuous plug-tip re-read ------
-        # By calling _calc_gripper_pose every tick, the plug-tip TF is
-        # re-read, so plug_tip_gripper_offset reflects the *current* cable
-        # swing state, and the integrator sees the real error.
+        # --- INSERT: slow descent with force-feedback gate. When the
+        # compensated wrist wrench exceeds FORCE_STOP_N, hold the current
+        # z_offset (don't advance) so the integrator and cable dynamics
+        # re-settle. Resume advancing once force drops below FORCE_RESUME_N
+        # or FORCE_HOLD_MAX_S elapses (to avoid permanent stalls).
         self.get_logger().info("Phase: INSERT")
         z_offset = self.HOVER_Z_OFFSET
+        hold_start = None
+        force_stopped_count = 0
         while z_offset > self.INSERT_Z_OFFSET:
-            z_offset -= self.DESCENT_STEP
+            # Read compensated wrist wrench.
+            force_mag = 0.0
+            try:
+                obs = get_observation()
+                wr = obs.wrist_wrench.wrench
+                tare = obs.controller_state.fts_tare_offset.wrench
+                fx = wr.force.x - tare.force.x
+                fy = wr.force.y - tare.force.y
+                fz = wr.force.z - tare.force.z
+                force_mag = (fx * fx + fy * fy + fz * fz) ** 0.5
+            except Exception as ex:
+                self.get_logger().warn(f"Obs read failed during insert: {ex}")
+
+            # Force gate: pause advancing z if force is high.
+            now = self.time_now()
+            if hold_start is None and force_mag > self.FORCE_STOP_N:
+                hold_start = now
+                force_stopped_count += 1
+                self.get_logger().info(
+                    f"INSERT: force gate engaged at |F|={force_mag:.1f}N, "
+                    f"z_offset={z_offset * 1000:.1f}mm — holding")
+            elif hold_start is not None:
+                elapsed = (now - hold_start).nanoseconds / 1e9
+                if force_mag < self.FORCE_RESUME_N or elapsed > self.FORCE_HOLD_MAX_S:
+                    self.get_logger().info(
+                        f"INSERT: resuming (|F|={force_mag:.1f}N, held {elapsed:.2f}s)")
+                    hold_start = None
+
+            if hold_start is None:
+                z_offset -= self.DESCENT_STEP
+
+            # Refresh port transform every tick so orientation + position
+            # deltas (board jitter, residual settling) feed into the
+            # commanded gripper pose immediately.
+            port_transform = self._refresh_port_transform(port_frame, port_transform)
             try:
                 self.set_pose_target(
                     move_robot=move_robot,
@@ -318,6 +370,8 @@ class CheatCodeRobust(Policy):
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insert: {ex}")
             self.sleep_for(self.DESCENT_SLEEP)
+        self.get_logger().info(
+            f"INSERT done — force gate engaged {force_stopped_count} times")
 
         self.get_logger().info("Phase: STABILIZE")
         self.sleep_for(5.0)
