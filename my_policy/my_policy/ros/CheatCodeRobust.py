@@ -29,7 +29,9 @@ from aic_model.policy import (
 from aic_task_interfaces.msg import Task
 from geometry_msgs.msg import Point, Pose, Quaternion, Transform
 from rclpy.duration import Duration
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rclpy.time import Time
+from std_msgs.msg import String
 from tf2_ros import TransformException
 from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
 
@@ -71,13 +73,37 @@ class CheatCodeRobust(Policy):
     # controller pushes the plug into the port rim at 100+ N.
     FORCE_STOP_N = 10.0
     FORCE_RESUME_N = 6.0
-    FORCE_HOLD_MAX_S = 2.0
+    FORCE_HOLD_MAX_S = 1.0
 
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
         self._task = None
+        # Latched on first "inserted" event; reset at the start of each
+        # insert_cable call so stale events don't bleed across trials.
+        self._inserted_flag = False
         super().__init__(parent_node)
+        # Match the QoS the aic_scoring node advertises
+        # (reliable, volatile, keep_last, depth 10) — same profile we use
+        # in collect_episode.py's BatchMonitor.
+        event_qos = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self._parent_node.create_subscription(
+            String,
+            "/scoring/insertion_event",
+            self._on_insertion_event,
+            event_qos,
+        )
+
+    def _on_insertion_event(self, msg: String) -> None:
+        # Any event on this topic during a trial means the scoring system
+        # has detected insertion. Log the exact string so we can confirm.
+        self.get_logger().info(f"/scoring/insertion_event: {msg.data!r}")
+        self._inserted_flag = True
 
     # ------------------------------------------------------------------
     # TF helpers
@@ -234,6 +260,8 @@ class CheatCodeRobust(Policy):
     ):
         self.get_logger().info(f"CheatCodeRobust.insert_cable() task: {task}")
         self._task = task
+        # Reset insertion-event latch for this trial.
+        self._inserted_flag = False
 
         port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
         cable_tip_frame = f"{task.cable_name}/{task.plug_name}_link"
@@ -316,16 +344,28 @@ class CheatCodeRobust(Policy):
                 f"ALIGN timeout after {self.ALIGN_TIMEOUT_S}s — descending anyway. "
                 f"Last xy_err: {xy_err * 1000:.1f} mm")
 
-        # --- INSERT: slow descent with force-feedback gate. When the
-        # compensated wrist wrench exceeds FORCE_STOP_N, hold the current
-        # z_offset (don't advance) so the integrator and cable dynamics
-        # re-settle. Resume advancing once force drops below FORCE_RESUME_N
-        # or FORCE_HOLD_MAX_S elapses (to avoid permanent stalls).
+        # --- INSERT: slow descent with force gate and insertion_event exit.
+        # PRIMARY exit: the scoring system publishes on /scoring/insertion_event
+        # when it detects full insertion — we subscribed in __init__ and the
+        # callback latches self._inserted_flag. When set, stop descent.
+        # Force gate is defensive only: if contact force exceeds FORCE_STOP_N,
+        # freeze the currently commanded pose (don't recompute against an
+        # in-contact plug_tip) until force drops or hold times out.
         self.get_logger().info("Phase: INSERT")
         z_offset = self.HOVER_Z_OFFSET
         hold_start = None
+        hold_pose = None                # frozen commanded pose during hold
         force_stopped_count = 0
+
         while z_offset > self.INSERT_Z_OFFSET:
+            if self._inserted_flag:
+                self.get_logger().info(
+                    f"INSERT: insertion_event received, exiting at "
+                    f"z_offset={z_offset * 1000:.1f}mm")
+                break
+
+            now = self.time_now()
+
             # Read compensated wrist wrench.
             force_mag = 0.0
             try:
@@ -339,11 +379,17 @@ class CheatCodeRobust(Policy):
             except Exception as ex:
                 self.get_logger().warn(f"Obs read failed during insert: {ex}")
 
-            # Force gate: pause advancing z if force is high.
-            now = self.time_now()
+            # Force gate state machine.
             if hold_start is None and force_mag > self.FORCE_STOP_N:
                 hold_start = now
                 force_stopped_count += 1
+                port_transform = self._refresh_port_transform(
+                    port_frame, port_transform)
+                try:
+                    hold_pose = self._calc_gripper_pose(
+                        port_transform, z_offset=z_offset)
+                except TransformException:
+                    hold_pose = None
                 self.get_logger().info(
                     f"INSERT: force gate engaged at |F|={force_mag:.1f}N, "
                     f"z_offset={z_offset * 1000:.1f}mm — holding")
@@ -353,25 +399,34 @@ class CheatCodeRobust(Policy):
                     self.get_logger().info(
                         f"INSERT: resuming (|F|={force_mag:.1f}N, held {elapsed:.2f}s)")
                     hold_start = None
+                    hold_pose = None
 
+            # Advance z_offset when not holding.
             if hold_start is None:
                 z_offset -= self.DESCENT_STEP
 
-            # Refresh port transform every tick so orientation + position
-            # deltas (board jitter, residual settling) feed into the
-            # commanded gripper pose immediately.
-            port_transform = self._refresh_port_transform(port_frame, port_transform)
+            # Command the gripper. If holding, re-send the frozen pose so
+            # the controller keeps it steady. Otherwise compute fresh.
             try:
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self._calc_gripper_pose(
-                        port_transform, z_offset=z_offset),
-                )
+                if hold_pose is not None:
+                    self.set_pose_target(
+                        move_robot=move_robot, pose=hold_pose)
+                else:
+                    port_transform = self._refresh_port_transform(
+                        port_frame, port_transform)
+                    self.set_pose_target(
+                        move_robot=move_robot,
+                        pose=self._calc_gripper_pose(
+                            port_transform, z_offset=z_offset),
+                    )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insert: {ex}")
+
             self.sleep_for(self.DESCENT_SLEEP)
+
         self.get_logger().info(
-            f"INSERT done — force gate engaged {force_stopped_count} times")
+            f"INSERT done — force gate engaged {force_stopped_count} times, "
+            f"final z_offset={z_offset * 1000:.1f}mm")
 
         self.get_logger().info("Phase: STABILIZE")
         self.sleep_for(5.0)
