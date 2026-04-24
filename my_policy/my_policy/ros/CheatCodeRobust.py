@@ -39,21 +39,24 @@ from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
 class CheatCodeRobust(Policy):
     """Ground-truth-TF insertion oracle tuned for randomized configs."""
 
-    # XY correction is integrator-only. Do NOT feedforward
-    # plug_tip_gripper_offset: in XY, the offset tracks cable *lag* during
-    # motion, so commanding gripper=port+offset creates a moving target
-    # that feeds back on itself — gripper runs, cable lags more, offset
-    # grows, command more motion. Z is fine (offset is static / gravity).
+    # XY correction: PI controller on (port_xy - plug_xy). The P term
+    # reacts immediately to the current error (not accumulated), so the
+    # gripper pulls toward the position that puts the plug at the port.
+    # The I term handles steady-state offset from cable hang.
+    # Keep P < 1 so we don't over-react (at P=1 this becomes v3-style
+    # full feedforward, which was unstable because cable lag fed back on
+    # itself). P=0.5 gives useful immediate correction with stable damping.
+    PROPORTIONAL_GAIN = 0.5
     INTEGRATOR_GAIN = 0.15
-    MAX_INTEGRATOR_WINDUP = 0.10     # 15 mm max correction — covers typical
-                                     # cable offsets under randomization
+    MAX_INTEGRATOR_WINDUP = 0.10     # 15 mm max I correction; typical
+                                     # steady-state cable offset after settling
 
     # Timing / kinematics.
     APPROACH_Z_OFFSET = 0.2          # start this far above the port along port Z
     # Hover height depends on plug length: SFP module is longer than SC plug,
     # needs more clearance above port rim so body doesn't pre-contact.
     HOVER_Z_OFFSET_BY_PLUG = {
-        "sfp": 0.13,
+        "sfp": 0.20,
         "sc": 0.10,
     }
     HOVER_Z_OFFSET_DEFAULT = 0.10
@@ -230,10 +233,20 @@ class CheatCodeRobust(Policy):
             )
 
         # Z feedforward: static offset (gravity-dominated), safe to apply.
-        # XY: integrator only — see MAX_INTEGRATOR_WINDUP comment above for
-        # why feedforward is unstable in XY.
-        target_x = port_xy[0] + self.INTEGRATOR_GAIN * self._tip_x_error_integrator
-        target_y = port_xy[1] + self.INTEGRATOR_GAIN * self._tip_y_error_integrator
+        # XY: PI controller on (port - plug) error. P reacts to current
+        # error immediately so the gripper pulls toward a position that
+        # puts the plug at the port; I handles steady-state offset from
+        # cable hang. See PROPORTIONAL_GAIN / MAX_INTEGRATOR_WINDUP above.
+        target_x = (
+            port_xy[0]
+            + self.PROPORTIONAL_GAIN * tip_x_error
+            + self.INTEGRATOR_GAIN * self._tip_x_error_integrator
+        )
+        target_y = (
+            port_xy[1]
+            + self.PROPORTIONAL_GAIN * tip_y_error
+            + self.INTEGRATOR_GAIN * self._tip_y_error_integrator
+        )
         target_z = port_transform.translation.z + z_offset - plug_tip_gripper_offset[2]
 
         blend_xyz = (
