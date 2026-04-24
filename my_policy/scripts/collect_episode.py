@@ -54,7 +54,7 @@ RECORD_TOPICS = [
     "/tf_static",
 ]
 
-CHEATCODE_POLICY = "aic_example_policies.ros.CheatCode"
+DEFAULT_POLICY = "my_policy.ros.CheatCodeRobust"
 TF_HEARTBEAT_TIMEOUT_S = 30.0  # if /tf goes silent this long, assume eval died
 
 
@@ -97,12 +97,12 @@ class BatchMonitor(Node):
         self.last_tf_time = time.monotonic()
 
 
-def start_model(log_path: Path) -> subprocess.Popen:
+def start_model(log_path: Path, policy: str) -> subprocess.Popen:
     cmd = [
         "ros2", "run", "aic_model", "aic_model",
         "--ros-args",
         "-p", "use_sim_time:=true",
-        "-p", f"policy:={CHEATCODE_POLICY}",
+        "-p", f"policy:={policy}",
     ]
     log = open(log_path, "w")
     return subprocess.Popen(
@@ -165,6 +165,8 @@ def main() -> int:
                    help="Hard watchdog timeout (default 2h).")
     p.add_argument("--warm-up-s", type=float, default=180.0,
                    help="Max time to wait for /tf to appear from the eval container.")
+    p.add_argument("--policy", type=str, default=DEFAULT_POLICY,
+                   help="Dotted import path for the policy class.")
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -189,7 +191,8 @@ def main() -> int:
     print("[orchestrator] /tf seen — eval is up.", flush=True)
 
     # Phase 2: start model + recorder.
-    model = start_model(logs_dir / "model.log")
+    print(f"[orchestrator] Policy: {args.policy}", flush=True)
+    model = start_model(logs_dir / "model.log", args.policy)
     time.sleep(3.0)
     recorder = start_recorder(bag_dir, logs_dir / "recorder.log")
     print(f"[orchestrator] model pid={model.pid} recorder pid={recorder.pid}",
