@@ -63,8 +63,8 @@ class CheatCodeRobust(Policy):
     INSERT_Z_OFFSET = -0.015         # final descent depth (upstream value)
     APPROACH_STEPS = 100
     APPROACH_SLEEP = 0.05            # 100 * 0.05 = 5 s approach
-    DESCENT_STEP = 0.0001            # 0.1 mm per tick
-    DESCENT_SLEEP = 0.05             # -> 2 mm/s (graceful insertion descent)
+    DESCENT_STEP = 0.0002            # 0.2 mm per tick
+    DESCENT_SLEEP = 0.05             # -> 4 mm/s (graceful insertion descent)
 
     # ALIGN phase: gate descent on actual XY convergence. Scoring tolerance
     # is 5 mm; require 5 mm at hover so we're inside the chamfer as we
@@ -74,13 +74,25 @@ class CheatCodeRobust(Policy):
     ALIGN_TIMEOUT_S = 10.0
     ALIGN_POLL_S = 0.05
 
-    # INSERT phase force gate: if contact force exceeds this, pause the
-    # descent so the integrator + cable dynamics re-settle before resuming.
-    # Prevents the "smash and hold" behaviour where the admittance
-    # controller pushes the plug into the port rim at 100+ N.
-    FORCE_STOP_N = 10.0
-    FORCE_RESUME_N = 6.0
+    # INSERT phase force gate. Thresholds sit just below the scoring
+    # penalty cutoff (>20 N for >1 s = -12 pts). Setting STOP at 18 N
+    # means normal chamfer-entry forces of 10-15 N don't trigger a hold
+    # at all — we only react to genuine smashing. Once engaged, we need
+    # force to drop back near the noise floor to resume, so FORCE_RESUME_N
+    # is kept tight relative to STOP (hysteresis prevents chatter but the
+    # gate stays usable — too high a resume threshold and we never exit).
+    FORCE_STOP_N = 18.0
+    FORCE_RESUME_N = 12.0
     FORCE_HOLD_MAX_S = 1.0
+
+    # When the force gate engages we not only freeze Z — we also slowly
+    # *retreat* upward during the hold. This disengages the plug from
+    # whatever it's stuck on (typically the port rim), letting force
+    # drop below FORCE_RESUME_N so the gate can release cleanly. On
+    # resume, z_offset is set to the retreated value so the commanded
+    # gripper pose doesn't snap back down.
+    HOLD_RETREAT_STEP = 0.0001       # 2 mm/s retreat at 50 ms tick
+    HOLD_RETREAT_MAX = 0.005         # cap retreat per single hold at 5 mm
 
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
@@ -380,7 +392,8 @@ class CheatCodeRobust(Policy):
         self.get_logger().info("Phase: INSERT")
         z_offset = hover_z
         hold_start = None
-        hold_z_offset = None             # z_offset frozen at entry to hold
+        hold_z_offset = None             # commanded Z during hold (retreats upward)
+        hold_entry_z_offset = None       # z_offset at the moment of hold entry
         force_stopped_count = 0
 
         while z_offset > self.INSERT_Z_OFFSET:
@@ -407,21 +420,35 @@ class CheatCodeRobust(Policy):
 
             # Force gate state machine.
             if hold_start is None and force_mag > self.FORCE_STOP_N:
-                # Enter HOLD. Freeze Z (hold_z_offset), but XY integrator
-                # will continue to update via _calc_gripper_pose below.
+                # Enter HOLD. Freeze z_offset at its current value but
+                # retreat the commanded Z upward during the hold so the
+                # plug disengages from whatever it's jammed on. XY
+                # integrator keeps running via _calc_gripper_pose.
                 hold_start = now
+                hold_entry_z_offset = z_offset
                 hold_z_offset = z_offset
                 force_stopped_count += 1
                 self.get_logger().info(
                     f"INSERT: force gate engaged at |F|={force_mag:.1f}N, "
-                    f"z_offset={z_offset * 1000:.1f}mm — holding Z, XY free")
+                    f"z_offset={z_offset * 1000:.1f}mm — retreating Z, XY free")
             elif hold_start is not None:
+                # Retreat upward (increase z_offset) to disengage the plug,
+                # capped at HOLD_RETREAT_MAX from the entry point.
+                if (hold_z_offset - hold_entry_z_offset) < self.HOLD_RETREAT_MAX:
+                    hold_z_offset += self.HOLD_RETREAT_STEP
+
                 elapsed = (now - hold_start).nanoseconds / 1e9
                 if force_mag < self.FORCE_RESUME_N or elapsed > self.FORCE_HOLD_MAX_S:
+                    # Resume descent from the retreated position so the
+                    # commanded pose doesn't snap back down on release.
+                    retreat_mm = (hold_z_offset - hold_entry_z_offset) * 1000
                     self.get_logger().info(
-                        f"INSERT: resuming (|F|={force_mag:.1f}N, held {elapsed:.2f}s)")
+                        f"INSERT: resuming (|F|={force_mag:.1f}N, held {elapsed:.2f}s, "
+                        f"retreated {retreat_mm:.1f}mm)")
+                    z_offset = hold_z_offset
                     hold_start = None
                     hold_z_offset = None
+                    hold_entry_z_offset = None
 
             # Advance z_offset when not holding.
             if hold_start is None:
