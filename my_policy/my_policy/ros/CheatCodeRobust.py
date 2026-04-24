@@ -37,9 +37,12 @@ from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
 class CheatCodeRobust(Policy):
     """Ground-truth-TF insertion oracle tuned for randomized configs."""
 
-    # Integrator authority — the single biggest reliability lever.
-    INTEGRATOR_GAIN = 0.2
-    MAX_INTEGRATOR_WINDUP = 0.15
+    # Integrator authority — keep wide range for reliability but moderate
+    # gain so the correction trajectory is smooth. Without force-feedback
+    # stop, a high gain causes overshoot and the controller holds the
+    # commanded pose against contact for seconds, producing force penalties.
+    INTEGRATOR_GAIN = 0.15            # upstream value; conservative
+    MAX_INTEGRATOR_WINDUP = 0.15      # ours: widened for large swing errors
 
     # Timing / kinematics.
     APPROACH_Z_OFFSET = 0.2          # start this far above the port along port Z
@@ -47,9 +50,9 @@ class CheatCodeRobust(Policy):
     INSERT_Z_OFFSET = -0.015         # final descent depth (upstream value)
     APPROACH_STEPS = 100
     APPROACH_SLEEP = 0.05            # 100 * 0.05 = 5 s approach
-    ALIGN_DWELL_S = 1.0              # let the cable stop swinging
-    DESCENT_STEP = 0.0002            # 0.2 mm per tick
-    DESCENT_SLEEP = 0.05             # -> 4 mm/s
+    ALIGN_DWELL_S = 2.5              # longer dwell so the integrator converges
+    DESCENT_STEP = 0.0001            # 0.1 mm per tick
+    DESCENT_SLEEP = 0.05             # -> 2 mm/s
 
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
