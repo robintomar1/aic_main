@@ -50,14 +50,18 @@ class CheatCodeRobust(Policy):
 
     # Timing / kinematics.
     APPROACH_Z_OFFSET = 0.2          # start this far above the port along port Z
-    HOVER_Z_OFFSET = 0.10            # hover height during ALIGN phase — gives
-                                     # genuine clearance above port rim once
-                                     # gripper->plug offset is accounted for
+    # Hover height depends on plug length: SFP module is longer than SC plug,
+    # needs more clearance above port rim so body doesn't pre-contact.
+    HOVER_Z_OFFSET_BY_PLUG = {
+        "sfp": 0.13,
+        "sc": 0.10,
+    }
+    HOVER_Z_OFFSET_DEFAULT = 0.10
     INSERT_Z_OFFSET = -0.015         # final descent depth (upstream value)
     APPROACH_STEPS = 100
     APPROACH_SLEEP = 0.05            # 100 * 0.05 = 5 s approach
-    DESCENT_STEP = 0.0002            # 0.2 mm per tick
-    DESCENT_SLEEP = 0.05             # -> 4 mm/s
+    DESCENT_STEP = 0.0001            # 0.1 mm per tick
+    DESCENT_SLEEP = 0.05             # -> 2 mm/s (graceful insertion descent)
 
     # ALIGN phase: gate descent on actual XY convergence. Scoring tolerance
     # is 5 mm; require 5 mm at hover so we're inside the chamfer as we
@@ -263,6 +267,12 @@ class CheatCodeRobust(Policy):
         # Reset insertion-event latch for this trial.
         self._inserted_flag = False
 
+        # Pick the plug-type-specific hover distance.
+        hover_z = self.HOVER_Z_OFFSET_BY_PLUG.get(
+            task.plug_type, self.HOVER_Z_OFFSET_DEFAULT)
+        self.get_logger().info(
+            f"plug_type={task.plug_type!r}, HOVER_Z_OFFSET={hover_z:.3f}m")
+
         port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
         cable_tip_frame = f"{task.cable_name}/{task.plug_name}_link"
 
@@ -312,7 +322,7 @@ class CheatCodeRobust(Policy):
                 self.set_pose_target(
                     move_robot=move_robot,
                     pose=self._calc_gripper_pose(
-                        port_transform, z_offset=self.HOVER_Z_OFFSET),
+                        port_transform, z_offset=hover_z),
                 )
                 plug_tf = self._parent_node._tf_buffer.lookup_transform(
                     "base_link",
@@ -346,15 +356,18 @@ class CheatCodeRobust(Policy):
 
         # --- INSERT: slow descent with force gate and insertion_event exit.
         # PRIMARY exit: the scoring system publishes on /scoring/insertion_event
-        # when it detects full insertion — we subscribed in __init__ and the
-        # callback latches self._inserted_flag. When set, stop descent.
-        # Force gate is defensive only: if contact force exceeds FORCE_STOP_N,
-        # freeze the currently commanded pose (don't recompute against an
-        # in-contact plug_tip) until force drops or hold times out.
+        # when it detects full insertion — the callback latches
+        # self._inserted_flag. When set, stop descent.
+        # Force gate: when contact force exceeds FORCE_STOP_N, freeze the
+        # Z target (don't decrement z_offset) but LET THE XY INTEGRATOR
+        # KEEP RUNNING. This is the key fix for the stuck-at-rim case:
+        # while we wait for force to drop, the integrator keeps correcting
+        # XY alignment, so the plug drifts toward the port axis instead of
+        # sitting misaligned against the rim forever.
         self.get_logger().info("Phase: INSERT")
-        z_offset = self.HOVER_Z_OFFSET
+        z_offset = hover_z
         hold_start = None
-        hold_pose = None                # frozen commanded pose during hold
+        hold_z_offset = None             # z_offset frozen at entry to hold
         force_stopped_count = 0
 
         while z_offset > self.INSERT_Z_OFFSET:
@@ -381,44 +394,38 @@ class CheatCodeRobust(Policy):
 
             # Force gate state machine.
             if hold_start is None and force_mag > self.FORCE_STOP_N:
+                # Enter HOLD. Freeze Z (hold_z_offset), but XY integrator
+                # will continue to update via _calc_gripper_pose below.
                 hold_start = now
+                hold_z_offset = z_offset
                 force_stopped_count += 1
-                port_transform = self._refresh_port_transform(
-                    port_frame, port_transform)
-                try:
-                    hold_pose = self._calc_gripper_pose(
-                        port_transform, z_offset=z_offset)
-                except TransformException:
-                    hold_pose = None
                 self.get_logger().info(
                     f"INSERT: force gate engaged at |F|={force_mag:.1f}N, "
-                    f"z_offset={z_offset * 1000:.1f}mm — holding")
+                    f"z_offset={z_offset * 1000:.1f}mm — holding Z, XY free")
             elif hold_start is not None:
                 elapsed = (now - hold_start).nanoseconds / 1e9
                 if force_mag < self.FORCE_RESUME_N or elapsed > self.FORCE_HOLD_MAX_S:
                     self.get_logger().info(
                         f"INSERT: resuming (|F|={force_mag:.1f}N, held {elapsed:.2f}s)")
                     hold_start = None
-                    hold_pose = None
+                    hold_z_offset = None
 
             # Advance z_offset when not holding.
             if hold_start is None:
                 z_offset -= self.DESCENT_STEP
 
-            # Command the gripper. If holding, re-send the frozen pose so
-            # the controller keeps it steady. Otherwise compute fresh.
+            # Command the gripper. Always recompute via _calc_gripper_pose
+            # so the XY integrator keeps correcting. Z is pinned to the
+            # frozen hold_z_offset during a hold.
+            effective_z = hold_z_offset if hold_start is not None else z_offset
+            port_transform = self._refresh_port_transform(
+                port_frame, port_transform)
             try:
-                if hold_pose is not None:
-                    self.set_pose_target(
-                        move_robot=move_robot, pose=hold_pose)
-                else:
-                    port_transform = self._refresh_port_transform(
-                        port_frame, port_transform)
-                    self.set_pose_target(
-                        move_robot=move_robot,
-                        pose=self._calc_gripper_pose(
-                            port_transform, z_offset=z_offset),
-                    )
+                self.set_pose_target(
+                    move_robot=move_robot,
+                    pose=self._calc_gripper_pose(
+                        port_transform, z_offset=effective_z),
+                )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insert: {ex}")
 
