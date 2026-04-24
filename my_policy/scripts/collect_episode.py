@@ -1,46 +1,51 @@
 #!/usr/bin/env python3
-"""Oracle data-collection orchestrator for AIC.
+"""Batch oracle data-collection runner for AIC.
 
-Runs the CheatCode policy against a pre-generated randomized config, records
-the data needed to train the 3-stage policy (port localizer + aligner + local
-insertion policy), and tags success/failure from /scoring/insertion_event.
+Assumes the eval container is started externally (see run_eval_batch.sh) with
+an N-trial config. This script runs in the dev container and:
+  1. Starts the aic_model node with CheatCode policy.
+  2. Starts a rosbag2 recorder on the training-relevant topics.
+  3. Subscribes to /scoring/insertion_event live and counts events.
+  4. Exits when (a) expected_trials insertion events have fired, OR (b) the
+     hard timeout elapses, OR (c) the eval container stops publishing (heartbeat
+     loss on /tf for >30 s).
+  5. Tears model + recorder down cleanly so the final insertion_event lands
+     in the bag.
 
-Each episode launches three subprocesses:
-  1. aic_gz_bringup.launch.py (Gazebo + aic_adapter + aic_engine + gt TF)
-  2. aic_model with policy=aic_example_policies.ros.CheatCode
-  3. ros2 bag record (MCAP) of the training-relevant topics
+Two-terminal usage:
 
-The engine is configured with shutdown_on_aic_engine_exit:=true, so when it
-finishes all trials in the config it brings the whole launch down — the
-orchestrator detects launch exit and tears the other two subprocesses down.
+    # Host terminal — start eval with our batch config
+    cd aic_docker/aic
+    docker compose run --rm eval \\
+        ground_truth:=true start_aic_engine:=true \\
+        aic_engine_config_file:=/root/aic_results/batch_config.yaml
 
-Usage:
-    pixi run python collect_episode.py --config-dir /path/to/configs \
-        --output-dir /path/to/bags --n-episodes 500
+    # Dev container terminal — run the recorder
+    pixi run python my_policy/scripts/collect_episode.py \\
+        --out-dir /root/ws_aic/src/aic/results/batch_001 \\
+        --expected-trials 20 \\
+        --timeout-s 7200
 
-Each episode writes:
-    <output-dir>/ep_<idx>_<config-hash>/
-        bag/                       # raw mcap bag (deleted after HDF5 build)
-        meta.json                  # config_hash, success, duration_s, times
+The batch config itself is produced by gen_trial_config.py --n-trials <N> --out
+<path>.
 """
 
 import argparse
 import json
 import os
-import random
-import shutil
 import signal
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
 
-# Topics to record per episode. /observations gives us the full time-synced
-# policy-visible state (3 cams + wrench + joint_states + controller_state) at
-# 20 Hz. /tf + /tf_static carry ground-truth port poses (training only,
-# ground_truth:=true). /aic_controller/pose_commands is the oracle's action
-# signal. /scoring/insertion_event tags success.
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import String
+from tf2_msgs.msg import TFMessage
+
+
 RECORD_TOPICS = [
     "/observations",
     "/aic_controller/pose_commands",
@@ -49,43 +54,47 @@ RECORD_TOPICS = [
     "/tf_static",
 ]
 
-DEFAULT_TIMEOUT_S = 300  # hard watchdog; trial time_limit is usually 180 s
-
 CHEATCODE_POLICY = "aic_example_policies.ros.CheatCode"
+TF_HEARTBEAT_TIMEOUT_S = 30.0  # if /tf goes silent this long, assume eval died
 
 
-@dataclass
-class EpisodeResult:
-    episode_idx: int
-    config_path: str
-    config_hash: str
-    bag_path: str
-    success: bool
-    duration_s: float
-    insertion_events: int
-    aborted_reason: str  # "" on success, else reason
+class BatchMonitor(Node):
+    """Subscribes to /scoring/insertion_event + /tf for live progress."""
 
+    def __init__(self):
+        super().__init__("batch_monitor")
+        # Match whatever QoS aic_scoring publishes with. Transient local is
+        # common for latched topics; use reliable volatile as a safer default.
+        events_qos = QoSProfile(
+            depth=10,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        tf_qos = QoSProfile(
+            depth=100,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            String, "/scoring/insertion_event", self._on_event, events_qos)
+        self.create_subscription(
+            TFMessage, "/tf", self._on_tf, tf_qos)
 
-def extract_config_hash(config_path: Path) -> str:
-    """gen_trial_config.py embeds a content hash in the filename."""
-    stem = config_path.stem
-    parts = stem.split("_")
-    return parts[-1] if parts else "unknown"
+        self.event_count = 0
+        self.event_log: list[tuple[float, str]] = []
+        self.last_tf_time: float | None = None
 
+    def _on_event(self, msg: String) -> None:
+        self.event_count += 1
+        t = time.monotonic()
+        self.event_log.append((t, msg.data))
+        self.get_logger().info(
+            f"[event {self.event_count}] {msg.data}")
 
-def start_bringup(config_path: Path, log_path: Path) -> subprocess.Popen:
-    cmd = [
-        "ros2", "launch", "aic_bringup", "aic_gz_bringup.launch.py",
-        "ground_truth:=true",
-        "start_aic_engine:=true",
-        "shutdown_on_aic_engine_exit:=true",
-        f"aic_engine_config_file:={config_path}",
-    ]
-    log = open(log_path, "w")
-    return subprocess.Popen(
-        cmd, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True,  # isolate signal group so we can SIGINT the tree
-    )
+    def _on_tf(self, _msg: TFMessage) -> None:
+        self.last_tf_time = time.monotonic()
 
 
 def start_model(log_path: Path) -> subprocess.Popen:
@@ -135,162 +144,112 @@ def terminate(proc: subprocess.Popen, timeout: float = 10.0) -> None:
                 pass
 
 
-def count_insertion_events(bag_dir: Path) -> int:
-    """Read /scoring/insertion_event from the bag and count events.
-
-    Used only for success labeling. Runs in a helper subprocess so we don't
-    pollute this script's rclpy init with a spinning executor.
-    """
-    # Simple approach: rely on post-processing. For now, return 0 if the bag
-    # isn't readable and let the HDF5 builder parse events properly.
-    # NOTE: a proper implementation reads the MCAP via rosbag2_py.
-    try:
-        import rosbag2_py
-        from rclpy.serialization import deserialize_message
-        from rosidl_runtime_py.utilities import get_message
-    except ImportError:
-        return 0
-
-    reader = rosbag2_py.SequentialReader()
-    reader.open(
-        rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id="mcap"),
-        rosbag2_py.ConverterOptions("", ""),
-    )
-    reader.set_filter(rosbag2_py.StorageFilter(topics=["/scoring/insertion_event"]))
-    type_map = {t.name: get_message(t.type) for t in reader.get_all_topics_and_types()}
-    count = 0
-    while reader.has_next():
-        topic, data, _ = reader.read_next()
-        _ = deserialize_message(data, type_map[topic])
-        count += 1
-    return count
-
-
-def run_episode(
-    episode_idx: int,
-    config_path: Path,
-    output_root: Path,
-    timeout_s: float,
-) -> EpisodeResult:
-    config_hash = extract_config_hash(config_path)
-    ep_dir = output_root / f"ep_{episode_idx:05d}_{config_hash}"
-    ep_dir.mkdir(parents=True, exist_ok=True)
-    bag_dir = ep_dir / "bag"
-    logs_dir = ep_dir / "logs"
-    logs_dir.mkdir(exist_ok=True)
-
-    t_start = time.monotonic()
-    aborted_reason = ""
-
-    bringup = start_bringup(config_path, logs_dir / "bringup.log")
-    # Give Gazebo + controller spawners a head start before model/recorder.
-    time.sleep(15.0)
-    model = start_model(logs_dir / "model.log")
-    # Recorder last — by now the topics exist and QoS handshakes succeed.
-    time.sleep(3.0)
-    recorder = start_recorder(bag_dir, logs_dir / "recorder.log")
-
-    try:
-        # Block until bringup (aic_engine) exits — that is the episode end.
-        while True:
-            if bringup.poll() is not None:
-                break
-            if time.monotonic() - t_start > timeout_s:
-                aborted_reason = f"timeout_{timeout_s:.0f}s"
-                break
-            if model.poll() is not None:
-                aborted_reason = f"model_crash_rc_{model.returncode}"
-                break
-            if recorder.poll() is not None:
-                aborted_reason = f"recorder_crash_rc_{recorder.returncode}"
-                break
-            time.sleep(1.0)
-    finally:
-        # Flush the recorder first so it captures the final insertion_event.
-        terminate(recorder, timeout=15.0)
-        terminate(model, timeout=10.0)
-        terminate(bringup, timeout=15.0)
-
-    duration_s = time.monotonic() - t_start
-
-    insertion_events = 0
-    if bag_dir.exists():
-        try:
-            insertion_events = count_insertion_events(bag_dir)
-        except Exception as exc:
-            aborted_reason = aborted_reason or f"bag_read_failed: {exc}"
-
-    success = aborted_reason == "" and insertion_events > 0
-
-    return EpisodeResult(
-        episode_idx=episode_idx,
-        config_path=str(config_path),
-        config_hash=config_hash,
-        bag_path=str(bag_dir),
-        success=success,
-        duration_s=duration_s,
-        insertion_events=insertion_events,
-        aborted_reason=aborted_reason,
-    )
+def wait_for_first_tf(monitor: BatchMonitor, executor, warm_up_s: float = 120.0) -> bool:
+    """Block until /tf starts publishing (sim is up) or timeout."""
+    deadline = time.monotonic() + warm_up_s
+    while time.monotonic() < deadline:
+        executor.spin_once(timeout_sec=1.0)
+        if monitor.last_tf_time is not None:
+            return True
+    return False
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config-dir", type=Path, required=True,
-                   help="Directory of trial YAML configs from gen_trial_config.py.")
-    p.add_argument("--output-dir", type=Path, required=True,
-                   help="Where to write per-episode bag + meta.")
-    p.add_argument("--n-episodes", type=int, default=1,
-                   help="How many episodes to run.")
-    p.add_argument("--start-idx", type=int, default=0,
-                   help="Starting episode index (useful for resuming).")
-    p.add_argument("--seed", type=int, default=0,
-                   help="RNG seed for config selection order.")
-    p.add_argument("--timeout-s", type=float, default=DEFAULT_TIMEOUT_S,
-                   help="Hard watchdog timeout per episode.")
-    p.add_argument("--keep-bag", action="store_true",
-                   help="Do not delete raw bag after episode (default: delete).")
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--out-dir", type=Path, required=True,
+                   help="Where to write the bag and run metadata.")
+    p.add_argument("--expected-trials", type=int, required=True,
+                   help="How many insertion events to expect before exiting.")
+    p.add_argument("--timeout-s", type=float, default=7200.0,
+                   help="Hard watchdog timeout (default 2h).")
+    p.add_argument("--warm-up-s", type=float, default=180.0,
+                   help="Max time to wait for /tf to appear from the eval container.")
     args = p.parse_args()
 
-    configs = sorted(args.config_dir.glob("trial_*.yaml"))
-    if not configs:
-        print(f"No configs found in {args.config_dir}", file=sys.stderr)
-        return 1
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    bag_dir = args.out_dir / "bag"
+    logs_dir = args.out_dir / "logs"
+    logs_dir.mkdir(exist_ok=True)
 
-    rng = random.Random(args.seed)
-    rng.shuffle(configs)
+    rclpy.init()
+    monitor = BatchMonitor()
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(monitor)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = args.output_dir / "summary.jsonl"
+    # Phase 1: wait for the eval container to come up.
+    print(f"[orchestrator] Waiting up to {args.warm_up_s:.0f}s for /tf from eval...",
+          flush=True)
+    if not wait_for_first_tf(monitor, executor, args.warm_up_s):
+        print("[orchestrator] TIMEOUT: no /tf observed. Is the eval container running?",
+              file=sys.stderr)
+        monitor.destroy_node()
+        rclpy.shutdown()
+        return 2
+    print("[orchestrator] /tf seen — eval is up.", flush=True)
 
-    n_success = 0
-    for i in range(args.n_episodes):
-        ep_idx = args.start_idx + i
-        cfg = configs[ep_idx % len(configs)]
-        print(f"\n==== Episode {ep_idx} / {args.start_idx + args.n_episodes - 1}"
-              f" | config {cfg.name} ====", flush=True)
+    # Phase 2: start model + recorder.
+    model = start_model(logs_dir / "model.log")
+    time.sleep(3.0)
+    recorder = start_recorder(bag_dir, logs_dir / "recorder.log")
+    print(f"[orchestrator] model pid={model.pid} recorder pid={recorder.pid}",
+          flush=True)
 
-        result = run_episode(ep_idx, cfg, args.output_dir, args.timeout_s)
+    t_start = time.monotonic()
+    exit_reason = ""
 
-        with summary_path.open("a") as f:
-            f.write(json.dumps(asdict(result)) + "\n")
+    try:
+        while True:
+            executor.spin_once(timeout_sec=1.0)
 
-        tag = "OK" if result.success else f"FAIL({result.aborted_reason or 'no_insertion'})"
-        print(f"  -> {tag}  duration={result.duration_s:.1f}s"
-              f"  insertions={result.insertion_events}", flush=True)
+            # Success: all expected trials seen.
+            if monitor.event_count >= args.expected_trials:
+                exit_reason = "all_trials_complete"
+                break
 
-        if result.success:
-            n_success += 1
+            # Hard timeout.
+            elapsed = time.monotonic() - t_start
+            if elapsed > args.timeout_s:
+                exit_reason = f"timeout_{args.timeout_s:.0f}s"
+                break
 
-        # Post-process hook would go here: build_hdf5_episode(result.bag_path)
-        # For now, keep the bag so we can iterate on the HDF5 builder separately.
-        if not args.keep_bag and not result.success:
-            # Clean up failed-episode bags to save disk.
-            shutil.rmtree(result.bag_path, ignore_errors=True)
+            # Eval container died (no /tf heartbeat).
+            if monitor.last_tf_time is not None:
+                silent = time.monotonic() - monitor.last_tf_time
+                if silent > TF_HEARTBEAT_TIMEOUT_S:
+                    exit_reason = f"eval_heartbeat_lost_{silent:.0f}s"
+                    break
 
-    print(f"\n==== Done. Success: {n_success}/{args.n_episodes} ====")
-    return 0
+            # Subprocess health.
+            if model.poll() is not None:
+                exit_reason = f"model_crash_rc_{model.returncode}"
+                break
+            if recorder.poll() is not None:
+                exit_reason = f"recorder_crash_rc_{recorder.returncode}"
+                break
+    finally:
+        print(f"[orchestrator] Exit reason: {exit_reason}. Tearing down...", flush=True)
+        # Let recorder drain first so the last event lands in the bag.
+        time.sleep(2.0)
+        terminate(recorder, timeout=20.0)
+        terminate(model, timeout=10.0)
+
+    meta = {
+        "exit_reason": exit_reason,
+        "expected_trials": args.expected_trials,
+        "observed_events": monitor.event_count,
+        "event_log": [(t - t_start, txt) for t, txt in monitor.event_log],
+        "wall_duration_s": time.monotonic() - t_start,
+        "bag_path": str(bag_dir),
+    }
+    (args.out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
+    print(f"[orchestrator] Done. events={monitor.event_count}/{args.expected_trials}"
+          f" reason={exit_reason}", flush=True)
+
+    monitor.destroy_node()
+    rclpy.shutdown()
+    return 0 if monitor.event_count >= args.expected_trials else 1
 
 
 if __name__ == "__main__":

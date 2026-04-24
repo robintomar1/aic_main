@@ -220,6 +220,15 @@ def gen_sc_trial(rng: random.Random, distractor_count: int) -> dict:
     return {"scene": scene, "tasks": tasks}
 
 
+def gen_trial(rng: random.Random, task_type: str, distractor_count: int) -> dict:
+    if task_type == "sfp":
+        return gen_sfp_trial(rng, distractor_count)
+    elif task_type == "sc":
+        return gen_sc_trial(rng, distractor_count)
+    else:
+        raise ValueError(f"unknown task_type: {task_type}")
+
+
 def gen_config(
     template: dict,
     rng: random.Random,
@@ -227,13 +236,29 @@ def gen_config(
     distractor_count: int,
 ) -> dict:
     config = copy.deepcopy(template)
-    if task_type == "sfp":
-        trial = gen_sfp_trial(rng, distractor_count)
-    elif task_type == "sc":
-        trial = gen_sc_trial(rng, distractor_count)
-    else:
-        raise ValueError(f"unknown task_type: {task_type}")
-    config["trials"] = {"trial_1": trial}
+    config["trials"] = {"trial_1": gen_trial(rng, task_type, distractor_count)}
+    return config
+
+
+def gen_batch_config(
+    template: dict,
+    rng: random.Random,
+    n_trials: int,
+    task_type: str,
+    distractor_range: tuple,
+) -> dict:
+    """Pack N randomized trials into one config for batch evaluation.
+
+    aic_engine runs trials sequentially, resetting the scene between each, so
+    this lets us record N episodes in a single eval-container lifecycle.
+    """
+    config = copy.deepcopy(template)
+    trials = {}
+    dmin, dmax = distractor_range
+    for i in range(n_trials):
+        tt = rng.choice(["sfp", "sc"]) if task_type == "mixed" else task_type
+        trials[f"trial_{i + 1}"] = gen_trial(rng, tt, rng.randint(dmin, dmax))
+    config["trials"] = trials
     return config
 
 
@@ -248,21 +273,39 @@ def main() -> None:
     p.add_argument("--template", type=Path,
                    default=Path(__file__).resolve().parents[2] / "aic_engine" / "config" / "sample_config.yaml",
                    help="Template YAML providing scoring/task_board_limits/robot sections.")
-    p.add_argument("--out", type=Path, required=True, help="Output directory for generated config files.")
-    p.add_argument("--n", type=int, default=100, help="Number of configs to generate.")
+    p.add_argument("--out", type=Path, required=True,
+                   help="Output path: directory (per-config mode) OR a file ending in .yaml (batch mode).")
+    p.add_argument("--n", type=int, default=100,
+                   help="Per-config mode: number of single-trial configs to generate.")
+    p.add_argument("--n-trials", type=int, default=None,
+                   help="Batch mode: pack this many random trials into ONE config written to --out (file).")
     p.add_argument("--seed", type=int, default=0, help="Random seed.")
     p.add_argument("--task-type", choices=["sfp", "sc", "mixed"], default="mixed",
-                   help="Which task type(s) to generate. 'mixed' picks per-config uniformly.")
-    p.add_argument("--distractor-min", type=int, default=0, help="Min distractor mounts per config.")
-    p.add_argument("--distractor-max", type=int, default=4, help="Max distractor mounts per config.")
+                   help="Which task type(s) to generate. 'mixed' picks per-trial uniformly.")
+    p.add_argument("--distractor-min", type=int, default=0, help="Min distractor mounts per trial.")
+    p.add_argument("--distractor-max", type=int, default=4, help="Max distractor mounts per trial.")
     args = p.parse_args()
 
     with args.template.open() as f:
         template = yaml.safe_load(f)
 
-    args.out.mkdir(parents=True, exist_ok=True)
     rng = random.Random(args.seed)
 
+    if args.n_trials is not None:
+        # Batch mode: one file, N trials in it.
+        config = gen_batch_config(
+            template, rng, args.n_trials, args.task_type,
+            (args.distractor_min, args.distractor_max),
+        )
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        with args.out.open("w") as f:
+            yaml.safe_dump(config, f, sort_keys=False)
+        print(f"Wrote batch config with {args.n_trials} trials to {args.out} "
+              f"(hash {config_hash(config)})")
+        return
+
+    # Per-config mode: N files, one trial each.
+    args.out.mkdir(parents=True, exist_ok=True)
     for i in range(args.n):
         tt = rng.choice(["sfp", "sc"]) if args.task_type == "mixed" else args.task_type
         distractors = rng.randint(args.distractor_min, args.distractor_max)
