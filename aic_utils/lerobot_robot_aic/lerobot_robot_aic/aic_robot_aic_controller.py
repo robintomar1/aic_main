@@ -34,7 +34,7 @@ from aic_control_interfaces.msg import (
     TrajectoryGenerationMode,
 )
 from aic_control_interfaces.srv import ChangeTargetMode
-from geometry_msgs.msg import Twist, Vector3, Wrench
+from geometry_msgs.msg import Twist, Vector3, Wrench, WrenchStamped
 from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots import Robot, RobotConfig
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -46,7 +46,10 @@ from rclpy.node import Node
 from rclpy.publisher import Publisher
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.subscription import Subscription
+from rclpy.time import Time
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from .aic_robot import aic_cameras, arm_joint_names
 from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
@@ -87,6 +90,49 @@ ObservationState = TypedDict(
 )
 
 
+# Tare-compensated wrench (raw F/T minus controller's tare offset, which is
+# orientation-aware — see reference_aic_ft_sensor.md). 6 floats.
+ObservationWrench = TypedDict(
+    "ObservationWrench",
+    {
+        "wrench.fx": float,
+        "wrench.fy": float,
+        "wrench.fz": float,
+        "wrench.tx": float,
+        "wrench.ty": float,
+        "wrench.tz": float,
+    },
+)
+
+
+# Ground-truth port and plug poses in base_link via /tf (only published with
+# ground_truth:=true; zeros at eval). 7 floats each: position + quaternion.
+# Frame names are configured per-trial via set_active_trial().
+ObservationGroundTruth = TypedDict(
+    "ObservationGroundTruth",
+    {
+        "groundtruth.port_pose.x": float,
+        "groundtruth.port_pose.y": float,
+        "groundtruth.port_pose.z": float,
+        "groundtruth.port_pose.qx": float,
+        "groundtruth.port_pose.qy": float,
+        "groundtruth.port_pose.qz": float,
+        "groundtruth.port_pose.qw": float,
+        "groundtruth.plug_pose.x": float,
+        "groundtruth.plug_pose.y": float,
+        "groundtruth.plug_pose.z": float,
+        "groundtruth.plug_pose.qx": float,
+        "groundtruth.plug_pose.qy": float,
+        "groundtruth.plug_pose.qz": float,
+        "groundtruth.plug_pose.qw": float,
+        # Latched: 1.0 once /scoring/insertion_event "inserted" fires for the
+        # active trial; reset on set_active_trial(). Useful for episode-success
+        # filtering and as the supervisory label for the data collection run.
+        "meta.insertion_success": float,
+    },
+)
+
+
 class CameraImageScaling(TypedDict):
     left_camera: float
     center_camera: float
@@ -123,12 +169,18 @@ class AICRos2Interface:
     joint_motion_update_pub: Publisher[JointMotionUpdate]
     controller_state_sub: Subscription[ControllerState]
     joint_states_sub: Subscription[JointState]
+    wrench_sub: Subscription[WrenchStamped]
+    insertion_event_sub: Subscription[String]
+    tf_buffer: Buffer
+    tf_listener: TransformListener
     logger: RcutilsLogger
 
     @staticmethod
     def connect(
         controller_state_cb: Callable[[ControllerState], None],
         joint_states_cb: Callable[[JointState], None],
+        wrench_cb: Callable[[WrenchStamped], None],
+        insertion_event_cb: Callable[[String], None],
     ) -> "AICRos2Interface":
         if not rclpy.ok():
             rclpy.init()
@@ -163,6 +215,20 @@ class AICRos2Interface:
             JointState, "/joint_states", joint_states_cb, qos_profile_sensor_data
         )
 
+        wrench_sub = node.create_subscription(
+            WrenchStamped, "/fts_broadcaster/wrench", wrench_cb, qos_profile_sensor_data
+        )
+
+        # Latched insertion-success signal published by aic_scoring on full insertion.
+        insertion_event_sub = node.create_subscription(
+            String, "/scoring/insertion_event", insertion_event_cb, 10
+        )
+
+        # TF buffer + listener for ground-truth port/plug pose lookups (only
+        # populated when ground_truth:=true; lookups silently fail at eval).
+        tf_buffer = Buffer()
+        tf_listener = TransformListener(tf_buffer, node)
+
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         executor_thread = Thread(target=executor.spin, daemon=True)
@@ -178,6 +244,10 @@ class AICRos2Interface:
             joint_motion_update_pub=joint_motion_update_pub,
             controller_state_sub=controller_state_sub,
             joint_states_sub=joint_states_sub,
+            wrench_sub=wrench_sub,
+            insertion_event_sub=insertion_event_sub,
+            tf_buffer=tf_buffer,
+            tf_listener=tf_listener,
             logger=logger,
         )
 
@@ -192,6 +262,12 @@ class AICRobotAICController(Robot):
         self.ros2_interface: AICRos2Interface | None = None
         self.last_controller_state: ControllerState | None = None
         self.last_joint_states: JointState | None = None
+        self.last_wrench: WrenchStamped | None = None
+
+        # Per-trial active state (set by recorder via set_active_trial()).
+        self._active_port_frame: str | None = None
+        self._active_plug_frame: str | None = None
+        self._inserted_flag: bool = False
 
         self._is_connected = False
 
@@ -254,7 +330,12 @@ class AICRobotAICController(Robot):
 
     @cached_property
     def observation_features(self) -> dict:
-        return {**ObservationState.__annotations__, **self._cameras_ft}
+        return {
+            **ObservationState.__annotations__,
+            **ObservationWrench.__annotations__,
+            **ObservationGroundTruth.__annotations__,
+            **self._cameras_ft,
+        }
 
     @cached_property
     def action_features(self) -> dict[str, type]:
@@ -283,8 +364,16 @@ class AICRobotAICController(Robot):
         def joint_states_cb(msg: JointState):
             self.last_joint_states = msg
 
+        def wrench_cb(msg: WrenchStamped):
+            self.last_wrench = msg
+
+        def insertion_event_cb(msg: String):
+            # Latch on success; reset is via set_active_trial().
+            if msg.data == "inserted":
+                self._inserted_flag = True
+
         self.ros2_interface = AICRos2Interface.connect(
-            controller_state_cb, joint_states_cb
+            controller_state_cb, joint_states_cb, wrench_cb, insertion_event_cb
         )
 
         change_mode_req = (
@@ -308,6 +397,61 @@ class AICRobotAICController(Robot):
 
     def configure(self) -> None:
         pass  # robot must be configured before running LeRobot
+
+    def set_active_trial(
+        self,
+        port_frame: str | None,
+        plug_frame: str | None,
+    ) -> None:
+        """Configure the active TF frames for the current trial.
+
+        The recorder calls this at trial boundaries. Frames are looked up by
+        name from the TF tree on every observation; pass None to disable.
+        Resets the latched insertion-success flag for the new trial.
+        """
+        self._active_port_frame = port_frame
+        self._active_plug_frame = plug_frame
+        self._inserted_flag = False
+
+    def _compensated_wrench(self) -> tuple:
+        """Returns (fx, fy, fz, tx, ty, tz). Zeros if data not yet available.
+
+        Tare uses the controller's orientation-aware fts_tare_offset, matching
+        the approach in CheatCodeRobust and the recommendation from Rocky's
+        thread on Discourse.
+        """
+        if self.last_wrench is None or self.last_controller_state is None:
+            return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        raw = self.last_wrench.wrench
+        tare = self.last_controller_state.fts_tare_offset.wrench
+        return (
+            raw.force.x - tare.force.x,
+            raw.force.y - tare.force.y,
+            raw.force.z - tare.force.z,
+            raw.torque.x - tare.torque.x,
+            raw.torque.y - tare.torque.y,
+            raw.torque.z - tare.torque.z,
+        )
+
+    def _lookup_pose(self, frame_id: str | None) -> tuple:
+        """Returns (x, y, z, qx, qy, qz, qw) for `base_link -> frame_id`.
+
+        Returns all-zeros if the frame is unset, the lookup fails (TF not
+        ready yet, or frame not in tree at eval time), or the interface is
+        not connected.
+        """
+        if frame_id is None or self.ros2_interface is None:
+            return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        try:
+            t = self.ros2_interface.tf_buffer.lookup_transform(
+                "base_link", frame_id, Time()
+            ).transform
+        except TransformException:
+            return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return (
+            t.translation.x, t.translation.y, t.translation.z,
+            t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w,
+        )
 
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
@@ -376,7 +520,29 @@ class AICRobotAICController(Robot):
             except Exception as e:
                 logger.error(f"Failed to read camera {cam_key}: {e}")
 
-        obs = {**cam_obs, **controller_state_obs}
+        # Tare-compensated wrench (zeros if not yet received).
+        fx, fy, fz, tx, ty, tz = self._compensated_wrench()
+        wrench_obs: ObservationWrench = {
+            "wrench.fx": fx, "wrench.fy": fy, "wrench.fz": fz,
+            "wrench.tx": tx, "wrench.ty": ty, "wrench.tz": tz,
+        }
+
+        # Ground-truth port and plug poses + insertion-success latch.
+        px, py, pz, pqx, pqy, pqz, pqw = self._lookup_pose(self._active_port_frame)
+        gx, gy, gz, gqx, gqy, gqz, gqw = self._lookup_pose(self._active_plug_frame)
+        gt_obs: ObservationGroundTruth = {
+            "groundtruth.port_pose.x": px, "groundtruth.port_pose.y": py,
+            "groundtruth.port_pose.z": pz,
+            "groundtruth.port_pose.qx": pqx, "groundtruth.port_pose.qy": pqy,
+            "groundtruth.port_pose.qz": pqz, "groundtruth.port_pose.qw": pqw,
+            "groundtruth.plug_pose.x": gx, "groundtruth.plug_pose.y": gy,
+            "groundtruth.plug_pose.z": gz,
+            "groundtruth.plug_pose.qx": gqx, "groundtruth.plug_pose.qy": gqy,
+            "groundtruth.plug_pose.qz": gqz, "groundtruth.plug_pose.qw": gqw,
+            "meta.insertion_success": float(self._inserted_flag),
+        }
+
+        obs = {**cam_obs, **controller_state_obs, **wrench_obs, **gt_obs}
         return obs
 
     def send_action_cartesian(self, action: dict[str, Any]) -> None:
