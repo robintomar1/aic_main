@@ -73,6 +73,11 @@ class CheatCodeRobust(Policy):
     ALIGN_STABLE_S = 1.0
     ALIGN_TIMEOUT_S = 10.0
     ALIGN_POLL_S = 0.05
+    # If we time out with residual xy error worse than this, abort the trial
+    # rather than descend into bad alignment (would smash the port and produce
+    # a useless demo for IL training). Set above XY_THRESHOLD so a near-miss
+    # still tries to insert, but a 1+ cm misalignment bails cleanly.
+    ALIGN_BAIL_XY_M = 0.008
 
     # INSERT phase force gate. Thresholds sit just below the scoring
     # penalty cutoff (>20 N for >1 s = -12 pts). Setting STOP at 18 N
@@ -375,9 +380,15 @@ class CheatCodeRobust(Policy):
         if converged:
             self.get_logger().info(f"ALIGN converged (xy_err < {self.ALIGN_XY_THRESHOLD_M * 1000:.1f} mm)")
         else:
+            xy_err_mm = xy_err * 1000 if (xy_err is not None and xy_err < float("inf")) else float("inf")
+            if xy_err is not None and xy_err > self.ALIGN_BAIL_XY_M:
+                self.get_logger().error(
+                    f"ALIGN timeout with xy_err {xy_err_mm:.1f} mm > "
+                    f"{self.ALIGN_BAIL_XY_M * 1000:.1f} mm bail threshold — aborting trial.")
+                return False
             self.get_logger().warn(
                 f"ALIGN timeout after {self.ALIGN_TIMEOUT_S}s — descending anyway. "
-                f"Last xy_err: {xy_err * 1000:.1f} mm")
+                f"Last xy_err: {xy_err_mm:.1f} mm")
 
         # --- INSERT: slow descent with force gate and insertion_event exit.
         # PRIMARY exit: the scoring system publishes on /scoring/insertion_event
