@@ -43,6 +43,10 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Import cv2 BEFORE any ROS / aic_* package — pulling in ros2 message types
+# triggers libtiff load that's incompatible with cv2's libjpeg expectations.
+# Loading cv2 first lets it bring in the version it was built against.
+import cv2  # noqa: F401  (used transitively by lerobot_robot_aic)
 import numpy as np
 import rclpy
 import yaml
