@@ -61,9 +61,8 @@ from tf2_msgs.msg import TFMessage
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.feature_utils import (
     build_dataset_frame,
-    create_initial_features,
-    aggregate_pipeline_dataset_features,
     combine_feature_dicts,
+    hw_to_dataset_features,
 )
 
 from lerobot_robot_aic.aic_robot_aic_controller import (
@@ -235,18 +234,13 @@ def make_or_resume_dataset(
         # Existing dataset: append.
         return LeRobotDataset.resume(repo_id=repo_id, root=str(root))
 
-    # Build the grouped features schema from the robot's flat dicts.
+    # Build the grouped features schema from the robot's flat dicts. The
+    # adapter exposes scalars as `float` and camera images as 3-tuple shapes;
+    # hw_to_dataset_features groups scalars into a vector under <prefix>.state
+    # (or just <prefix> for actions) and creates one image/video feature per cam.
     features = combine_feature_dicts(
-        aggregate_pipeline_dataset_features(
-            pipeline=None,
-            initial_features=create_initial_features(action=robot.action_features),
-            use_videos=True,
-        ),
-        aggregate_pipeline_dataset_features(
-            pipeline=None,
-            initial_features=create_initial_features(observation=robot.observation_features),
-            use_videos=True,
-        ),
+        hw_to_dataset_features(robot.action_features, prefix="action", use_video=True),
+        hw_to_dataset_features(robot.observation_features, prefix="observation", use_video=True),
     )
 
     return LeRobotDataset.create(
