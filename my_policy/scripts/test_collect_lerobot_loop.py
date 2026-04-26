@@ -211,7 +211,8 @@ def _make_trial(plug_type: str, port_name: str, target: str, cable: str) -> dict
     }
 
 
-def _run(trials, events, *, max_episode_s=40.0, max_ticks=20000, tick_dt=0.05):
+def _run(trials, events, *, max_episode_s=40.0, max_ticks=20000, tick_dt=0.05,
+         save_episode_async=None):
     sim_clock = {"t": 0.0}
     monitor = FakeMonitor(sim_clock)
     robot = FakeRobot()
@@ -241,6 +242,7 @@ def _run(trials, events, *, max_episode_s=40.0, max_ticks=20000, tick_dt=0.05):
         tick_pacer=tick_pacer,
         monotonic_fn=monotonic_fn,
         t_global_start=0.0,
+        save_episode_async=save_episode_async,
     )
     return summary, monitor, robot, dataset, log
 
@@ -383,6 +385,74 @@ def test_succeeded_with_insertion_short_trial_is_saved():
     assert dataset.clear_episode_buffer_calls == 0
 
 
+def test_async_save_does_not_drop_next_trial_frames():
+    """REGRESSION (2026-04-26 logs): trial 2's first 116 wall sec were missing
+    because trial 1's save_episode() blocked the recording loop while trial 2
+    was already running in the engine. The save must not steal capture time
+    from the next trial.
+
+    With the new architecture, save handoff goes through `save_episode_async`,
+    which production wraps in a worker thread. The loop continues immediately
+    after handoff. We simulate this by injecting an async-style callable that
+    records frames *without* doing the (slow) dataset.add_frame work — and
+    verify both trials still capture frames.
+
+    The contract being tested: between trial N's terminal and trial N+1's
+    goal_start, the loop must NOT block in the save path. Trial N+1 must get
+    its full sim-time worth of frames.
+    """
+    captured_episodes: list[list[dict]] = []
+
+    def fake_async_save(frames):
+        # Production: hand to worker thread, return immediately. Test: just
+        # snapshot the list and return — zero work on the loop thread.
+        captured_episodes.append(list(frames))
+
+    trials = [
+        _make_trial("sfp", "sfp_port_0", "nic_card_mount_0", "cable_0"),
+        _make_trial("sc", "sc_port_base", "sc_port_1", "cable_1"),
+    ]
+    events = [
+        (0.1, "goal_start", {}),
+        (10.0, "insertion_event", {}),
+        (12.0, "goal_terminate", {"status": _FakeGoalStatus.STATUS_SUCCEEDED}),
+        # Trial 2 starts immediately after trial 1's terminal. With sync save
+        # blocking the loop, frames at the start of trial 2 would be missed.
+        (12.5, "goal_start", {}),
+        (22.0, "insertion_event", {}),
+        (24.0, "goal_terminate", {"status": _FakeGoalStatus.STATUS_SUCCEEDED}),
+    ]
+    summary, _, _, dataset, _ = _run(
+        trials, events, max_episode_s=40.0, save_episode_async=fake_async_save,
+    )
+    assert len(summary["trials"]) == 2
+    assert summary["trials"][0]["outcome"] == "saved_inserted"
+    assert summary["trials"][1]["outcome"] == "saved_inserted"
+    assert len(captured_episodes) == 2, captured_episodes
+    # Both trials must have captured frames. If the loop blocks during
+    # save, trial 2's frame count drops to ~0.
+    assert len(captured_episodes[0]) > 0, "trial 0 produced no frames"
+    assert len(captured_episodes[1]) > 0, "trial 1 produced no frames"
+    # When the saver is fully async (zero-cost handoff), trial 2 should
+    # capture roughly the same number of frames as trial 1 (~10 sim sec
+    # of recording each, same tick rate). Assert they're within 30% — large
+    # margin because the test scenario clock is coarse.
+    n0, n1 = len(captured_episodes[0]), len(captured_episodes[1])
+    ratio = min(n0, n1) / max(n0, n1)
+    assert ratio > 0.7, (
+        f"trial 1 frame count diverges too much from trial 0 ({n0} vs {n1}); "
+        f"likely the loop is blocking during save"
+    )
+    # Critical: dataset.add_frame is NEVER called by the loop in the new
+    # architecture (frames go to pending_frames → save_episode_async).
+    # The fake_async_save above doesn't touch the dataset, so its buffer
+    # should be empty and save_episode_calls should be 0.
+    assert dataset.save_episode_calls == 0, (
+        "the loop should not call dataset.save_episode directly; "
+        "save_episode_async owns that"
+    )
+
+
 def test_canceled_overlong_trial_is_discarded():
     """If both overlong AND canceled fire (e.g., engine's time_limit slightly
     exceeds our cap), trial must still be discarded — no double-save, no save.
@@ -487,6 +557,7 @@ if __name__ == "__main__":
         test_canceled_trial_is_discarded,
         test_aborted_trial_is_discarded,
         test_succeeded_with_insertion_short_trial_is_saved,
+        test_async_save_does_not_drop_next_trial_frames,
         test_canceled_overlong_trial_is_discarded,
         test_sim_time_used_for_overlong_not_wall_time,
         test_overlapping_goals_discards_previous,

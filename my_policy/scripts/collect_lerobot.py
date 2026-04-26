@@ -40,6 +40,7 @@ The engine's per-task time_limit in the batch YAML should match.
 """
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import os
@@ -406,6 +407,7 @@ def run_collection_loop(
     tick_pacer,                     # callable(elapsed_s) -> None (sleep in prod, no-op in tests)
     monotonic_fn=time.monotonic,    # injectable for tests
     t_global_start: float | None = None,
+    save_episode_async=None,        # callable(frames: list[dict]) -> None
 ) -> dict:
     """Event-driven recording loop. Extracted for unit-testing.
 
@@ -417,9 +419,32 @@ def run_collection_loop(
     Per-trial baselines for the goal counters (event_count_at_trial_start,
     goal_terminated_at_trial_start) prevent stale counts from a previously
     overlong-discarded trial from immediately ending the next one.
+
+    save_episode_async: callable invoked with the buffered frames when a trial
+    is saved. Default: synchronous — adds each frame to the dataset and calls
+    save_episode in the foreground. Production should pass an async wrapper
+    that runs the save in a worker thread; observed in 2026-04-26 logs that
+    a synchronous save_episode for trial N (50-280 wall sec for
+    1294-2752 frames) caused the recorder to miss the first 116-223 wall sec
+    of trial N+1 — the loop was blocked while the engine and policy ran trial
+    N+1's APPROACH and ALIGN. The result: SUCCEEDED+inserted but partial demos
+    that pollute IL training with inconsistent trajectory lengths.
+
+    Frames are accumulated in a local `pending_frames` list during recording
+    and only handed to `save_episode_async` at trial save time, so the worker
+    thread can encode the previous episode while the main loop captures the
+    next one without contention on the dataset object.
     """
     if t_global_start is None:
         t_global_start = monotonic_fn()
+
+    if save_episode_async is None:
+        # Default: synchronous — add frames to dataset and save inline. Used in
+        # tests and as the safe fallback.
+        def save_episode_async(frames):
+            for f in frames:
+                dataset.add_frame(f)
+            dataset.save_episode()
 
     def now_sim_s() -> float:
         return monitor.get_clock().now().nanoseconds / 1e9
@@ -434,16 +459,26 @@ def run_collection_loop(
     event_count_at_trial_start = 0
     goal_terminated_at_trial_start = monitor.goal_terminated_count
     last_goal_started_count = monitor.goal_started_count
+    # Local frame buffer — never touched outside this loop. Handed off to
+    # save_episode_async on trial save (the worker thread then routes them
+    # into the dataset). Replaces direct dataset.add_frame calls during
+    # recording so the main loop is decoupled from save latency.
+    pending_frames: list[dict] = []
 
     def _finalize_trial(*, discarded: bool, reason: str) -> None:
-        nonlocal recording, trial_idx, n_frames
+        nonlocal recording, trial_idx, n_frames, pending_frames
         duration = now_sim_s() - trial_start_sim_s
         insertion_event_fired = (
             monitor.event_count > event_count_at_trial_start
         )
         if discarded:
             try:
+                # No dataset mutation needed: pending_frames was the only
+                # buffer, and we drop it. Still call clear_episode_buffer so
+                # any frames that may have been pre-added (defensive) are
+                # cleared.
                 dataset.clear_episode_buffer()
+                pending_frames = []
                 # Categorize the discard so summary.json is filterable for
                 # debugging without re-parsing reason strings.
                 if "overlong" in reason or reason == "overlapping_goals":
@@ -461,7 +496,17 @@ def run_collection_loop(
                 log.error(f"clear_episode_buffer failed: {ex}")
         else:
             try:
-                dataset.save_episode()
+                # Hand off the snapshot to the (potentially async) saver.
+                # `list(pending_frames)` snapshots so the main loop can keep
+                # building the next trial's buffer without racing the worker.
+                snapshot = list(pending_frames)
+                log.info(
+                    f"[SAVE SUBMIT] trial {trial_idx + 1}/{len(trials)} "
+                    f"frames={len(snapshot)} dur={duration:.1f}s "
+                    f"→ handing to save worker"
+                )
+                save_episode_async(snapshot)
+                pending_frames = []
                 # Under the strict discard predicate, only fully-inserted
                 # SUCCEEDED trials reach this branch.
                 outcome = "saved_inserted"
@@ -469,7 +514,8 @@ def run_collection_loop(
                 outcome = f"save_failed:{ex}"
                 log.error(f"save_episode failed: {ex}")
         log.info(
-            f"    trial {trial_idx + 1} done: {outcome} ({reason}) "
+            f"[RECORD STOP] trial {trial_idx + 1}/{len(trials)} "
+            f"outcome={outcome} reason={reason} "
             f"frames={n_frames} dur={duration:.1f}s"
         )
         task = trials[trial_idx] if trial_idx < len(trials) else {}
@@ -515,7 +561,10 @@ def run_collection_loop(
                 task = trials[trial_idx]
                 port_frame, plug_frame = task_to_frames(task)
                 instruction = task_to_instruction(task)
-                log.info(f"=== trial {trial_idx + 1}/{len(trials)}: {instruction}")
+                log.info(
+                    f"[RECORD START] trial {trial_idx + 1}/{len(trials)}: "
+                    f"{instruction}"
+                )
                 log.info(f"    port_frame={port_frame}")
                 log.info(f"    plug_frame={plug_frame}")
                 robot.set_active_trial(port_frame=port_frame, plug_frame=plug_frame)
@@ -574,7 +623,11 @@ def run_collection_loop(
                         dataset.features, action_dict, prefix="action"
                     )
                     frame = {**obs_frame, **action_frame, "task": instruction}
-                    dataset.add_frame(frame)
+                    # Append to local list, NOT dataset.add_frame. The worker
+                    # touches the dataset; the main loop must not, or the
+                    # worker's save_episode could race with concurrent
+                    # add_frame calls for the next trial.
+                    pending_frames.append(frame)
                     n_frames += 1
 
         tick_pacer(monotonic_fn() - tick_t)
@@ -681,6 +734,71 @@ def main() -> int:
             if slack > 0:
                 time.sleep(slack)
 
+        # Single-worker thread pool for save_episode. The dataset's
+        # save_episode runs Dataset.map() (synchronous, several seconds per
+        # 1000 frames) plus SVT-AV1 video encode for 3 cameras (~20-280 wall
+        # sec depending on episode length). If we ran that on the main loop
+        # we'd miss the start of the next trial — see 2026-04-26 logs:
+        # trial 2 was missed for 116 wall sec, trial 3 for 223 wall sec,
+        # producing partial demos. max_workers=1 keeps saves sequential so
+        # only ONE thread ever touches the dataset, avoiding races with
+        # finalize().
+        save_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="save_worker"
+        )
+        # Counters tracked across saves so the end-of-run summary can show
+        # how many episodes actually landed on disk vs. were dropped.
+        save_state = {
+            "submitted": 0,
+            "started": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "errors": [],  # list[str] for summary.json
+        }
+
+        def _save_episode_sync(frames, save_id):
+            save_state["started"] += 1
+            t0 = time.monotonic()
+            log.info(
+                f"[SAVE START] #{save_id} frames={len(frames)} "
+                f"adding to dataset and encoding..."
+            )
+            try:
+                for f in frames:
+                    dataset.add_frame(f)
+                dataset.save_episode()
+                elapsed = time.monotonic() - t0
+                log.info(
+                    f"[SAVE OK] #{save_id} frames={len(frames)} "
+                    f"elapsed={elapsed:.1f}s "
+                    f"dataset_episodes_now={dataset.num_episodes}"
+                )
+            except Exception:
+                # Re-raise so future.result() in _on_save_done sees it.
+                # _on_save_done logs and updates counters.
+                raise
+
+        def _on_save_done(fut, save_id):
+            try:
+                fut.result()
+                save_state["succeeded"] += 1
+            except Exception as ex:
+                save_state["failed"] += 1
+                save_state["errors"].append(f"#{save_id}: {ex!r}")
+                log.error(
+                    f"[SAVE FAIL] #{save_id} {type(ex).__name__}: {ex}"
+                )
+
+        def save_episode_async(frames):
+            save_state["submitted"] += 1
+            save_id = save_state["submitted"]
+            log.info(
+                f"[SAVE QUEUE] #{save_id} frames={len(frames)} "
+                f"queued (queue depth submitted-started={save_state['submitted'] - save_state['started']})"
+            )
+            fut = save_executor.submit(_save_episode_sync, frames, save_id)
+            fut.add_done_callback(lambda f: _on_save_done(f, save_id))
+
         loop_summary = run_collection_loop(
             monitor=monitor,
             robot=robot,
@@ -694,8 +812,33 @@ def main() -> int:
             tick_pacer=tick_pacer,
             monotonic_fn=time.monotonic,
             t_global_start=t_global_start,
+            save_episode_async=save_episode_async,
         )
         summary["trials"] = loop_summary["trials"]
+        # Drain pending saves before finalize. wait=True blocks until the
+        # worker thread has completed all queued save_episode calls.
+        pending = save_state["submitted"] - (
+            save_state["succeeded"] + save_state["failed"]
+        )
+        log.info(
+            f"[SAVE DRAIN] waiting for {pending} pending save(s) "
+            f"(submitted={save_state['submitted']} "
+            f"succeeded={save_state['succeeded']} "
+            f"failed={save_state['failed']})..."
+        )
+        save_executor.shutdown(wait=True)
+        log.info(
+            f"[SAVE DRAIN] complete. final: "
+            f"submitted={save_state['submitted']} "
+            f"succeeded={save_state['succeeded']} "
+            f"failed={save_state['failed']}"
+        )
+        summary["save_stats"] = {
+            "submitted": save_state["submitted"],
+            "succeeded": save_state["succeeded"],
+            "failed": save_state["failed"],
+            "errors": list(save_state["errors"]),
+        }
     finally:
         log.info("tearing down...")
         # Always terminate aic_model first so it stops emitting before
@@ -728,11 +871,30 @@ def main() -> int:
     summary["episodes_in_dataset"] = dataset.num_episodes
     (logs_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    n_inserted = sum(1 for t in summary["trials"] if t["outcome"] == "inserted")
+    n_saved = sum(1 for t in summary["trials"] if t["outcome"] == "saved_inserted")
+    n_discarded = sum(
+        1 for t in summary["trials"] if t["outcome"].startswith("discarded")
+    )
+    save_stats = summary.get("save_stats", {})
     log.info(
-        f"done. inserted {n_inserted}/{len(trials)}; "
+        f"done. trials_run={len(summary['trials'])} "
+        f"saved={n_saved} discarded={n_discarded}; "
+        f"save_episode submitted={save_stats.get('submitted', 0)} "
+        f"succeeded={save_stats.get('succeeded', 0)} "
+        f"failed={save_stats.get('failed', 0)}; "
         f"dataset has {dataset.num_episodes} episodes total"
     )
+    if save_stats.get("failed"):
+        log.error(
+            f"{save_stats['failed']} save(s) FAILED — check errors in "
+            f"summary.json. Some trials are missing from the dataset."
+        )
+    elif n_saved != save_stats.get("succeeded", 0):
+        log.warning(
+            f"mismatch: {n_saved} trials marked saved_inserted, but "
+            f"{save_stats.get('succeeded', 0)} save_episode calls succeeded — "
+            f"possible silent drop."
+        )
     return 0
 
 
