@@ -559,6 +559,14 @@ def main() -> int:
     trials = load_trial_sequence(args.batch_config)
     log.info(f"loaded {len(trials)} trials from {args.batch_config}")
 
+    # --- Start aic_model subprocess FIRST, before our own rclpy/Zenoh setup.
+    # aic_model has its own ~30s Zenoh discovery; the eval engine has a
+    # ~60s timeout searching for the aic_model lifecycle node and times out
+    # if discovery + recorder bring-up happens sequentially. Starting it
+    # first lets aic_model's discovery overlap with everything else here.
+    model = start_model(logs_dir / "model.log", args.policy)
+    log.info(f"aic_model started pid={model.pid} policy={args.policy}")
+
     # --- Bring up rclpy and our side-channel monitor
     rclpy.init()
     monitor = CollectorMonitor()
@@ -571,6 +579,7 @@ def main() -> int:
         log.error("timeout waiting for /tf — is the eval container running?")
         monitor.destroy_node()
         rclpy.shutdown()
+        terminate(model, timeout=10.0)
         return 2
     log.info("/tf seen — eval is up.")
 
@@ -583,11 +592,6 @@ def main() -> int:
     # --- Dataset
     dataset = make_or_resume_dataset(args.repo_id, args.root, args.fps, robot)
     log.info(f"dataset opened at {args.root} (existing episodes: {dataset.num_episodes})")
-
-    # --- Start aic_model subprocess (CheatCodeRobust)
-    model = start_model(logs_dir / "model.log", args.policy)
-    time.sleep(3.0)
-    log.info(f"aic_model started pid={model.pid} policy={args.policy}")
 
     t_global_start = time.monotonic()
 
