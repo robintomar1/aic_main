@@ -61,6 +61,7 @@ from action_msgs.msg import GoalStatus, GoalStatusArray
 from aic_control_interfaces.msg import MotionUpdate
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     QoSDurabilityPolicy,
     QoSHistoryPolicy,
@@ -157,7 +158,15 @@ class CollectorMonitor(Node):
     """
 
     def __init__(self):
-        super().__init__("aic_collector_monitor")
+        # Engine's time_limit is enforced in SIM time. The host can run sim
+        # at well under 1× RTF (observed ~0.1× on heavier physics scenes), so
+        # measuring per-trial duration in wall time would discard everything.
+        # Anchor to /clock via use_sim_time so our cap aligns with engine
+        # semantics. Must be passed at construction for the clock to switch.
+        super().__init__(
+            "aic_collector_monitor",
+            parameter_overrides=[Parameter("use_sim_time", value=True)],
+        )
 
         events_qos = QoSProfile(
             depth=10,
@@ -354,6 +363,166 @@ def wait_for_first_tf(monitor: CollectorMonitor, executor, warm_up_s: float) -> 
     return False
 
 
+def run_collection_loop(
+    *,
+    monitor,
+    robot,
+    dataset,
+    trials: list[dict],
+    log,
+    max_episode_s: float,
+    global_timeout_s: float,
+    is_alive,                       # callable() -> bool
+    spin_monitor,                   # callable() -> None (no-op in tests)
+    tick_pacer,                     # callable(elapsed_s) -> None (sleep in prod, no-op in tests)
+    monotonic_fn=time.monotonic,    # injectable for tests
+    t_global_start: float | None = None,
+) -> dict:
+    """Event-driven recording loop. Extracted for unit-testing.
+
+    Trial advancement is driven by /insert_cable/_action/status transitions
+    (ACCEPTED→start, terminal→end). Per-trial duration is measured in SIM time
+    via monitor.get_clock(); the engine's time_limit is also sim-time so
+    these align even when sim runs well below 1× RTF.
+
+    Per-trial baselines for the goal counters (event_count_at_trial_start,
+    goal_terminated_at_trial_start) prevent stale counts from a previously
+    overlong-discarded trial from immediately ending the next one.
+    """
+    if t_global_start is None:
+        t_global_start = monotonic_fn()
+
+    def now_sim_s() -> float:
+        return monitor.get_clock().now().nanoseconds / 1e9
+
+    summary = {"trials": []}
+
+    trial_idx = 0
+    recording = False
+    trial_start_sim_s = 0.0
+    n_frames = 0
+    instruction = ""
+    event_count_at_trial_start = 0
+    goal_terminated_at_trial_start = monitor.goal_terminated_count
+    last_goal_started_count = monitor.goal_started_count
+
+    def _finalize_trial(*, discarded: bool, reason: str) -> None:
+        nonlocal recording, trial_idx, n_frames
+        duration = now_sim_s() - trial_start_sim_s
+        insertion_event_fired = (
+            monitor.event_count > event_count_at_trial_start
+        )
+        if discarded:
+            try:
+                dataset.clear_episode_buffer()
+                outcome = "discarded_overlong"
+            except Exception as ex:
+                outcome = f"clear_failed:{ex}"
+                log.error(f"clear_episode_buffer failed: {ex}")
+        else:
+            try:
+                dataset.save_episode()
+                outcome = "saved_inserted" if insertion_event_fired else "saved_no_insertion"
+            except Exception as ex:
+                outcome = f"save_failed:{ex}"
+                log.error(f"save_episode failed: {ex}")
+        log.info(
+            f"    trial {trial_idx + 1} done: {outcome} ({reason}) "
+            f"frames={n_frames} dur={duration:.1f}s"
+        )
+        task = trials[trial_idx] if trial_idx < len(trials) else {}
+        summary["trials"].append({
+            "idx": trial_idx,
+            "outcome": outcome,
+            "reason": reason,
+            "frames": n_frames,
+            "duration_s": duration,
+            "insertion_event_fired": insertion_event_fired,
+            "instruction": instruction,
+            "task_meta": task_to_metadata_json(task) if task else "",
+        })
+        trial_idx += 1
+        recording = False
+
+    while trial_idx < len(trials):
+        tick_t = monotonic_fn()
+        spin_monitor()
+
+        # Global watchdogs
+        if (tick_t - t_global_start) > global_timeout_s:
+            log.error(f"global timeout {global_timeout_s:.0f}s exceeded")
+            if recording:
+                _finalize_trial(discarded=True, reason="global_timeout")
+            break
+        if not is_alive():
+            log.error("aic_model crashed")
+            if recording:
+                _finalize_trial(discarded=True, reason="model_crash")
+            break
+
+        # New goal accepted by aic_model? Start a trial.
+        if monitor.goal_started_count > last_goal_started_count:
+            last_goal_started_count = monitor.goal_started_count
+            if recording:
+                log.warning(
+                    f"new goal started before previous terminated; "
+                    f"discarding trial {trial_idx + 1}"
+                )
+                _finalize_trial(discarded=True, reason="overlapping_goals")
+            if trial_idx < len(trials):
+                task = trials[trial_idx]
+                port_frame, plug_frame = task_to_frames(task)
+                instruction = task_to_instruction(task)
+                log.info(f"=== trial {trial_idx + 1}/{len(trials)}: {instruction}")
+                log.info(f"    port_frame={port_frame}")
+                log.info(f"    plug_frame={plug_frame}")
+                robot.set_active_trial(port_frame=port_frame, plug_frame=plug_frame)
+                event_count_at_trial_start = monitor.event_count
+                goal_terminated_at_trial_start = monitor.goal_terminated_count
+                trial_start_sim_s = now_sim_s()
+                n_frames = 0
+                recording = True
+            else:
+                log.warning(
+                    f"received goal start beyond expected trial count {len(trials)}"
+                )
+
+        # Per-trial termination conditions
+        if recording:
+            duration_sim = now_sim_s() - trial_start_sim_s
+            terminal = monitor.goal_terminated_count > goal_terminated_at_trial_start
+            overlong = duration_sim > max_episode_s
+            if terminal or overlong:
+                if terminal:
+                    status_name = {
+                        GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED",
+                        GoalStatus.STATUS_CANCELED: "CANCELED",
+                        GoalStatus.STATUS_ABORTED: "ABORTED",
+                    }.get(monitor.last_terminal_status, str(monitor.last_terminal_status))
+                    reason = f"action_status_{status_name}"
+                else:
+                    reason = f"overlong_{duration_sim:.1f}s_sim>{max_episode_s}s"
+                _finalize_trial(discarded=overlong, reason=reason)
+            else:
+                obs = robot.get_observation()
+                if obs:
+                    action_arr = monitor.latest_action()
+                    obs_frame = build_dataset_frame(
+                        dataset.features, obs, prefix="observation"
+                    )
+                    action_dict = {n: action_arr[i] for i, n in enumerate(ACTION_NAMES)}
+                    action_frame = build_dataset_frame(
+                        dataset.features, action_dict, prefix="action"
+                    )
+                    frame = {**obs_frame, **action_frame, "task": instruction}
+                    dataset.add_frame(frame)
+                    n_frames += 1
+
+        tick_pacer(monotonic_fn() - tick_t)
+
+    return summary
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -368,8 +537,10 @@ def main() -> int:
                    help="Dotted import path for the aic_model policy.")
     p.add_argument("--fps", type=int, default=TICK_RATE_HZ)
     p.add_argument("--max-episode-s", type=float, default=MAX_EPISODE_DURATION_S,
-                   help="Hard cap per trial; episodes longer than this are DISCARDED. "
-                        "Should match the per-task time_limit in the batch config.")
+                   help="Hard cap per trial in SIM seconds (matches the engine's "
+                        "time_limit, which is also sim-time). Episodes exceeding "
+                        "this are DISCARDED. Sim can run well below 1× RTF, so do "
+                        "not interpret this as wall time.")
     p.add_argument("--warm-up-s", type=float, default=180.0,
                    help="Max wait for /tf from the eval container before bailing.")
     p.add_argument("--global-timeout-s", type=float, default=14400.0,
@@ -419,148 +590,36 @@ def main() -> int:
     log.info(f"aic_model started pid={model.pid} policy={args.policy}")
 
     t_global_start = time.monotonic()
-    summary = {
-        "trials": [],
-        "max_episode_s": args.max_episode_s,
-        "policy": args.policy,
-    }
 
     def spin_monitor():
         # Pump callbacks so latest_action / goal counters / event_count stay current.
         monitor_executor.spin_once(timeout_sec=0.0)
 
-    # Event-driven loop: trial advancement is driven by /insert_cable/_action/status
-    # transitions (ACCEPTED→start, terminal→end). The trials list from the batch
-    # config is consumed sequentially; the engine processes the same list in order.
-    trial_idx = 0
-    recording = False
-    trial_start_t = 0.0
-    n_frames = 0
-    instruction = ""
-    event_count_at_trial_start = 0
-    last_goal_started_count = monitor.goal_started_count
-    last_goal_terminated_count = monitor.goal_terminated_count
+    def is_alive() -> bool:
+        return model.poll() is None
 
-    def _finalize_trial(*, discarded: bool, reason: str) -> None:
-        """End the current trial: discard or save episode + record summary."""
-        nonlocal recording, trial_idx, n_frames
-        duration = time.monotonic() - trial_start_t
-        insertion_event_fired = (
-            monitor.event_count > event_count_at_trial_start
-        )
-        if discarded:
-            try:
-                dataset.clear_episode_buffer()
-                outcome = "discarded_overlong"
-            except Exception as ex:
-                outcome = f"clear_failed:{ex}"
-                log.error(f"clear_episode_buffer failed: {ex}")
-        else:
-            try:
-                dataset.save_episode()
-                outcome = "saved_inserted" if insertion_event_fired else "saved_no_insertion"
-            except Exception as ex:
-                outcome = f"save_failed:{ex}"
-                log.error(f"save_episode failed: {ex}")
-        log.info(
-            f"    trial {trial_idx + 1} done: {outcome} ({reason}) "
-            f"frames={n_frames} dur={duration:.1f}s"
-        )
-        task = trials[trial_idx] if trial_idx < len(trials) else {}
-        summary["trials"].append({
-            "idx": trial_idx,
-            "outcome": outcome,
-            "reason": reason,
-            "frames": n_frames,
-            "duration_s": duration,
-            "insertion_event_fired": insertion_event_fired,
-            "instruction": instruction,
-            "task_meta": task_to_metadata_json(task) if task else "",
-        })
-        trial_idx += 1
-        recording = False
+    def tick_pacer(elapsed_s: float) -> None:
+        slack = TICK_PERIOD_S - elapsed_s
+        if slack > 0:
+            time.sleep(slack)
 
+    summary = {"trials": [], "max_episode_s": args.max_episode_s, "policy": args.policy}
     try:
-        while trial_idx < len(trials):
-            tick_t = time.monotonic()
-            spin_monitor()
-
-            # Global watchdogs
-            if (tick_t - t_global_start) > args.global_timeout_s:
-                log.error(f"global timeout {args.global_timeout_s:.0f}s exceeded")
-                if recording:
-                    _finalize_trial(discarded=True, reason="global_timeout")
-                break
-            if model.poll() is not None:
-                log.error(f"aic_model crashed rc={model.returncode}")
-                if recording:
-                    _finalize_trial(discarded=True, reason="model_crash")
-                break
-
-            # New goal accepted by aic_model? Start a trial.
-            if monitor.goal_started_count > last_goal_started_count:
-                last_goal_started_count = monitor.goal_started_count
-                if recording:
-                    # Previous trial didn't terminate cleanly before next goal arrived
-                    # — discard partial data rather than mislabel.
-                    log.warning(
-                        f"new goal started before previous terminated; discarding trial {trial_idx + 1}"
-                    )
-                    _finalize_trial(discarded=True, reason="overlapping_goals")
-                if trial_idx < len(trials):
-                    task = trials[trial_idx]
-                    port_frame, plug_frame = task_to_frames(task)
-                    instruction = task_to_instruction(task)
-                    log.info(f"=== trial {trial_idx + 1}/{len(trials)}: {instruction}")
-                    log.info(f"    port_frame={port_frame}")
-                    log.info(f"    plug_frame={plug_frame}")
-                    robot.set_active_trial(port_frame=port_frame, plug_frame=plug_frame)
-                    event_count_at_trial_start = monitor.event_count
-                    trial_start_t = tick_t
-                    n_frames = 0
-                    recording = True
-                else:
-                    log.warning(
-                        f"received goal start beyond expected trial count {len(trials)}"
-                    )
-
-            # Per-trial termination conditions
-            if recording:
-                duration = tick_t - trial_start_t
-                terminal = monitor.goal_terminated_count > last_goal_terminated_count
-                overlong = duration > args.max_episode_s
-                if terminal or overlong:
-                    if terminal:
-                        last_goal_terminated_count = monitor.goal_terminated_count
-                        status_name = {
-                            GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED",
-                            GoalStatus.STATUS_CANCELED: "CANCELED",
-                            GoalStatus.STATUS_ABORTED: "ABORTED",
-                        }.get(monitor.last_terminal_status, str(monitor.last_terminal_status))
-                        reason = f"action_status_{status_name}"
-                    else:
-                        reason = f"overlong_{duration:.1f}s>{args.max_episode_s}s"
-                    _finalize_trial(discarded=overlong, reason=reason)
-                    # Don't write a frame this tick; loop continues to wait for next goal.
-                else:
-                    obs = robot.get_observation()
-                    if obs:
-                        action_arr = monitor.latest_action()
-                        obs_frame = build_dataset_frame(
-                            dataset.features, obs, prefix="observation"
-                        )
-                        action_dict = {n: action_arr[i] for i, n in enumerate(ACTION_NAMES)}
-                        action_frame = build_dataset_frame(
-                            dataset.features, action_dict, prefix="action"
-                        )
-                        frame = {**obs_frame, **action_frame, "task": instruction}
-                        dataset.add_frame(frame)
-                        n_frames += 1
-
-            # 20 Hz pacing whether recording or idling between trials.
-            slack = TICK_PERIOD_S - (time.monotonic() - tick_t)
-            if slack > 0:
-                time.sleep(slack)
+        loop_summary = run_collection_loop(
+            monitor=monitor,
+            robot=robot,
+            dataset=dataset,
+            trials=trials,
+            log=log,
+            max_episode_s=args.max_episode_s,
+            global_timeout_s=args.global_timeout_s,
+            is_alive=is_alive,
+            spin_monitor=spin_monitor,
+            tick_pacer=tick_pacer,
+            monotonic_fn=time.monotonic,
+            t_global_start=t_global_start,
+        )
+        summary["trials"] = loop_summary["trials"]
     finally:
         log.info("tearing down...")
         terminate(model, timeout=10.0)
