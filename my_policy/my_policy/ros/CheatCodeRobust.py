@@ -46,7 +46,11 @@ class CheatCodeRobust(Policy):
     # Keep P < 1 so we don't over-react (at P=1 this becomes v3-style
     # full feedforward, which was unstable because cable lag fed back on
     # itself). P=0.5 gives useful immediate correction with stable damping.
-    PROPORTIONAL_GAIN = 0.5
+    # P=0.3 (down from 0.5): observed XY oscillation at hover with 0.5; the
+    # cable's lateral inertia + admittance compliance gives the loop enough
+    # phase lag that 0.5 over-reacts. 0.3 still drives the steady-state
+    # error fast enough that the I term doesn't have to work alone.
+    PROPORTIONAL_GAIN = 0.3
     INTEGRATOR_GAIN = 0.15
     MAX_INTEGRATOR_WINDUP = 0.10     # 15 mm max I correction; typical
                                      # steady-state cable offset after settling
@@ -66,12 +70,14 @@ class CheatCodeRobust(Policy):
     DESCENT_STEP = 0.0002            # 0.2 mm per tick
     DESCENT_SLEEP = 0.05             # -> 4 mm/s (graceful insertion descent)
 
-    # ALIGN phase: gate descent on actual XY convergence. Scoring tolerance
-    # is 5 mm; require 5 mm at hover so we're inside the chamfer as we
-    # enter. Stable 1 s to ignore transient oscillation dips.
-    ALIGN_XY_THRESHOLD_M = 0.005
+    # ALIGN phase: gate descent on actual XY convergence. Tightened to
+    # 2.5 mm so we enter the chamfer with margin, not at the edge.
+    # Timeout 5 s — with the wider P/I gains the loop converges in ~1-2 s
+    # when it's going to converge at all, so 5 s is plenty and bails out
+    # of stuck-misaligned cases faster.
+    ALIGN_XY_THRESHOLD_M = 0.0025
     ALIGN_STABLE_S = 1.0
-    ALIGN_TIMEOUT_S = 10.0
+    ALIGN_TIMEOUT_S = 5.0
     ALIGN_POLL_S = 0.05
     # If we time out with residual xy error worse than this, abort the trial
     # rather than descend into bad alignment (would smash the port and produce
@@ -99,10 +105,17 @@ class CheatCodeRobust(Policy):
     HOLD_RETREAT_STEP = 0.0001       # 2 mm/s retreat at 50 ms tick
     HOLD_RETREAT_MAX = 0.005         # cap retreat per single hold at 5 mm
 
+    # Status print throttle. Periodic 1Hz line during APPROACH/ALIGN/INSERT
+    # with the metrics we actually want to see (xy err, z err, traj time,
+    # Fz). Replaces the framework's bare "insert_cable execute loop" heartbeat
+    # in aic_model.py — that's policy-agnostic and can't see these values.
+    STATUS_LOG_PERIOD_S = 1.0
+
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
         self._task = None
+        self._last_status_log_t = None
         # Latched on first "inserted" event; reset at the start of each
         # insert_cable call so stale events don't bleed across trials.
         self._inserted_flag = False
@@ -168,6 +181,60 @@ class CheatCodeRobust(Policy):
         self.get_logger().error(
             f"Transform '{source_frame}' not available after {timeout_sec}s")
         return False
+
+    # ------------------------------------------------------------------
+    # Periodic status line
+    # ------------------------------------------------------------------
+    def _log_status(
+        self,
+        phase: str,
+        port_transform: Transform,
+        traj_start: Time,
+        z_offset: float | None = None,
+        get_observation=None,
+    ) -> None:
+        """1 Hz status print: traj time, xy err, z err, Fz, current z_offset."""
+        now = self.time_now()
+        if self._last_status_log_t is not None:
+            if (now - self._last_status_log_t).nanoseconds < int(
+                self.STATUS_LOG_PERIOD_S * 1e9
+            ):
+                return
+        self._last_status_log_t = now
+
+        t_traj = (now - traj_start).nanoseconds / 1e9
+
+        xy_err_mm = float("nan")
+        z_err_mm = float("nan")
+        try:
+            plug_tf = self._parent_node._tf_buffer.lookup_transform(
+                "base_link",
+                f"{self._task.cable_name}/{self._task.plug_name}_link",
+                Time(),
+            )
+            dx = port_transform.translation.x - plug_tf.transform.translation.x
+            dy = port_transform.translation.y - plug_tf.transform.translation.y
+            dz = port_transform.translation.z - plug_tf.transform.translation.z
+            xy_err_mm = (dx * dx + dy * dy) ** 0.5 * 1000.0
+            z_err_mm = dz * 1000.0
+        except TransformException:
+            pass
+
+        fz = float("nan")
+        if get_observation is not None:
+            try:
+                obs = get_observation()
+                wr = obs.wrist_wrench.wrench
+                tare = obs.controller_state.fts_tare_offset.wrench
+                fz = wr.force.z - tare.force.z
+            except Exception:
+                pass
+
+        z_str = f" z_off={z_offset * 1000:6.1f}mm" if z_offset is not None else ""
+        self.get_logger().info(
+            f"[{phase} t={t_traj:5.1f}s xy_err={xy_err_mm:5.1f}mm "
+            f"z_err={z_err_mm:6.1f}mm Fz={fz:6.2f}N{z_str}]"
+        )
 
     # ------------------------------------------------------------------
     # Gripper pose computation — mirrors upstream but with widened integrator.
@@ -296,6 +363,8 @@ class CheatCodeRobust(Policy):
         self._task = task
         # Reset insertion-event latch for this trial.
         self._inserted_flag = False
+        self._last_status_log_t = None
+        traj_start = self.time_now()
 
         # Pick the plug-type-specific hover distance.
         hover_z = self.HOVER_Z_OFFSET_BY_PLUG.get(
@@ -335,6 +404,7 @@ class CheatCodeRobust(Policy):
                 )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during approach: {ex}")
+            self._log_status("APPROACH", port_transform, traj_start)
             self.sleep_for(self.APPROACH_SLEEP)
 
         # --- ALIGN: hold at hover and wait for the plug to converge to
@@ -375,6 +445,7 @@ class CheatCodeRobust(Policy):
             else:
                 stable_since = None
 
+            self._log_status("ALIGN   ", port_transform, traj_start)
             self.sleep_for(self.ALIGN_POLL_S)
 
         if converged:
@@ -480,14 +551,18 @@ class CheatCodeRobust(Policy):
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insert: {ex}")
 
+            self._log_status(
+                "INSERT  ", port_transform, traj_start,
+                z_offset=effective_z, get_observation=get_observation,
+            )
             self.sleep_for(self.DESCENT_SLEEP)
 
         self.get_logger().info(
             f"INSERT done — force gate engaged {force_stopped_count} times, "
             f"final z_offset={z_offset * 1000:.1f}mm")
 
-        self.get_logger().info("Phase: STABILIZE")
-        self.sleep_for(5.0)
-
+        # No STABILIZE dwell — once /scoring/insertion_event has fired the
+        # trial is scored, and on a non-insertion exit there's nothing useful
+        # to settle. Return immediately so the engine can deactivate.
         self.get_logger().info("CheatCodeRobust.insert_cable() exiting...")
         return True

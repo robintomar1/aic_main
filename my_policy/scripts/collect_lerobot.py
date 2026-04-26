@@ -268,6 +268,35 @@ class CollectorMonitor(Node):
 # aic_model subprocess management
 # =============================================================================
 
+def kill_stale_aic_model(log: logging.Logger, settle_s: float = 2.0) -> None:
+    """Sweep any leftover aic_model processes before spawning a new one.
+
+    A previous recorder run that didn't unwind cleanly (double Ctrl-C, kill -9,
+    OOM, segfault) leaves an aic_model process whose lifecycle services no
+    longer respond but whose name still appears in the ROS graph. The eval
+    engine then targets the stale uuid and the trial deadlocks. Re-running the
+    recorder must be safe regardless of how the previous run ended, so we
+    always start clean. The settle delay lets Zenoh prune the dead node from
+    its routing tables before our replacement registers.
+    """
+    try:
+        pgrep = subprocess.run(
+            ["pgrep", "-af", "aic_model --ros-args"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        log.warning("pgrep not found; cannot check for stale aic_model")
+        return
+    stale = [ln for ln in pgrep.stdout.splitlines() if ln.strip()]
+    if not stale:
+        return
+    log.warning(f"found {len(stale)} stale aic_model process(es); killing:")
+    for line in stale:
+        log.warning(f"  {line}")
+    subprocess.run(["pkill", "-9", "-f", "aic_model --ros-args"], check=False)
+    time.sleep(settle_s)
+
+
 def start_model(log_path: Path, policy: str) -> subprocess.Popen:
     cmd = [
         "ros2", "run", "aic_model", "aic_model",
@@ -559,6 +588,12 @@ def main() -> int:
     trials = load_trial_sequence(args.batch_config)
     log.info(f"loaded {len(trials)} trials from {args.batch_config}")
 
+    # --- Sweep stale aic_model from prior runs. Re-running this script must
+    # be safe regardless of how the previous run ended (clean exit, Ctrl-C,
+    # double-Ctrl-C mid-cleanup, kill -9, segfault). See
+    # feedback_recorder_restart_normal_flow.md.
+    kill_stale_aic_model(log)
+
     # --- Start aic_model subprocess FIRST, before our own rclpy/Zenoh setup.
     # aic_model has its own ~30s Zenoh discovery; the eval engine has a
     # ~60s timeout searching for the aic_model lifecycle node and times out
@@ -567,48 +602,55 @@ def main() -> int:
     model = start_model(logs_dir / "model.log", args.policy)
     log.info(f"aic_model started pid={model.pid} policy={args.policy}")
 
-    # --- Bring up rclpy and our side-channel monitor
-    rclpy.init()
-    monitor = CollectorMonitor()
-    monitor_executor = SingleThreadedExecutor()
-    monitor_executor.add_node(monitor)
-
-    # --- Wait for /tf so we know the eval container is alive
-    log.info(f"waiting up to {args.warm_up_s:.0f}s for /tf...")
-    if not wait_for_first_tf(monitor, monitor_executor, args.warm_up_s):
-        log.error("timeout waiting for /tf — is the eval container running?")
-        monitor.destroy_node()
-        rclpy.shutdown()
-        terminate(model, timeout=10.0)
-        return 2
-    log.info("/tf seen — eval is up.")
-
-    # --- Connect the LeRobot adapter (this creates its own node/executor/thread)
-    robot_cfg = AICRobotAICControllerConfig(id="aic")
-    robot = AICRobotAICController(robot_cfg)
-    robot.connect(calibrate=False)
-    log.info("AICRobotAICController connected.")
-
-    # --- Dataset
-    dataset = make_or_resume_dataset(args.repo_id, args.root, args.fps, robot)
-    log.info(f"dataset opened at {args.root} (existing episodes: {dataset.num_episodes})")
-
-    t_global_start = time.monotonic()
-
-    def spin_monitor():
-        # Pump callbacks so latest_action / goal counters / event_count stay current.
-        monitor_executor.spin_once(timeout_sec=0.0)
-
-    def is_alive() -> bool:
-        return model.poll() is None
-
-    def tick_pacer(elapsed_s: float) -> None:
-        slack = TICK_PERIOD_S - elapsed_s
-        if slack > 0:
-            time.sleep(slack)
-
+    # Everything after start_model must be in a try/finally that calls
+    # terminate(model). Otherwise any exception in setup (rclpy init,
+    # adapter connect, dataset creation, etc.) leaks aic_model — it was
+    # spawned with start_new_session=True so it survives our parent
+    # exiting and ends up as a stale node in the ROS graph that the
+    # eval engine then mistakenly tries to talk to on the next run.
+    monitor = None
+    monitor_executor = None
+    robot = None
+    dataset = None
     summary = {"trials": [], "max_episode_s": args.max_episode_s, "policy": args.policy}
     try:
+        # --- Bring up rclpy and our side-channel monitor
+        rclpy.init()
+        monitor = CollectorMonitor()
+        monitor_executor = SingleThreadedExecutor()
+        monitor_executor.add_node(monitor)
+
+        # --- Wait for /tf so we know the eval container is alive
+        log.info(f"waiting up to {args.warm_up_s:.0f}s for /tf...")
+        if not wait_for_first_tf(monitor, monitor_executor, args.warm_up_s):
+            log.error("timeout waiting for /tf — is the eval container running?")
+            return 2
+        log.info("/tf seen — eval is up.")
+
+        # --- Connect the LeRobot adapter (this creates its own node/executor/thread)
+        robot_cfg = AICRobotAICControllerConfig(id="aic")
+        robot = AICRobotAICController(robot_cfg)
+        robot.connect(calibrate=False)
+        log.info("AICRobotAICController connected.")
+
+        # --- Dataset
+        dataset = make_or_resume_dataset(args.repo_id, args.root, args.fps, robot)
+        log.info(f"dataset opened at {args.root} (existing episodes: {dataset.num_episodes})")
+
+        t_global_start = time.monotonic()
+
+        def spin_monitor():
+            # Pump callbacks so latest_action / goal counters / event_count stay current.
+            monitor_executor.spin_once(timeout_sec=0.0)
+
+        def is_alive() -> bool:
+            return model.poll() is None
+
+        def tick_pacer(elapsed_s: float) -> None:
+            slack = TICK_PERIOD_S - elapsed_s
+            if slack > 0:
+                time.sleep(slack)
+
         loop_summary = run_collection_loop(
             monitor=monitor,
             robot=robot,
@@ -626,17 +668,30 @@ def main() -> int:
         summary["trials"] = loop_summary["trials"]
     finally:
         log.info("tearing down...")
+        # Always terminate aic_model first so it stops emitting before
+        # we shut down rclpy. None-guards because partial setup is possible
+        # (e.g. /tf timeout returns before robot/dataset exist).
         terminate(model, timeout=10.0)
-        try:
-            dataset.finalize()
-        except Exception as ex:
-            log.error(f"dataset.finalize failed: {ex}")
-        try:
-            robot.disconnect()
-        except Exception as ex:
-            log.error(f"robot.disconnect failed: {ex}")
-        monitor.destroy_node()
-        rclpy.shutdown()
+        if dataset is not None:
+            try:
+                dataset.finalize()
+            except Exception as ex:
+                log.error(f"dataset.finalize failed: {ex}")
+        if robot is not None:
+            try:
+                robot.disconnect()
+            except Exception as ex:
+                log.error(f"robot.disconnect failed: {ex}")
+        if monitor is not None:
+            try:
+                monitor.destroy_node()
+            except Exception as ex:
+                log.error(f"monitor.destroy_node failed: {ex}")
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception as ex:
+                log.error(f"rclpy.shutdown failed: {ex}")
 
     summary["wall_duration_s"] = time.monotonic() - t_global_start
     summary["events_observed"] = monitor.event_count
