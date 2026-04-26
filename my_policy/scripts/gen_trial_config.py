@@ -341,7 +341,7 @@ def gen_sfp_trial(rng: random.Random, distractor_count: int) -> dict:
             "port_type": "sfp",
             "port_name": "sfp_port_0",
             "target_module_name": f"nic_card_mount_{nic_index}",
-            "time_limit": 180,
+            "time_limit": 40,
         },
     }
     return {"scene": scene, "tasks": tasks}
@@ -400,7 +400,7 @@ def gen_sc_trial(rng: random.Random, distractor_count: int) -> dict:
             "port_type": "sc",
             "port_name": "sc_port_base",
             "target_module_name": f"sc_port_{sc_index}",
-            "time_limit": 180,
+            "time_limit": 40,
         },
     }
     return {"scene": scene, "tasks": tasks}
