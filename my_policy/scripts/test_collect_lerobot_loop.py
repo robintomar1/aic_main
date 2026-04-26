@@ -91,8 +91,9 @@ class FakeMonitor:
         self.goal_terminated_count = 0
         self.event_count = 0
         self.last_terminal_status: int | None = None
-        # Action-callback equivalent: a fixed action vector.
-        self._action = [0.0] * 6
+        # Action vector matches collect_lerobot.ACTION_DIM (pose target: xyz +
+        # xyzw quaternion = 7 floats). Tests don't care about the values.
+        self._action = [0.0] * 7
 
     def get_clock(self):
         ns = int(self._clock_ref["t"] * 1e9)

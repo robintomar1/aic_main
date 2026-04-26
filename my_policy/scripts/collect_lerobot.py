@@ -87,9 +87,20 @@ from lerobot_robot_aic.aic_robot_aic_controller import (
 
 DEFAULT_POLICY = "my_policy.ros.CheatCodeRobust"
 TF_HEARTBEAT_TIMEOUT_S = 30.0
-ACTION_DIM = 6
-ACTION_NAMES = ["linear.x", "linear.y", "linear.z",
-                "angular.x", "angular.y", "angular.z"]
+# Action = pose target (xyz + xyzw quaternion). CheatCodeRobust publishes
+# pose targets via Policy.set_pose_target() with trajectory_generation_mode
+# = MODE_POSITION; the velocity Twist field of MotionUpdate is left at
+# zeros. Recording velocity (the canonical adapter's send_action_cartesian
+# convention) gives an all-zero action stream — confirmed in the inspect
+# output of smoke_d4b_dataset (action.std=0 across every episode).
+# We record pose instead so the action carries useful supervision; a
+# deployed learned policy that outputs poses re-uses set_pose_target.
+ACTION_DIM = 7
+ACTION_NAMES = [
+    "pose.position.x", "pose.position.y", "pose.position.z",
+    "pose.orientation.x", "pose.orientation.y",
+    "pose.orientation.z", "pose.orientation.w",
+]
 TICK_RATE_HZ = 20
 TICK_PERIOD_S = 1.0 / TICK_RATE_HZ
 INSERT_CABLE_ACTION_STATUS_TOPIC = "/insert_cable/_action/status"
@@ -216,10 +227,16 @@ class CollectorMonitor(Node):
         self.last_terminal_status: int | None = None
 
     def _on_pose_cmd(self, msg: MotionUpdate) -> None:
-        v = msg.velocity
+        # Read msg.pose, NOT msg.velocity. CheatCodeRobust publishes pose
+        # targets (MODE_POSITION) via Policy.set_pose_target(); the velocity
+        # Twist is left at zeros. Recording velocity here gives an all-zero
+        # action stream (confirmed in smoke_d4b_dataset). The 7-float pose
+        # target is what the oracle is actually commanding the controller
+        # to track.
+        p = msg.pose
         self._latest_action = np.array([
-            v.linear.x, v.linear.y, v.linear.z,
-            v.angular.x, v.angular.y, v.angular.z,
+            p.position.x, p.position.y, p.position.z,
+            p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w,
         ], dtype=np.float32)
         self._action_seen = True
 
@@ -351,8 +368,16 @@ def make_or_resume_dataset(
     # adapter exposes scalars as `float` and camera images as 3-tuple shapes;
     # hw_to_dataset_features groups scalars into a vector under <prefix>.state
     # (or just <prefix> for actions) and creates one image/video feature per cam.
+    #
+    # Override action_features: the canonical adapter advertises 6-D velocity
+    # twists (its send_action_cartesian convention), but our oracle policy
+    # CheatCodeRobust publishes 7-D pose targets via set_pose_target. Recording
+    # velocity gives an all-zero action stream (the velocity field of the
+    # published MotionUpdate is empty when MODE_POSITION is used). We record
+    # what the policy actually commands.
+    pose_action_features = {n: float for n in ACTION_NAMES}
     features = combine_feature_dicts(
-        hw_to_dataset_features(robot.action_features, prefix="action", use_video=True),
+        hw_to_dataset_features(pose_action_features, prefix="action", use_video=True),
         hw_to_dataset_features(robot.observation_features, prefix="observation", use_video=True),
     )
 

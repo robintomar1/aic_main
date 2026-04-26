@@ -157,80 +157,119 @@ def main():
     def _stat_col(feature: str, stat: str) -> str:
         return f"stats/{feature}/{stat}"
 
-    # action variance
-    if _stat_col("action", "std") in eps.columns:
-        action_stds = []
+    # The recorder collapses scalar observation fields into a single
+    # `observation.state` vector. Read its component names from info.json so
+    # we can index into the per-episode min/max/std stats by name.
+    state_info = info.get("features", {}).get("observation.state", {})
+    state_names: list[str] = list(state_info.get("names", []))
+
+    def _state_slice(target_substr: str) -> tuple[int, int] | None:
+        """Return (start, end) into observation.state for the contiguous
+        block of channels whose name contains target_substr. Returns None
+        if no match.
+        """
+        idxs = [i for i, n in enumerate(state_names) if target_substr in n]
+        if not idxs:
+            return None
+        return min(idxs), max(idxs) + 1
+
+    def _ep_stat(row, feature: str, stat: str) -> np.ndarray:
+        col = _stat_col(feature, stat)
+        if col not in eps.columns:
+            return np.array([])
+        return np.asarray(row[col], dtype=float).flatten()
+
+    # action variance — should be NON-zero for a useful demo.
+    action_stds = []
+    for _, row in eps.iterrows():
+        arr = _ep_stat(row, "action", "std")
+        action_stds.append(float(arr.max()) if arr.size else 0.0)
+    if action_stds:
+        print(f"  action.std (max-component, across episodes): "
+              f"min={min(action_stds):.4f} mean={np.mean(action_stds):.4f} "
+              f"max={max(action_stds):.4f}")
+        if max(action_stds) < 1e-4:
+            issues.append(
+                "action stream is ~constant in every episode — almost "
+                "certainly recording the wrong field of MotionUpdate "
+                "(velocity is zero when policy uses set_pose_target). "
+                "Check ACTION_NAMES / _on_pose_cmd in collect_lerobot.py."
+            )
+
+    # groundtruth.port_pose: indexed within observation.state.
+    sl = _state_slice("groundtruth.port_pose")
+    if sl is None:
+        issues.append("groundtruth.port_pose.* not in observation.state")
+    else:
+        s, e = sl
+        zero_eps = []
         for _, row in eps.iterrows():
-            arr = np.asarray(row[_stat_col("action", "std")], dtype=float).flatten()
-            action_stds.append(float(arr.max()) if arr.size else 0.0)
-        if action_stds:
-            print(f"  action.std (max-component, across episodes): "
-                  f"min={min(action_stds):.4f} mean={np.mean(action_stds):.4f} "
-                  f"max={max(action_stds):.4f}")
-            if max(action_stds) < 1e-4:
-                issues.append(
-                    "action stream is ~constant in every episode "
-                    "(robot didn't move, or wrong action topic)"
-                )
-    else:
-        issues.append("no `action` stats column — action wasn't recorded")
+            hi = _ep_stat(row, "observation.state", "max")[s:e]
+            lo = _ep_stat(row, "observation.state", "min")[s:e]
+            if hi.size and lo.size and float(np.max(np.abs(np.concatenate([hi, lo])))) < 1e-9:
+                zero_eps.append(int(row["episode_index"]))
+        if zero_eps:
+            issues.append(
+                f"groundtruth.port_pose is all-zero in episodes {zero_eps} "
+                "(TF lookup not wired or ground_truth:=true was off)"
+            )
+        else:
+            print(f"  groundtruth.port_pose: non-zero in all episodes ✓")
 
-    # groundtruth.port_pose all-zero
-    gt_port_keys = [k for k in feature_keys if "groundtruth.port_pose" in k]
-    if gt_port_keys:
-        gt_key = gt_port_keys[0]
-        col_max = _stat_col(gt_key, "max")
-        col_min = _stat_col(gt_key, "min")
-        if col_max in eps.columns:
-            zero_eps = []
-            for _, row in eps.iterrows():
-                hi = np.asarray(row[col_max], dtype=float).flatten()
-                lo = np.asarray(row[col_min], dtype=float).flatten()
-                if np.max(np.abs(np.concatenate([hi, lo]))) < 1e-9:
-                    zero_eps.append(int(row["episode_index"]))
-            if zero_eps:
-                issues.append(
-                    f"{gt_key} is all-zero in episodes {zero_eps} "
-                    "(TF wasn't wired or ground_truth:=true was off)"
-                )
-            else:
-                print(f"  {gt_key}: non-zero in all episodes ✓")
+    # wrench: variance non-zero
+    sl = _state_slice("wrench.")
+    if sl is None:
+        issues.append("wrench.* not in observation.state")
     else:
-        issues.append("no groundtruth.port_pose feature — TF wasn't logged")
+        s, e = sl
+        const_eps = []
+        for _, row in eps.iterrows():
+            std = _ep_stat(row, "observation.state", "std")[s:e]
+            if std.size and float(std.max()) < 1e-9:
+                const_eps.append(int(row["episode_index"]))
+        if const_eps:
+            issues.append(
+                f"wrench is constant in episodes {const_eps} "
+                "(tare math broken, or fts topic stalled)"
+            )
+        else:
+            print(f"  wrench: variance >0 in all episodes ✓")
 
-    # wrench compensated variance
-    wrench_keys = [k for k in feature_keys if "wrench_compensated" in k]
-    if wrench_keys:
-        w_key = wrench_keys[0]
-        col_std = _stat_col(w_key, "std")
-        if col_std in eps.columns:
-            const_eps = []
-            for _, row in eps.iterrows():
-                arr = np.asarray(row[col_std], dtype=float).flatten()
-                if arr.size and float(arr.max()) < 1e-9:
-                    const_eps.append(int(row["episode_index"]))
-            if const_eps:
-                issues.append(
-                    f"{w_key} is constant in episodes {const_eps} "
-                    "(tare math broken or fts topic stalled)"
-                )
-            else:
-                print(f"  {w_key}: variance >0 in all episodes ✓")
+    # meta.insertion_success: should be 1.0 by end of every saved trial.
+    sl = _state_slice("meta.insertion_success")
+    if sl is None:
+        issues.append("meta.insertion_success not in observation.state")
     else:
-        issues.append("no wrench_compensated feature — F/T wasn't logged")
+        s, e = sl
+        non_inserted = []
+        for _, row in eps.iterrows():
+            hi = _ep_stat(row, "observation.state", "max")[s:e]
+            if hi.size and float(hi.max()) < 0.5:
+                non_inserted.append(int(row["episode_index"]))
+        if non_inserted:
+            issues.append(
+                f"meta.insertion_success never reached 1.0 in episodes "
+                f"{non_inserted} — these saved demos didn't actually insert "
+                f"(discard predicate may have leaked one through)"
+            )
+        else:
+            print(f"  meta.insertion_success: latched to 1.0 in every episode ✓")
 
-    # video files
+    # video files — LeRobot v3 chunks: one mp4 per camera per chunk, NOT per
+    # episode. So 3 cams + few chunks = small file count is normal. Just
+    # verify the directory exists and contains *some* files.
     videos_dir = args.root / "videos"
     if videos_dir.exists():
         n_videos = sum(1 for _ in videos_dir.rglob("*.mp4"))
         cam_keys = [k for k in feature_keys if "image" in k.lower()]
-        expected = len(eps) * len(cam_keys)
-        print(f"  video files:      {n_videos} found "
-              f"(expected ≥{expected}: {len(eps)} ep × {len(cam_keys)} cams)")
-        if expected and n_videos < expected:
+        print(f"  video files:      {n_videos} mp4 across {len(cam_keys)} cams "
+              f"(v3 chunks: count varies with chunk size)")
+        if n_videos == 0:
+            issues.append("videos/ exists but contains 0 mp4 files")
+        elif n_videos < len(cam_keys):
             issues.append(
-                f"only {n_videos} mp4 files (expected {expected}) — "
-                "encoder may have failed silently"
+                f"only {n_videos} mp4 files for {len(cam_keys)} cameras "
+                f"— at least 1 mp4 per camera expected"
             )
     else:
         issues.append("no videos/ directory — videos weren't written")
