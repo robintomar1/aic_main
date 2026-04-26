@@ -444,14 +444,27 @@ def run_collection_loop(
         if discarded:
             try:
                 dataset.clear_episode_buffer()
-                outcome = "discarded_overlong"
+                # Categorize the discard so summary.json is filterable for
+                # debugging without re-parsing reason strings.
+                if "overlong" in reason or reason == "overlapping_goals":
+                    outcome = "discarded_overlong"
+                elif "CANCELED" in reason:
+                    outcome = "discarded_canceled"
+                elif "ABORTED" in reason:
+                    outcome = "discarded_aborted"
+                elif "no_insertion" in reason:
+                    outcome = "discarded_no_insertion"
+                else:
+                    outcome = f"discarded:{reason}"
             except Exception as ex:
                 outcome = f"clear_failed:{ex}"
                 log.error(f"clear_episode_buffer failed: {ex}")
         else:
             try:
                 dataset.save_episode()
-                outcome = "saved_inserted" if insertion_event_fired else "saved_no_insertion"
+                # Under the strict discard predicate, only fully-inserted
+                # SUCCEEDED trials reach this branch.
+                outcome = "saved_inserted"
             except Exception as ex:
                 outcome = f"save_failed:{ex}"
                 log.error(f"save_episode failed: {ex}")
@@ -522,16 +535,33 @@ def run_collection_loop(
             terminal = monitor.goal_terminated_count > goal_terminated_at_trial_start
             overlong = duration_sim > max_episode_s
             if terminal or overlong:
-                if terminal:
+                insertion_event_fired = (
+                    monitor.event_count > event_count_at_trial_start
+                )
+                succeeded = (
+                    terminal
+                    and monitor.last_terminal_status == GoalStatus.STATUS_SUCCEEDED
+                )
+                # Strict discard predicate: only keep trials that (a) didn't
+                # blow the cap, (b) ended via SUCCEEDED action status, AND
+                # (c) actually fired /scoring/insertion_event. Anything else
+                # is a stuck/recovering/aborted trajectory that hurts IL
+                # training quality more than it helps. Replaces the prior
+                # `discarded = overlong` predicate that let CANCELED and
+                # SUCCEEDED-but-no-insertion trials into the dataset.
+                discarded = overlong or (not succeeded) or (not insertion_event_fired)
+                if overlong:
+                    reason = f"overlong_{duration_sim:.1f}s_sim>{max_episode_s}s"
+                else:
                     status_name = {
                         GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED",
                         GoalStatus.STATUS_CANCELED: "CANCELED",
                         GoalStatus.STATUS_ABORTED: "ABORTED",
                     }.get(monitor.last_terminal_status, str(monitor.last_terminal_status))
                     reason = f"action_status_{status_name}"
-                else:
-                    reason = f"overlong_{duration_sim:.1f}s_sim>{max_episode_s}s"
-                _finalize_trial(discarded=overlong, reason=reason)
+                    if succeeded and not insertion_event_fired:
+                        reason += "_no_insertion"
+                _finalize_trial(discarded=discarded, reason=reason)
             else:
                 obs = robot.get_observation()
                 if obs:

@@ -143,6 +143,36 @@ class CheatCodeRobust(Policy):
         self._inserted_flag = True
 
     # ------------------------------------------------------------------
+    # Cancellation / lifecycle abort check
+    # ------------------------------------------------------------------
+    def _should_abort(self) -> bool:
+        """True iff insert_cable() must stop running ASAP.
+
+        The framework's `insert_cable_execute_callback` in aic_model.py returns
+        on cancel, but it does NOT terminate the action_thread that is running
+        this policy method. If we don't poll for the abort condition ourselves,
+        the cancelled trial's insert_cable keeps publishing pose commands while
+        the framework starts a NEW action_thread for the next trial — both
+        threads then interleave move_robot calls. Observed in the 2026-04-26
+        log: trial 2 cancel at sim t=39.4s, trial 3 starts at sim t≈+74s, both
+        running concurrently for ~70 wall sec; then on lifecycle cleanup the
+        publisher was destroyed and trial 2's stale loop spammed
+        `move_robot exception: 'NoneType' object has no attribute 'publish'`
+        for ~25 wall sec.
+        """
+        parent = self._parent_node
+        if not getattr(parent, "is_active", False):
+            return True
+        gh = getattr(parent, "goal_handle", None)
+        if gh is None:
+            return True
+        if not getattr(gh, "is_active", True):
+            return True
+        if getattr(gh, "is_cancel_requested", False):
+            return True
+        return False
+
+    # ------------------------------------------------------------------
     # TF helpers
     # ------------------------------------------------------------------
     def _refresh_port_transform(
@@ -390,6 +420,9 @@ class CheatCodeRobust(Policy):
         # --- APPROACH: smooth interpolation to the hover pose -----------
         self.get_logger().info("Phase: APPROACH")
         for t in range(0, self.APPROACH_STEPS):
+            if self._should_abort():
+                self.get_logger().info("APPROACH: aborting (cancel/deactivate)")
+                return False
             interp_fraction = t / float(self.APPROACH_STEPS)
             try:
                 self.set_pose_target(
@@ -417,6 +450,9 @@ class CheatCodeRobust(Policy):
         stable_since = None
         converged = False
         while self.time_now() < align_timeout:
+            if self._should_abort():
+                self.get_logger().info("ALIGN: aborting (cancel/deactivate)")
+                return False
             port_transform = self._refresh_port_transform(port_frame, port_transform)
             try:
                 self.set_pose_target(
@@ -479,6 +515,9 @@ class CheatCodeRobust(Policy):
         force_stopped_count = 0
 
         while z_offset > self.INSERT_Z_OFFSET:
+            if self._should_abort():
+                self.get_logger().info("INSERT: aborting (cancel/deactivate)")
+                return False
             if self._inserted_flag:
                 self.get_logger().info(
                     f"INSERT: insertion_event received, exiting at "
