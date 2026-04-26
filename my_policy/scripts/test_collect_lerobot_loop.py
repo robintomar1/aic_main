@@ -309,20 +309,94 @@ def test_overlong_discard_then_stale_terminal_then_normal():
     assert error_calls == [], f"unexpected save_episode errors: {error_calls}"
 
 
-def test_terminal_aborted_short_trial_is_saved():
-    """Trial ends quickly via ABORTED (e.g., ALIGN-bailout return False) — short
-    enough to NOT be overlong; should still be saved (with insertion_success=0)."""
+def test_succeeded_no_insertion_is_discarded():
+    """Trial ends via STATUS_SUCCEEDED but no /scoring/insertion_event fired
+    (e.g., policy returned False on ALIGN bail). The action-level success means
+    only "the policy method returned without exception", not "the cable was
+    inserted". For IL data quality these demos are useless — the gripper traced
+    a path that does NOT end in insertion — so the recorder must DISCARD them
+    rather than save them as `saved_no_insertion`.
+    """
     trials = [_make_trial("sc", "sc_port_base", "sc_port_0", "cable_1")]
     events = [
         (0.1, "goal_start", {}),
-        # No insertion event. Engine returns SUCCEEDED on policy returning False
-        # (the action goal completes successfully even if the policy says fail).
         (5.0, "goal_terminate", {"status": _FakeGoalStatus.STATUS_SUCCEEDED}),
     ]
     summary, _, _, dataset, _ = _run(trials, events, max_episode_s=40.0)
-    assert summary["trials"][0]["outcome"] == "saved_no_insertion", summary["trials"][0]
+    assert summary["trials"][0]["outcome"].startswith("discarded"), summary["trials"][0]
+    assert summary["trials"][0]["insertion_event_fired"] is False
+    assert dataset.save_episode_calls == 0, (
+        f"trial without insertion must NOT be saved; got {dataset.save_episode_calls}"
+    )
+    assert dataset.clear_episode_buffer_calls == 1
+
+
+def test_canceled_trial_is_discarded():
+    """Engine cancels the goal (typically because Task.time_limit elapsed in sim).
+    Trial 2 in 2026-04-26 model.log: cancel arrived at sim t=39.4s, JUST under
+    the recorder's 40s overlong cap. Currently the recorder saves it as
+    `saved_no_insertion`; that polluted the dataset with a 39-second trajectory
+    of the policy thrashing against the port rim. Must be discarded.
+    """
+    trials = [_make_trial("sfp", "sfp_port_0", "nic_card_mount_4", "cable_0")]
+    events = [
+        (0.1, "goal_start", {}),
+        # Cancel at sim t=39.4 — under the 40s cap, but no insertion.
+        (39.4, "goal_terminate", {"status": _FakeGoalStatus.STATUS_CANCELED}),
+    ]
+    summary, _, _, dataset, _ = _run(trials, events, max_episode_s=40.0)
+    assert summary["trials"][0]["outcome"].startswith("discarded"), summary["trials"][0]
+    assert summary["trials"][0]["insertion_event_fired"] is False
+    assert dataset.save_episode_calls == 0
+    assert dataset.clear_episode_buffer_calls == 1
+
+
+def test_aborted_trial_is_discarded():
+    """STATUS_ABORTED (action server reported abort, e.g. exception in policy
+    thread). Same reasoning as canceled — no useful demo, must discard.
+    """
+    trials = [_make_trial("sfp", "sfp_port_0", "nic_card_mount_4", "cable_0")]
+    events = [
+        (0.1, "goal_start", {}),
+        (5.0, "goal_terminate", {"status": _FakeGoalStatus.STATUS_ABORTED}),
+    ]
+    summary, _, _, dataset, _ = _run(trials, events, max_episode_s=40.0)
+    assert summary["trials"][0]["outcome"].startswith("discarded"), summary["trials"][0]
+    assert dataset.save_episode_calls == 0
+
+
+def test_succeeded_with_insertion_short_trial_is_saved():
+    """Positive control: SUCCEEDED + insertion event under the cap → SAVED.
+    Distinct from happy_path which has two trials; this isolates the single-
+    trial save path so a regression in the new discard predicate doesn't
+    accidentally drop good demos.
+    """
+    trials = [_make_trial("sc", "sc_port_base", "sc_port_1", "cable_1")]
+    events = [
+        (0.1, "goal_start", {}),
+        (15.0, "insertion_event", {}),
+        (18.0, "goal_terminate", {"status": _FakeGoalStatus.STATUS_SUCCEEDED}),
+    ]
+    summary, _, _, dataset, _ = _run(trials, events, max_episode_s=40.0)
+    assert summary["trials"][0]["outcome"] == "saved_inserted", summary["trials"][0]
     assert dataset.save_episode_calls == 1
     assert dataset.clear_episode_buffer_calls == 0
+
+
+def test_canceled_overlong_trial_is_discarded():
+    """If both overlong AND canceled fire (e.g., engine's time_limit slightly
+    exceeds our cap), trial must still be discarded — no double-save, no save.
+    """
+    trials = [_make_trial("sfp", "sfp_port_0", "nic_card_mount_4", "cable_0")]
+    events = [
+        (0.1, "goal_start", {}),
+        # Cancel arrives at sim t=42 — past our 40s cap.
+        (42.0, "goal_terminate", {"status": _FakeGoalStatus.STATUS_CANCELED}),
+    ]
+    summary, _, _, dataset, _ = _run(trials, events, max_episode_s=40.0)
+    assert summary["trials"][0]["outcome"].startswith("discarded"), summary["trials"][0]
+    assert dataset.save_episode_calls == 0
+    assert dataset.clear_episode_buffer_calls == 1
 
 
 def test_sim_time_used_for_overlong_not_wall_time():
@@ -395,7 +469,10 @@ def test_per_trial_baselines_isolate_event_counts():
     assert summary["trials"][0]["outcome"] == "saved_inserted"
     # Critical: trial 1 should NOT see trial 0's insertion event.
     assert summary["trials"][1]["insertion_event_fired"] is False, summary["trials"][1]
-    assert summary["trials"][1]["outcome"] == "saved_no_insertion"
+    # Under the strict discard predicate trial 1 is discarded (no insertion);
+    # what we're really verifying here is that it's NOT saved_inserted —
+    # i.e., trial 0's leftover insertion_event isn't bleeding through.
+    assert summary["trials"][1]["outcome"] != "saved_inserted", summary["trials"][1]
 
 
 # ============================================================================
@@ -406,7 +483,11 @@ if __name__ == "__main__":
     tests = [
         test_happy_path_two_trials_succeed,
         test_overlong_discard_then_stale_terminal_then_normal,
-        test_terminal_aborted_short_trial_is_saved,
+        test_succeeded_no_insertion_is_discarded,
+        test_canceled_trial_is_discarded,
+        test_aborted_trial_is_discarded,
+        test_succeeded_with_insertion_short_trial_is_saved,
+        test_canceled_overlong_trial_is_discarded,
         test_sim_time_used_for_overlong_not_wall_time,
         test_overlapping_goals_discards_previous,
         test_per_trial_baselines_isolate_event_counts,
