@@ -663,9 +663,17 @@ def main() -> int:
     logs_dir = args.root.parent / (args.root.name + "_logs")
     logs_dir.mkdir(exist_ok=True)
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
+    # force=True overrides any logging config that lerobot/rclpy applied at
+    # import time. Without this, basicConfig is a no-op and our log.info()
+    # calls go nowhere visible.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        force=True,
+        stream=sys.stdout,  # rcl logs go to stderr; keep ours separate.
+    )
     log = logging.getLogger("collect_lerobot")
+    log.setLevel(logging.INFO)
 
     # --- Trial sequence
     trials = load_trial_sequence(args.batch_config)
