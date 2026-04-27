@@ -157,26 +157,19 @@ class LocalizerDataset:
                 f"yields {expected_eps}; dataset and summary out of sync"
             )
 
-        # --- Optional LeRobot handle for image decoding. Force pyav backend:
-        # torchcodec needs FFmpeg ≤ 7 but pixi ships FFmpeg 8 — same trap
-        # viz_dataset.py documents. pyav ships its own FFmpeg statically.
-        # Monkey-patch __init__ before .resume() so kwargs propagate even on
-        # versions where .resume() doesn't accept video_backend directly.
+        # --- Optional LeRobot handle for image decoding. Use the plain
+        # constructor (NOT .resume() — that opens in "recording" mode and
+        # rejects __getitem__ until finalize() is called; we want read-only).
+        # Force pyav backend: torchcodec needs FFmpeg ≤ 7 but pixi ships
+        # FFmpeg 8 — same trap viz_dataset.py documents. pyav ships its own
+        # FFmpeg statically.
         if self._cameras:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
-            _orig_init = LeRobotDataset.__init__
-
-            def _patched_init(s, *a, **kw):
-                kw.setdefault("video_backend", "pyav")
-                return _orig_init(s, *a, **kw)
-
-            LeRobotDataset.__init__ = _patched_init
-            try:
-                self._lr = LeRobotDataset.resume(
-                    repo_id=repo_id, root=str(self._dataset_root)
-                )
-            finally:
-                LeRobotDataset.__init__ = _orig_init
+            self._lr = LeRobotDataset(
+                repo_id=repo_id,
+                root=str(self._dataset_root),
+                video_backend="pyav",
+            )
         else:
             self._lr = None
 
