@@ -30,11 +30,11 @@ from pathlib import Path
 
 import numpy as np
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
+_PACKAGE_PARENT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PACKAGE_PARENT))
 
-from my_policy.my_policy.localizer.dataset import LocalizerDataset  # noqa: E402
-from my_policy.my_policy.localizer.labels import reconstruct_port_in_baselink  # noqa: E402
+from my_policy.localizer.dataset import LocalizerDataset  # noqa: E402
+from my_policy.localizer.labels import reconstruct_port_in_baselink  # noqa: E402
 
 
 def _locate_artifacts(dataset_root: Path) -> tuple[Path, Path]:

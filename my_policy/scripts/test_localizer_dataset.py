@@ -24,12 +24,11 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-# Make the package importable from a checkout (no installation needed).
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
+_PACKAGE_PARENT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PACKAGE_PARENT))
 
-from my_policy.my_policy.localizer.dataset import LocalizerDataset  # noqa: E402
-from my_policy.my_policy.localizer.labels import (  # noqa: E402
+from my_policy.localizer.dataset import LocalizerDataset  # noqa: E402
+from my_policy.localizer.labels import (  # noqa: E402
     compute_label,
     match_episodes_to_trials,
     reconstruct_port_in_baselink,

@@ -266,6 +266,104 @@ def reconstruct_port_in_baselink(
     return board_xyz_baselink + R @ port_in_board
 
 
+def _quat_multiply_wxyz(q1: tuple, q2: tuple) -> tuple:
+    """Hamilton product, (w, x, y, z) convention."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return (
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    )
+
+
+def _yaw_quat(yaw_rad: float) -> tuple:
+    """R_z(yaw) as (w, x, y, z)."""
+    half = yaw_rad * 0.5
+    return (math.cos(half), 0.0, 0.0, math.sin(half))
+
+
+def calibrate_port_in_board_rotations(
+    dataset_root: Path,
+    batch_yaml: Path,
+    summary_json: Path,
+) -> dict[tuple[str, str], tuple[float, float, float, float]]:
+    """Empirically derive Q_port_in_board per (port_type, port_name).
+
+    Inverse of: Q_port_baselink = R_z(board_yaw) ⊗ Q_port_in_board
+    Therefore: Q_port_in_board = R_z(-board_yaw) ⊗ Q_port_baselink
+
+    The static value should be identical across all frames of any given trial
+    (Gazebo TF noise aside) and across rail indices for the same port_name
+    (geometry of the port frame itself doesn't depend on which rail it's on).
+    Averages across all frames of all trials sharing a (port_type, port_name).
+
+    Returns a dict suitable for handing to PortLocalizer.set_port_in_board_quat()
+    or for hardcoding as a constant.
+
+    Reads parquet directly to avoid needing lerobot/torch.
+    """
+    import pyarrow.parquet as pq
+    import yaml as _yaml
+
+    cfg = _yaml.safe_load(Path(batch_yaml).read_text())
+    summary = json.loads(Path(summary_json).read_text())
+    ep_to_trial = match_episodes_to_trials(summary, cfg["trials"])
+
+    parquet_path = Path(dataset_root) / "data" / "chunk-000" / "file-000.parquet"
+    info = json.loads((Path(dataset_root) / "meta" / "info.json").read_text())
+    state_names = info["features"]["observation.state"]["names"]
+    quat_idx = [state_names.index(f"groundtruth.port_pose.q{c}") for c in "xyzw"]
+
+    table = pq.read_table(str(parquet_path),
+                           columns=["observation.state", "episode_index"])
+    eps = table["episode_index"].to_numpy().astype(np.int64)
+    states = np.stack([
+        np.asarray(r, dtype=np.float64) for r in table["observation.state"].to_pylist()
+    ])
+
+    # Group all (qw, qx, qy, qz) of port_in_board by (port_type, port_name).
+    samples: dict[tuple[str, str], list[tuple[float, ...]]] = {}
+    for ep, trial_key in ep_to_trial.items():
+        trial = cfg["trials"][trial_key]
+        task = trial["tasks"]["task_1"]
+        port_type = task["port_type"]
+        port_name = task["port_name"]
+        label = compute_label(trial)
+        # Take the first frame's quaternion of this episode (constant, but
+        # averaging over all frames adds robustness to TF noise).
+        mask = eps == ep
+        if not mask.any():
+            continue
+        ep_states = states[mask]
+        # Q_baselink reading: parquet stores (qx, qy, qz, qw); convert to (w,x,y,z).
+        qx, qy, qz, qw = ep_states[:, quat_idx].T
+        for k in range(len(qw)):
+            q_port_baselink = (float(qw[k]), float(qx[k]), float(qy[k]), float(qz[k]))
+            q_unyaw = _yaw_quat(-label.board_yaw_baselink_rad)
+            q_port_in_board = _quat_multiply_wxyz(q_unyaw, q_port_baselink)
+            samples.setdefault((port_type, port_name), []).append(q_port_in_board)
+
+    out: dict[tuple[str, str], tuple[float, float, float, float]] = {}
+    for key, quats in samples.items():
+        arr = np.asarray(quats)
+        # Quaternion averaging: simple mean is biased but works when the spread
+        # is tiny (sub-degree). Re-normalize to unit quaternion.
+        # For more spread, would need quaternion-aware averaging (Markley method).
+        mean = arr.mean(axis=0)
+        mean = mean / np.linalg.norm(mean)
+        # Sanity: per-frame std should be ~1e-5 if the static rotation is real.
+        spread = float(np.std(arr, axis=0).max())
+        if spread > 1e-3:
+            print(
+                f"WARNING: large spread in port_in_board quat for {key}: "
+                f"std_max={spread:.5f}. Calibration may be unreliable."
+            )
+        out[key] = (float(mean[0]), float(mean[1]), float(mean[2]), float(mean[3]))
+    return out
+
+
 def match_episodes_to_trials(
     summary: dict,
     yaml_trials: dict,

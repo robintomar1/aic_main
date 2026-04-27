@@ -21,11 +21,14 @@ from pathlib import Path
 
 import numpy as np
 
-# Make the package importable from a checkout (no installation needed).
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT))
+# Make the package importable from a checkout. sys.path is set to the parent
+# of `my_policy/my_policy/`, NOT the workspace root, because the outer
+# `my_policy/` directory is a ROS package without __init__.py, and a colcon-
+# installed `my_policy` namespace can shadow it inside the pixi env.
+_PACKAGE_PARENT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PACKAGE_PARENT))
 
-from my_policy.my_policy.localizer.labels import (  # noqa: E402
+from my_policy.localizer.labels import (  # noqa: E402
     SC_PORT_BASE_OFFSET_IN_BOARD,
     SFP_PORT_OFFSET_IN_MOUNT,
     TASK_ONE_HOT_DIM,
