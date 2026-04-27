@@ -47,6 +47,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -60,7 +61,7 @@ import rclpy
 import yaml
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from aic_control_interfaces.msg import MotionUpdate
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import (
@@ -687,6 +688,20 @@ def main() -> int:
     args.root.parent.mkdir(parents=True, exist_ok=True)
     logs_dir = args.root.parent / (args.root.name + "_logs")
     logs_dir.mkdir(exist_ok=True)
+
+    # Suppress the noisy "Exception in thread Thread-N (spin)
+    # rclpy.executors.ExternalShutdownException" stacktraces that fire from
+    # third-party spin threads (lerobot adapter, tf2_ros listener) during
+    # rclpy.shutdown() at the end of a clean run. The threads exit fine; only
+    # the unhandled-exception logging is noise. Functional behavior unchanged.
+    _orig_excepthook = threading.excepthook
+
+    def _quiet_external_shutdown(args_):
+        if isinstance(args_.exc_value, ExternalShutdownException):
+            return
+        _orig_excepthook(args_)
+
+    threading.excepthook = _quiet_external_shutdown
 
     # force=True overrides any logging config that lerobot/rclpy applied at
     # import time. Without this, basicConfig is a no-op and our log.info()
