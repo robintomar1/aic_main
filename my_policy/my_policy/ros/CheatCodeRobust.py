@@ -105,6 +105,20 @@ class CheatCodeRobust(Policy):
     HOLD_RETREAT_STEP = 0.0001       # 2 mm/s retreat at 50 ms tick
     HOLD_RETREAT_MAX = 0.005         # cap retreat per single hold at 5 mm
 
+    # Inside-port XY lock. Once the plug body is past the port's chamfer the
+    # mechanical walls constrain XY — continued P/I corrections fight that
+    # constraint, generating lateral forces that bind the plug or amplify
+    # force-hold engagements. Latch on (xy_err small AND plug_tip below port
+    # plane by depth-threshold), freeze the commanded XY+orientation, and let
+    # only Z continue to descend. Per-plug-type depth: SFP body is longer so
+    # the tip needs to be deeper before we trust "inside"; SC is shorter.
+    INSIDE_XY_THRESHOLD_M = 0.002    # tighter than ALIGN (2.5 mm) by design
+    INSIDE_DEPTH_BY_PLUG = {
+        "sfp": -0.003,
+        "sc": -0.0015,
+    }
+    INSIDE_DEPTH_DEFAULT = -0.002
+
     # Status print throttle. Periodic 1Hz line during APPROACH/ALIGN/INSERT
     # with the metrics we actually want to see (xy err, z err, traj time,
     # Fz). Replaces the framework's bare "insert_cable execute loop" heartbeat
@@ -119,6 +133,8 @@ class CheatCodeRobust(Policy):
         # Latched on first "inserted" event; reset at the start of each
         # insert_cable call so stale events don't bleed across trials.
         self._inserted_flag = False
+        # Inside-port XY lock state; reset per trial in insert_cable().
+        self._inside_latched = False
         super().__init__(parent_node)
         # Match the QoS the aic_scoring node advertises
         # (reliable, volatile, keep_last, depth 10) — same profile we use
@@ -393,6 +409,7 @@ class CheatCodeRobust(Policy):
         self._task = task
         # Reset insertion-event latch for this trial.
         self._inserted_flag = False
+        self._inside_latched = False
         self._last_status_log_t = None
         traj_start = self.time_now()
 
@@ -513,6 +530,10 @@ class CheatCodeRobust(Policy):
         hold_z_offset = None             # commanded Z during hold (retreats upward)
         hold_entry_z_offset = None       # z_offset at the moment of hold entry
         force_stopped_count = 0
+        inside_depth_threshold = self.INSIDE_DEPTH_BY_PLUG.get(
+            task.plug_type, self.INSIDE_DEPTH_DEFAULT)
+        locked_pose: Pose | None = None
+        locked_z_offset: float | None = None
 
         while z_offset > self.INSERT_Z_OFFSET:
             if self._should_abort():
@@ -575,18 +596,57 @@ class CheatCodeRobust(Policy):
             if hold_start is None:
                 z_offset -= self.DESCENT_STEP
 
-            # Command the gripper. Always recompute via _calc_gripper_pose
-            # so the XY integrator keeps correcting. Z is pinned to the
-            # frozen hold_z_offset during a hold.
+            # Command the gripper. Pre-latch: recompute via _calc_gripper_pose
+            # so the XY integrator keeps correcting. Z is pinned to the frozen
+            # hold_z_offset during a hold. Post-latch: pin XY/orientation to
+            # the locked pose; gripper Z tracks effective_z 1:1 from the latch
+            # point so descent and force-hold retreat both work transparently.
             effective_z = hold_z_offset if hold_start is not None else z_offset
             port_transform = self._refresh_port_transform(
                 port_frame, port_transform)
+
+            # Inside-port latch check (only while not yet latched).
+            if not self._inside_latched:
+                try:
+                    plug_tf_latch = self._parent_node._tf_buffer.lookup_transform(
+                        "base_link", cable_tip_frame, Time())
+                    dx = (port_transform.translation.x
+                          - plug_tf_latch.transform.translation.x)
+                    dy = (port_transform.translation.y
+                          - plug_tf_latch.transform.translation.y)
+                    dz_plug = (plug_tf_latch.transform.translation.z
+                               - port_transform.translation.z)
+                    xy_err_latch = (dx * dx + dy * dy) ** 0.5
+                    if (xy_err_latch < self.INSIDE_XY_THRESHOLD_M
+                            and dz_plug < inside_depth_threshold):
+                        locked_pose = self._calc_gripper_pose(
+                            port_transform, z_offset=effective_z)
+                        locked_z_offset = effective_z
+                        self._inside_latched = True
+                        self.get_logger().info(
+                            f"INSERT: inside-port latch engaged "
+                            f"(xy_err={xy_err_latch * 1000:.1f}mm, "
+                            f"plug_dz={dz_plug * 1000:.1f}mm) — "
+                            f"freezing XY/orientation, Z-only from here")
+                except TransformException:
+                    pass
+
             try:
-                self.set_pose_target(
-                    move_robot=move_robot,
-                    pose=self._calc_gripper_pose(
-                        port_transform, z_offset=effective_z),
-                )
+                if self._inside_latched and locked_pose is not None:
+                    target_z = (locked_pose.position.z
+                                + (effective_z - locked_z_offset))
+                    pose = Pose(
+                        position=Point(
+                            x=locked_pose.position.x,
+                            y=locked_pose.position.y,
+                            z=target_z,
+                        ),
+                        orientation=locked_pose.orientation,
+                    )
+                else:
+                    pose = self._calc_gripper_pose(
+                        port_transform, z_offset=effective_z)
+                self.set_pose_target(move_robot=move_robot, pose=pose)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insert: {ex}")
 

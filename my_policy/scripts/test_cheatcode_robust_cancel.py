@@ -428,6 +428,93 @@ def test_insert_cable_aborts_mid_approach_when_cancel_arrives():
     )
 
 
+def _make_parent_with_plug_at(plug_xyz):
+    """FakeParentNode whose plug TF is configurable. Used by inside-latch tests.
+
+    Port stays at (0,0,0); gripper TCP stays at (0,0,0.5); plug at given xyz.
+    """
+    parent = FakeParentNode()
+
+    def _lookup(target, source, time):
+        if "tcp" in source:
+            return _TFStamped(_Transform(0.0, 0.0, 0.5))
+        if "plug" in source.lower() or "tip" in source:
+            return _TFStamped(_Transform(*plug_xyz))
+        return _TFStamped(_Transform(0.0, 0.0, 0.0))
+
+    parent._tf_buffer.lookup_transform = _lookup
+    return parent
+
+
+def test_insert_locks_xy_once_plug_inside_port():
+    """When plug satisfies (xy_err < INSIDE_XY_THRESHOLD AND
+    plug_z - port_z < INSIDE_DEPTH), the policy must freeze its commanded
+    XY/orientation. Subsequent commands may only change Z.
+
+    Setup: plug at (0.001, 0, -0.005) — 1 mm xy_err (< 2 mm) and 5 mm below
+    port plane (< -3 mm INSIDE_DEPTH for sfp). Latch should fire on the very
+    first INSERT iteration.
+    """
+    parent = _make_parent_with_plug_at((0.001, 0.0, -0.005))
+    policy = CheatCodeRobust(parent)
+    move_robot, get_obs, send_fb, _ = _build_callbacks()
+
+    captured = []
+
+    def capture(motion_update=None, joint_motion_update=None):
+        if motion_update is not None and hasattr(motion_update, "position"):
+            captured.append((
+                motion_update.position.x,
+                motion_update.position.y,
+                motion_update.position.z,
+            ))
+
+    policy.insert_cable(_make_task(), get_obs, capture, send_fb)
+
+    assert policy._inside_latched is True, (
+        "expected inside-port latch to engage with plug at (1mm, 0, -5mm) "
+        "vs port at origin"
+    )
+
+    # Take the last K commanded poses (deep into INSERT, well past latch).
+    # XY must be constant (locked); Z must vary (still descending).
+    tail = captured[-200:]
+    assert len(tail) > 50, f"expected many INSERT iterations, got {len(tail)}"
+    xs = [p[0] for p in tail]
+    ys = [p[1] for p in tail]
+    zs = [p[2] for p in tail]
+    assert max(xs) - min(xs) < 1e-9, (
+        f"X must be locked post-latch but varied by "
+        f"{(max(xs) - min(xs)) * 1000:.3f} mm"
+    )
+    assert max(ys) - min(ys) < 1e-9, (
+        f"Y must be locked post-latch but varied by "
+        f"{(max(ys) - min(ys)) * 1000:.3f} mm"
+    )
+    assert max(zs) - min(zs) > 1e-4, (
+        "Z must continue to descend post-latch but appears frozen"
+    )
+
+
+def test_insert_does_not_lock_xy_on_near_miss():
+    """xy_err just above INSIDE_XY_THRESHOLD: latch must NOT engage even
+    though the plug is below the port plane. Guards against premature lock
+    that would freeze the integrator on a misaligned plug.
+
+    Setup: plug at (0.005, 0, -0.005) — 5 mm xy_err > 2 mm threshold.
+    """
+    parent = _make_parent_with_plug_at((0.005, 0.0, -0.005))
+    policy = CheatCodeRobust(parent)
+    move_robot, get_obs, send_fb, _ = _build_callbacks()
+
+    policy.insert_cable(_make_task(), get_obs, move_robot, send_fb)
+
+    assert policy._inside_latched is False, (
+        "latch must NOT engage when xy_err (5 mm) exceeds "
+        "INSIDE_XY_THRESHOLD_M (2 mm), even with plug below port plane"
+    )
+
+
 def test_insert_cable_aborts_when_node_deactivates_mid_run():
     """Same as above but trip lifecycle deactivation instead of cancel."""
     parent = FakeParentNode()
@@ -463,6 +550,8 @@ if __name__ == "__main__":
         test_insert_cable_returns_false_when_cancel_requested_at_start,
         test_insert_cable_aborts_mid_approach_when_cancel_arrives,
         test_insert_cable_aborts_when_node_deactivates_mid_run,
+        test_insert_locks_xy_once_plug_inside_port,
+        test_insert_does_not_lock_xy_on_near_miss,
     ]
     failures = 0
     for t in tests:
