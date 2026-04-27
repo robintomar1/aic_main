@@ -54,9 +54,9 @@ class CheatCodeRobust(Policy):
     # cable's lateral inertia + admittance compliance gives the loop enough
     # phase lag that 0.5 over-reacts. 0.3 still drives the steady-state
     # error fast enough that the I term doesn't have to work alone.
-    PROPORTIONAL_GAIN = 0.2
-    INTEGRATOR_GAIN = 0.1
-    MAX_INTEGRATOR_WINDUP = 0.15     # 15 mm max I correction; typical
+    PROPORTIONAL_GAIN = 0.3
+    INTEGRATOR_GAIN = 0.15
+    MAX_INTEGRATOR_WINDUP = 0.30     # 15 mm max I correction; typical
                                      # steady-state cable offset after settling
 
     # Timing / kinematics.
@@ -70,9 +70,9 @@ class CheatCodeRobust(Policy):
     HOVER_Z_OFFSET_DEFAULT = 0.10
     INSERT_Z_OFFSET = -0.015         # final descent depth (upstream value)
     APPROACH_STEPS = 100
-    APPROACH_SLEEP = 0.05            # 100 * 0.05 = 5 s approach
-    DESCENT_STEP = 0.0004            # 0.2 mm per tick
-    DESCENT_SLEEP = 0.05             # -> 4 mm/s (graceful insertion descent)
+    APPROACH_SLEEP = 0.06            # 100 * 0.06 = 6 s approach
+    DESCENT_STEP = 0.0003            # 0.15 mm per tick
+    DESCENT_SLEEP = 0.05             # -> 3 mm/s (graceful insertion descent)
 
     # ALIGN phase: gate descent on actual XY convergence. Tightened to
     # 2.5 mm so we enter the chamfer with margin, not at the edge.
@@ -81,13 +81,13 @@ class CheatCodeRobust(Policy):
     # of stuck-misaligned cases faster.
     ALIGN_XY_THRESHOLD_M = 0.0025
     ALIGN_STABLE_S = 1.0
-    ALIGN_TIMEOUT_S = 5.0
+    ALIGN_TIMEOUT_S = 10.0
     ALIGN_POLL_S = 0.05
-    # If we time out with residual xy error worse than this, abort the trial
-    # rather than descend into bad alignment (would smash the port and produce
-    # a useless demo for IL training). Set above XY_THRESHOLD so a near-miss
-    # still tries to insert, but a 1+ cm misalignment bails cleanly.
-    ALIGN_BAIL_XY_M = 0.008
+    # ALIGN_BAIL_XY_M removed 2026-04-29: policy-side trial termination is no
+    # longer used. Authoritative terminator is the eval container's per-task
+    # time_limit. Bad demos are filtered downstream by the recorder's
+    # strict-discard predicate (only trials firing /scoring/insertion_event
+    # are saved).
 
     # INSERT phase force gate. Thresholds sit just below the scoring
     # penalty cutoff (>20 N for >1 s = -12 pts). Setting STOP at 18 N
@@ -718,12 +718,14 @@ class CheatCodeRobust(Policy):
             else:
                 self.get_logger().info(f"ALIGN converged (xy_err < {self.ALIGN_XY_THRESHOLD_M * 1000:.1f} mm)")
         else:
+            # Policy-side trial termination removed 2026-04-29: previously we
+            # returned False on xy_err > ALIGN_BAIL_XY_M to prevent bad demos,
+            # but the eval container's per-task time_limit is the authoritative
+            # terminator at submission time anyway. Always descend after ALIGN
+            # timeout — the recorder's strict-discard predicate filters out
+            # trials that don't fire /scoring/insertion_event, so bad attempts
+            # don't pollute the dataset.
             xy_err_mm = xy_err * 1000 if (xy_err is not None and xy_err < float("inf")) else float("inf")
-            if xy_err is not None and xy_err > self.ALIGN_BAIL_XY_M:
-                self.get_logger().error(
-                    f"ALIGN timeout with xy_err {xy_err_mm:.1f} mm > "
-                    f"{self.ALIGN_BAIL_XY_M * 1000:.1f} mm bail threshold — aborting trial.")
-                return False
             self.get_logger().warn(
                 f"ALIGN timeout after {self.ALIGN_TIMEOUT_S}s — descending anyway. "
                 f"Last xy_err: {xy_err_mm:.1f} mm")
