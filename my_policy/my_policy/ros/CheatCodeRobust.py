@@ -18,6 +18,10 @@ Changes vs. upstream CheatCode:
 Training-oracle only. Uses ground_truth:=true TF and is NOT submission-safe.
 """
 
+import hashlib
+import math
+import os
+
 import numpy as np
 
 from aic_model.policy import (
@@ -141,6 +145,18 @@ class CheatCodeRobust(Policy):
     # in aic_model.py — that's policy-agnostic and can't see these values.
     STATUS_LOG_PERIOD_S = 1.0
 
+    # Noise injection for the localizer-accuracy bench. When the env vars
+    # are set, every port-pose lookup from TF is perturbed by a deterministic
+    # per-trial offset before downstream use. This mimics what a learned
+    # board-pose localizer at submission time would feed CheatCodeRobust:
+    # localizer error in (board_x, board_y, board_yaw) translates 1:1 to
+    # port-pose error in base_link, so injecting at the port level is exactly
+    # equivalent to injecting at the board level. Used to measure how much
+    # error the PI controller + chamfer search + retreat-during-hold can
+    # mechanically absorb. NOT submission-safe (this is a bench knob).
+    NOISE_XY_M_ENV = "CHEATCODE_NOISE_XY_M"
+    NOISE_YAW_RAD_ENV = "CHEATCODE_NOISE_YAW_RAD"
+
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
@@ -151,6 +167,10 @@ class CheatCodeRobust(Policy):
         self._inserted_flag = False
         # Inside-port XY lock state; reset per trial in insert_cable().
         self._inside_latched = False
+        # Per-trial port-pose noise offsets; populated at insert_cable() start
+        # from env vars. (0,0)/0.0 is a no-op (the default).
+        self._noise_xy_offset: tuple[float, float] = (0.0, 0.0)
+        self._noise_yaw_offset: float = 0.0
         super().__init__(parent_node)
         # Match the QoS the aic_scoring node advertises
         # (reliable, volatile, keep_last, depth 10) — same profile we use
@@ -213,11 +233,12 @@ class CheatCodeRobust(Policy):
         """Re-read the port transform from TF so alignment follows any pose
         changes (board jitter, residual orientation drift). Falls back to
         last_good on transient TF failure so the descent loop keeps running.
+        Applies bench noise (no-op when env vars unset).
         """
         try:
             stamped = self._parent_node._tf_buffer.lookup_transform(
                 "base_link", port_frame, Time())
-            return stamped.transform
+            return self._apply_pose_noise(stamped.transform)
         except TransformException:
             return last_good
 
@@ -243,6 +264,89 @@ class CheatCodeRobust(Policy):
         self.get_logger().error(
             f"Transform '{source_frame}' not available after {timeout_sec}s")
         return False
+
+    # ------------------------------------------------------------------
+    # Port-pose noise injection (localizer-accuracy bench)
+    # ------------------------------------------------------------------
+    def _read_noise_config(self) -> tuple[float, float]:
+        """Returns (xy_radius_m, yaw_radius_rad) from env vars; zeros = no-op."""
+        try:
+            xy = float(os.environ.get(self.NOISE_XY_M_ENV, "0.0"))
+        except ValueError:
+            xy = 0.0
+        try:
+            yaw = float(os.environ.get(self.NOISE_YAW_RAD_ENV, "0.0"))
+        except ValueError:
+            yaw = 0.0
+        return xy, yaw
+
+    def _sample_trial_noise(
+        self, task
+    ) -> tuple[tuple[float, float], float]:
+        """Per-trial deterministic noise offset for port-pose perturbation.
+
+        Same task identity → same offset across re-runs (so a re-bench at the
+        same noise magnitude produces the same trajectory). Different tasks
+        within a batch get different offsets (random angle in XY, random sign
+        for yaw) so the bench measures robustness to noise in any direction,
+        not just one. Magnitudes from env vars; both zero → returns no-op.
+        """
+        xy_radius, yaw_radius = self._read_noise_config()
+        if xy_radius == 0.0 and yaw_radius == 0.0:
+            return (0.0, 0.0), 0.0
+        seed_str = (
+            f"{task.cable_name}|{task.target_module_name}|"
+            f"{task.port_name}|{task.plug_name}"
+        )
+        # Stable 32-bit seed from the task-identity bytes. SHA-1 spreads the
+        # whole string across the bits — int.from_bytes(...) % 2^32 would only
+        # see the bottom 4 bytes (little-endian truncation), causing two task
+        # identities that share their first 4 bytes (e.g. "cable_0…", "cable_1…")
+        # to collide. Python's built-in hash() is salted per-process so it
+        # can't be used for cross-run determinism.
+        digest = hashlib.sha1(seed_str.encode()).digest()
+        seed = int.from_bytes(digest[:4], "little")
+        rng = np.random.default_rng(seed)
+        theta = rng.uniform(0.0, 2.0 * math.pi)
+        xy = (xy_radius * math.cos(theta), xy_radius * math.sin(theta))
+        yaw_sign = 1.0 if rng.random() < 0.5 else -1.0
+        yaw = yaw_sign * yaw_radius
+        return xy, yaw
+
+    def _apply_pose_noise(self, transform: Transform) -> Transform:
+        """Return a NEW Transform with the trial-fixed noise offsets applied.
+
+        XY translation is shifted by self._noise_xy_offset; rotation is
+        left-multiplied by R_z(self._noise_yaw_offset) so the port "looks"
+        rotated about base_link Z. Z, roll, pitch unchanged. Does not mutate
+        the input. Returns the input unchanged when both offsets are zero.
+        """
+        xy = self._noise_xy_offset
+        yaw = self._noise_yaw_offset
+        if xy == (0.0, 0.0) and yaw == 0.0:
+            return transform
+        out = Transform()
+        out.translation.x = transform.translation.x + xy[0]
+        out.translation.y = transform.translation.y + xy[1]
+        out.translation.z = transform.translation.z
+        if yaw != 0.0:
+            half = yaw * 0.5
+            qn = (math.cos(half), 0.0, 0.0, math.sin(half))
+            qo = (
+                transform.rotation.w, transform.rotation.x,
+                transform.rotation.y, transform.rotation.z,
+            )
+            qr = quaternion_multiply(qn, qo)
+            out.rotation.w = qr[0]
+            out.rotation.x = qr[1]
+            out.rotation.y = qr[2]
+            out.rotation.z = qr[3]
+        else:
+            out.rotation.w = transform.rotation.w
+            out.rotation.x = transform.rotation.x
+            out.rotation.y = transform.rotation.y
+            out.rotation.z = transform.rotation.z
+        return out
 
     # ------------------------------------------------------------------
     # Plug-local-frame error decomposition + axis-aware alignment gate
@@ -493,6 +597,16 @@ class CheatCodeRobust(Policy):
         self._inserted_flag = False
         self._inside_latched = False
         self._last_status_log_t = None
+        # Sample per-trial port-pose noise (no-op when env vars unset).
+        self._noise_xy_offset, self._noise_yaw_offset = self._sample_trial_noise(task)
+        if self._noise_xy_offset != (0.0, 0.0) or self._noise_yaw_offset != 0.0:
+            self.get_logger().warn(
+                f"NOISE INJECTED for bench: "
+                f"xy=({self._noise_xy_offset[0] * 1000:+.1f}, "
+                f"{self._noise_xy_offset[1] * 1000:+.1f})mm "
+                f"yaw={math.degrees(self._noise_yaw_offset):+.1f}° "
+                f"(env: {self.NOISE_XY_M_ENV}, {self.NOISE_YAW_RAD_ENV})"
+            )
         traj_start = self.time_now()
 
         # Pick the plug-type-specific hover distance.
@@ -514,7 +628,7 @@ class CheatCodeRobust(Policy):
         except TransformException as ex:
             self.get_logger().error(f"Could not look up port transform: {ex}")
             return False
-        port_transform = port_tf_stamped.transform
+        port_transform = self._apply_pose_noise(port_tf_stamped.transform)
 
         # --- APPROACH: smooth interpolation to the hover pose -----------
         self.get_logger().info("Phase: APPROACH")

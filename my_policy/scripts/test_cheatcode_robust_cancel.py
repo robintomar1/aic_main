@@ -23,6 +23,8 @@ Why this matters (from 2026-04-26 model.log):
 Runs WITHOUT the pixi env: mocks all ROS imports.
 """
 
+import math
+import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -609,6 +611,114 @@ def test_insert_does_not_lock_xy_on_near_miss():
     )
 
 
+def test_apply_pose_noise_zero_is_identity():
+    """No noise configured -> _apply_pose_noise returns the input unchanged
+    (fast path; no wasted Transform allocation)."""
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    src = _Transform(0.5, -0.2, 1.14)
+    src.rotation = _Quat(w=1.0)
+    out = policy._apply_pose_noise(src)
+    assert out is src, "with zero noise the helper must return the input verbatim"
+
+
+def test_apply_pose_noise_xy_shifts_translation_only():
+    """XY offset shifts translation; Z, roll, pitch, yaw unchanged."""
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    policy._noise_xy_offset = (0.01, -0.005)  # +1 cm X, -5 mm Y
+    policy._noise_yaw_offset = 0.0
+    src = _Transform(0.5, -0.2, 1.14)
+    src.rotation = _Quat(w=1.0)
+    out = policy._apply_pose_noise(src)
+    assert out is not src, "must return a new Transform, not mutate input"
+    assert abs(out.translation.x - 0.51) < 1e-9
+    assert abs(out.translation.y - (-0.205)) < 1e-9
+    assert abs(out.translation.z - 1.14) < 1e-9
+    assert abs(out.rotation.w - 1.0) < 1e-9
+    # Original must NOT have been mutated.
+    assert abs(src.translation.x - 0.5) < 1e-9
+
+
+def test_apply_pose_noise_yaw_rotates_about_z():
+    """yaw=π/2 noise → output rotation is R_z(π/2) ⊗ identity."""
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    policy._noise_xy_offset = (0.0, 0.0)
+    policy._noise_yaw_offset = math.pi / 2.0
+    src = _Transform()
+    src.rotation = _Quat(w=1.0)
+    out = policy._apply_pose_noise(src)
+    expected_w = math.cos(math.pi / 4.0)
+    expected_z = math.sin(math.pi / 4.0)
+    assert abs(out.rotation.w - expected_w) < 1e-9
+    assert abs(out.rotation.x - 0.0) < 1e-9
+    assert abs(out.rotation.y - 0.0) < 1e-9
+    assert abs(out.rotation.z - expected_z) < 1e-9
+
+
+def test_sample_trial_noise_zero_when_env_unset():
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    os.environ.pop(CheatCodeRobust.NOISE_XY_M_ENV, None)
+    os.environ.pop(CheatCodeRobust.NOISE_YAW_RAD_ENV, None)
+    xy, yaw = policy._sample_trial_noise(_make_task())
+    assert xy == (0.0, 0.0)
+    assert yaw == 0.0
+
+
+def test_sample_trial_noise_xy_magnitude_matches_env():
+    """|sampled_xy| must equal NOISE_XY_M exactly (radius, not diameter)."""
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    os.environ[CheatCodeRobust.NOISE_XY_M_ENV] = "0.01"
+    os.environ[CheatCodeRobust.NOISE_YAW_RAD_ENV] = "0.0"
+    try:
+        xy, yaw = policy._sample_trial_noise(_make_task())
+        mag = math.hypot(xy[0], xy[1])
+        assert abs(mag - 0.01) < 1e-9, (
+            f"|xy| should equal NOISE_XY_M (0.01); got {mag}"
+        )
+        assert yaw == 0.0
+    finally:
+        os.environ.pop(CheatCodeRobust.NOISE_XY_M_ENV)
+        os.environ.pop(CheatCodeRobust.NOISE_YAW_RAD_ENV)
+
+
+def test_sample_trial_noise_deterministic_per_task():
+    """Same task identity -> same noise offset across re-runs (so a re-bench
+    at the same magnitude reproduces trajectories)."""
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    os.environ[CheatCodeRobust.NOISE_XY_M_ENV] = "0.02"
+    os.environ[CheatCodeRobust.NOISE_YAW_RAD_ENV] = "0.05"
+    try:
+        a = policy._sample_trial_noise(_make_task())
+        b = policy._sample_trial_noise(_make_task())
+        assert a == b, f"same task -> same offset; got {a} vs {b}"
+    finally:
+        os.environ.pop(CheatCodeRobust.NOISE_XY_M_ENV)
+        os.environ.pop(CheatCodeRobust.NOISE_YAW_RAD_ENV)
+
+
+def test_sample_trial_noise_different_tasks_different_offsets():
+    """Different tasks should yield different offsets (32-bit seed space —
+    collision is astronomically unlikely for our test pair)."""
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    os.environ[CheatCodeRobust.NOISE_XY_M_ENV] = "0.02"
+    os.environ[CheatCodeRobust.NOISE_YAW_RAD_ENV] = "0.0"
+    try:
+        sfp = policy._sample_trial_noise(_make_task())
+        sc = policy._sample_trial_noise(_make_sc_task())
+        assert sfp != sc, (
+            f"different tasks should produce different offsets: {sfp} vs {sc}"
+        )
+    finally:
+        os.environ.pop(CheatCodeRobust.NOISE_XY_M_ENV)
+        os.environ.pop(CheatCodeRobust.NOISE_YAW_RAD_ENV)
+
+
 def test_insert_cable_aborts_when_node_deactivates_mid_run():
     """Same as above but trip lifecycle deactivation instead of cancel."""
     parent = FakeParentNode()
@@ -649,6 +759,13 @@ if __name__ == "__main__":
         test_xy_aligned_axis_aware_for_sc,
         test_xy_aligned_uses_magnitude_for_symmetric_plug,
         test_inside_latch_axis_aware_for_sc,
+        test_apply_pose_noise_zero_is_identity,
+        test_apply_pose_noise_xy_shifts_translation_only,
+        test_apply_pose_noise_yaw_rotates_about_z,
+        test_sample_trial_noise_zero_when_env_unset,
+        test_sample_trial_noise_xy_magnitude_matches_env,
+        test_sample_trial_noise_deterministic_per_task,
+        test_sample_trial_noise_different_tasks_different_offsets,
     ]
     failures = 0
     for t in tests:
