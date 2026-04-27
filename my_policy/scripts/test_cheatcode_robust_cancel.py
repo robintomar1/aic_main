@@ -106,8 +106,18 @@ class _TransformException(Exception):
     pass
 
 
-def _quaternion_multiply(a, b):
-    return (1.0, 0.0, 0.0, 0.0)
+def _quaternion_multiply(q1, q2):
+    """Hamilton product, (w, x, y, z) convention. Real implementation so
+    plug-local-frame error decomposition works in tests.
+    """
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return (
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    )
 
 
 def _quaternion_slerp(a, b, frac):
@@ -428,6 +438,90 @@ def test_insert_cable_aborts_mid_approach_when_cancel_arrives():
     )
 
 
+def _make_sc_task():
+    return SimpleNamespace(
+        id="t", cable_type="sfp_sc", cable_name="cable_1", plug_type="sc",
+        plug_name="sc_tip", port_type="sc", port_name="sc_port_base",
+        target_module_name="sc_port_0", time_limit=40,
+    )
+
+
+def test_xy_aligned_axis_aware_for_sc():
+    """SC plug is anisotropic: chamfer along local X (eX up to ±3 mm
+    forgiven), local Y is the tight axis (must be < 0.5 mm).
+    Same xy_err magnitude can pass or fail depending on direction.
+    """
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    sc_task = _make_sc_task()
+
+    # Chamfer-tolerant: eX=2 mm (in chamfer dir), eY=0.3 mm (within tight).
+    assert policy._xy_aligned(
+        sc_task, ex_local=0.002, ey_local=0.0003,
+        magnitude_threshold=policy.ALIGN_XY_THRESHOLD_M,
+        tight_threshold=policy.ALIGN_TIGHT_THRESHOLD_M,
+        chamfer_threshold=policy.ALIGN_CHAMFER_THRESHOLD_M,
+    ) is True, "SC: eX=2mm (chamfer) + eY=0.3mm (within tight) must align"
+
+    # Tight-axis violation, same magnitude rotated 90°: eY=2 mm.
+    assert policy._xy_aligned(
+        sc_task, ex_local=0.0003, ey_local=0.002,
+        magnitude_threshold=policy.ALIGN_XY_THRESHOLD_M,
+        tight_threshold=policy.ALIGN_TIGHT_THRESHOLD_M,
+        chamfer_threshold=policy.ALIGN_CHAMFER_THRESHOLD_M,
+    ) is False, "SC: eY=2mm violates tight axis even though magnitude is < 2.5mm"
+
+
+def test_xy_aligned_uses_magnitude_for_symmetric_plug():
+    """SFP has chamfers on both axes — magnitude check applies regardless
+    of which axis the error lies on. Both directions of the same magnitude
+    should give the same answer.
+    """
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    sfp_task = SimpleNamespace(
+        id="t", cable_type="sfp_sc", cable_name="cable_0", plug_type="sfp",
+        plug_name="sfp_tip", port_type="sfp", port_name="sfp_port_0",
+        target_module_name="nic_card_mount_0", time_limit=40,
+    )
+
+    # eX=2mm, eY=0.3mm: magnitude ≈ 2.02 mm < 2.5 mm → aligned.
+    assert policy._xy_aligned(
+        sfp_task, ex_local=0.002, ey_local=0.0003,
+        magnitude_threshold=policy.ALIGN_XY_THRESHOLD_M,
+        tight_threshold=policy.ALIGN_TIGHT_THRESHOLD_M,
+        chamfer_threshold=policy.ALIGN_CHAMFER_THRESHOLD_M,
+    ) is True
+
+    # Same magnitude in the orthogonal direction — must give same result.
+    assert policy._xy_aligned(
+        sfp_task, ex_local=0.0003, ey_local=0.002,
+        magnitude_threshold=policy.ALIGN_XY_THRESHOLD_M,
+        tight_threshold=policy.ALIGN_TIGHT_THRESHOLD_M,
+        chamfer_threshold=policy.ALIGN_CHAMFER_THRESHOLD_M,
+    ) is True, "SFP must be direction-independent (chamfered on both axes)"
+
+
+def test_inside_latch_axis_aware_for_sc():
+    """Inside-port latch uses the same axis-aware gate. With plug below the
+    port plane and eY violating tight axis, the latch must NOT engage even
+    though magnitude is below the symmetric INSIDE_XY_THRESHOLD.
+    """
+    # eX=0 mm, eY=0.8 mm, plug 5 mm below port plane.
+    # Magnitude 0.8 mm < INSIDE_XY_THRESHOLD_M (2.0 mm), but eY=0.8 mm
+    # exceeds INSIDE_TIGHT_THRESHOLD_M (0.5 mm) — must not latch.
+    parent = _make_parent_with_plug_at((0.0, -0.0008, -0.005))
+    policy = CheatCodeRobust(parent)
+    move_robot, get_obs, send_fb, _ = _build_callbacks()
+
+    policy.insert_cable(_make_sc_task(), get_obs, move_robot, send_fb)
+
+    assert policy._inside_latched is False, (
+        "SC: latch must NOT engage with eY=0.8 mm (> tight threshold) "
+        "even with plug below port plane and small magnitude xy_err"
+    )
+
+
 def _make_parent_with_plug_at(plug_xyz):
     """FakeParentNode whose plug TF is configurable. Used by inside-latch tests.
 
@@ -552,6 +646,9 @@ if __name__ == "__main__":
         test_insert_cable_aborts_when_node_deactivates_mid_run,
         test_insert_locks_xy_once_plug_inside_port,
         test_insert_does_not_lock_xy_on_near_miss,
+        test_xy_aligned_axis_aware_for_sc,
+        test_xy_aligned_uses_magnitude_for_symmetric_plug,
+        test_inside_latch_axis_aware_for_sc,
     ]
     failures = 0
     for t in tests:

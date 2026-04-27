@@ -119,6 +119,22 @@ class CheatCodeRobust(Policy):
     }
     INSIDE_DEPTH_DEFAULT = -0.002
 
+    # Plug-type anisotropy. SFP plug has chamfers along both local X and Y so
+    # any small XY error is forgiven by the chamfer — magnitude check is
+    # appropriate. SC plug has a chamfer along local X only; local Y is the
+    # tight direction (jams if eY > ~0.5 mm at chamfer entry, even when
+    # |xy_err| is sub-mm). Empirically validated against 7-trial run
+    # 2026-04-28: failures clustered at eY > 0.5 mm regardless of eX magnitude
+    # (eX up to ±1.4 mm in successes); successes had eY < 0.5 mm. Trial E
+    # was the proof: eY=1.96 mm jammed → force-gate retreat cycle walked the
+    # plug along the chamfer until eY=0.07 → insertion fired.
+    # Map value None means "symmetric, use magnitude check".
+    PLUG_TIGHT_AXIS_BY_PLUG = {"sc": "y"}
+    ALIGN_TIGHT_THRESHOLD_M = 0.0005     # 0.5 mm on tight axis
+    ALIGN_CHAMFER_THRESHOLD_M = 0.003    # 3 mm on chamfer axis (forgiving)
+    INSIDE_TIGHT_THRESHOLD_M = 0.0005    # match ALIGN: tight before latching
+    INSIDE_CHAMFER_THRESHOLD_M = 0.003
+
     # Status print throttle. Periodic 1Hz line during APPROACH/ALIGN/INSERT
     # with the metrics we actually want to see (xy err, z err, traj time,
     # Fz). Replaces the framework's bare "insert_cable execute loop" heartbeat
@@ -229,6 +245,66 @@ class CheatCodeRobust(Policy):
         return False
 
     # ------------------------------------------------------------------
+    # Plug-local-frame error decomposition + axis-aware alignment gate
+    # ------------------------------------------------------------------
+    def _local_axis_err(
+        self, port_transform: Transform, plug_tf_stamped
+    ) -> tuple[float, float, float]:
+        """Project (port − plug) into the plug's local frame.
+
+        Returns (e_x_local, e_y_local, e_z_local) in metres. Used both for
+        diagnostic logging and the axis-aware ALIGN/INSIDE-latch gates.
+        Quaternion convention matches transforms3d._gohlketransforms (w,x,y,z):
+        v_local = q_plug^-1 * v_world * q_plug, with v as a pure quaternion.
+        """
+        dx = port_transform.translation.x - plug_tf_stamped.transform.translation.x
+        dy = port_transform.translation.y - plug_tf_stamped.transform.translation.y
+        dz = port_transform.translation.z - plug_tf_stamped.transform.translation.z
+        q = (
+            plug_tf_stamped.transform.rotation.w,
+            plug_tf_stamped.transform.rotation.x,
+            plug_tf_stamped.transform.rotation.y,
+            plug_tf_stamped.transform.rotation.z,
+        )
+        q_inv = (q[0], -q[1], -q[2], -q[3])
+        qv = (0.0, dx, dy, dz)
+        tmp = quaternion_multiply(q_inv, qv)
+        res = quaternion_multiply(tmp, q)
+        return (res[1], res[2], res[3])
+
+    def _xy_aligned(
+        self,
+        task,
+        ex_local: float,
+        ey_local: float,
+        magnitude_threshold: float,
+        tight_threshold: float,
+        chamfer_threshold: float,
+    ) -> bool:
+        """True iff the plug-local XY error meets alignment criteria.
+
+        Symmetric plugs (no entry in PLUG_TIGHT_AXIS_BY_PLUG, e.g. SFP):
+        magnitude check `sqrt(eX² + eY²) < magnitude_threshold`.
+
+        Anisotropic plugs (e.g. SC): per-axis check
+        `|e_tight| < tight_threshold AND |e_chamfer| < chamfer_threshold`,
+        where the tight/chamfer split is given by PLUG_TIGHT_AXIS_BY_PLUG.
+        """
+        tight_axis = self.PLUG_TIGHT_AXIS_BY_PLUG.get(task.plug_type)
+        if tight_axis is None:
+            mag = (ex_local * ex_local + ey_local * ey_local) ** 0.5
+            return mag < magnitude_threshold
+        if tight_axis == "y":
+            e_tight, e_chamfer = ey_local, ex_local
+        elif tight_axis == "x":
+            e_tight, e_chamfer = ex_local, ey_local
+        else:
+            raise ValueError(f"unknown tight_axis {tight_axis!r} for plug "
+                             f"{task.plug_type!r}")
+        return (abs(e_tight) < tight_threshold
+                and abs(e_chamfer) < chamfer_threshold)
+
+    # ------------------------------------------------------------------
     # Periodic status line
     # ------------------------------------------------------------------
     def _log_status(
@@ -252,13 +328,6 @@ class CheatCodeRobust(Policy):
 
         xy_err_mm = float("nan")
         z_err_mm = float("nan")
-        # Plug-local-frame decomposition. SC plug has chamfers on only one
-        # local axis, so a given xy_err magnitude is forgiving along the
-        # chamfer axis but jamming along the orthogonal "tight" axis. Log
-        # both components so we can identify which plug-local axis is
-        # chamfered for SC by correlating per-axis error with success/fail
-        # outcomes across trials. SFP is symmetric so this is purely
-        # diagnostic for it.
         err_local_x_mm = float("nan")
         err_local_y_mm = float("nan")
         try:
@@ -272,23 +341,9 @@ class CheatCodeRobust(Policy):
             dz = port_transform.translation.z - plug_tf.transform.translation.z
             xy_err_mm = (dx * dx + dy * dy) ** 0.5 * 1000.0
             z_err_mm = dz * 1000.0
-
-            # Rotate the world-frame error vector into the plug's local
-            # frame: v_local = q_plug^-1 * v_world * q_plug, with the
-            # vector treated as a pure quaternion (0, vx, vy, vz). Convention
-            # matches transforms3d._gohlketransforms (w, x, y, z).
-            q_plug = (
-                plug_tf.transform.rotation.w,
-                plug_tf.transform.rotation.x,
-                plug_tf.transform.rotation.y,
-                plug_tf.transform.rotation.z,
-            )
-            q_plug_inv = (q_plug[0], -q_plug[1], -q_plug[2], -q_plug[3])
-            qv = (0.0, dx, dy, dz)
-            tmp = quaternion_multiply(q_plug_inv, qv)
-            err_local = quaternion_multiply(tmp, q_plug)
-            err_local_x_mm = err_local[1] * 1000.0
-            err_local_y_mm = err_local[2] * 1000.0
+            ex_l, ey_l, _ = self._local_axis_err(port_transform, plug_tf)
+            err_local_x_mm = ex_l * 1000.0
+            err_local_y_mm = ey_l * 1000.0
         except TransformException:
             pass
 
@@ -493,6 +548,11 @@ class CheatCodeRobust(Policy):
         align_timeout = align_start + Duration(seconds=self.ALIGN_TIMEOUT_S)
         stable_since = None
         converged = False
+        # Per-plug-type alignment criterion. Anisotropic plugs (SC) gate
+        # on |e_tight| AND |e_chamfer| in plug-local frame; symmetric plugs
+        # (SFP) gate on |xy_err| magnitude. The latched-tight-axis label
+        # below is for the convergence log only.
+        tight_axis = self.PLUG_TIGHT_AXIS_BY_PLUG.get(task.plug_type)
         while self.time_now() < align_timeout:
             if self._should_abort():
                 self.get_logger().info("ALIGN: aborting (cancel/deactivate)")
@@ -512,11 +572,19 @@ class CheatCodeRobust(Policy):
                 dx = port_transform.translation.x - plug_tf.transform.translation.x
                 dy = port_transform.translation.y - plug_tf.transform.translation.y
                 xy_err = (dx * dx + dy * dy) ** 0.5
+                ex_l, ey_l, _ = self._local_axis_err(port_transform, plug_tf)
+                aligned = self._xy_aligned(
+                    task, ex_l, ey_l,
+                    magnitude_threshold=self.ALIGN_XY_THRESHOLD_M,
+                    tight_threshold=self.ALIGN_TIGHT_THRESHOLD_M,
+                    chamfer_threshold=self.ALIGN_CHAMFER_THRESHOLD_M,
+                )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during align: {ex}")
                 xy_err = float("inf")
+                aligned = False
 
-            if xy_err < self.ALIGN_XY_THRESHOLD_M:
+            if aligned:
                 if stable_since is None:
                     stable_since = self.time_now()
                 elif (self.time_now() - stable_since) >= Duration(seconds=self.ALIGN_STABLE_S):
@@ -529,7 +597,12 @@ class CheatCodeRobust(Policy):
             self.sleep_for(self.ALIGN_POLL_S)
 
         if converged:
-            self.get_logger().info(f"ALIGN converged (xy_err < {self.ALIGN_XY_THRESHOLD_M * 1000:.1f} mm)")
+            if tight_axis is not None:
+                self.get_logger().info(
+                    f"ALIGN converged (|e_tight| < {self.ALIGN_TIGHT_THRESHOLD_M * 1000:.1f}mm, "
+                    f"|e_chamfer| < {self.ALIGN_CHAMFER_THRESHOLD_M * 1000:.1f}mm; tight_axis={tight_axis})")
+            else:
+                self.get_logger().info(f"ALIGN converged (xy_err < {self.ALIGN_XY_THRESHOLD_M * 1000:.1f} mm)")
         else:
             xy_err_mm = xy_err * 1000 if (xy_err is not None and xy_err < float("inf")) else float("inf")
             if xy_err is not None and xy_err > self.ALIGN_BAIL_XY_M:
@@ -632,7 +705,9 @@ class CheatCodeRobust(Policy):
             port_transform = self._refresh_port_transform(
                 port_frame, port_transform)
 
-            # Inside-port latch check (only while not yet latched).
+            # Inside-port latch check (only while not yet latched). Uses the
+            # same axis-aware criterion as ALIGN: SC requires |e_tight| AND
+            # |e_chamfer| sub-threshold; SFP uses magnitude.
             if not self._inside_latched:
                 try:
                     plug_tf_latch = self._parent_node._tf_buffer.lookup_transform(
@@ -644,15 +719,23 @@ class CheatCodeRobust(Policy):
                     dz_plug = (plug_tf_latch.transform.translation.z
                                - port_transform.translation.z)
                     xy_err_latch = (dx * dx + dy * dy) ** 0.5
-                    if (xy_err_latch < self.INSIDE_XY_THRESHOLD_M
-                            and dz_plug < inside_depth_threshold):
+                    ex_l, ey_l, _ = self._local_axis_err(
+                        port_transform, plug_tf_latch)
+                    xy_ok = self._xy_aligned(
+                        task, ex_l, ey_l,
+                        magnitude_threshold=self.INSIDE_XY_THRESHOLD_M,
+                        tight_threshold=self.INSIDE_TIGHT_THRESHOLD_M,
+                        chamfer_threshold=self.INSIDE_CHAMFER_THRESHOLD_M,
+                    )
+                    if xy_ok and dz_plug < inside_depth_threshold:
                         locked_pose = self._calc_gripper_pose(
                             port_transform, z_offset=effective_z)
                         locked_z_offset = effective_z
                         self._inside_latched = True
                         self.get_logger().info(
                             f"INSERT: inside-port latch engaged "
-                            f"(xy_err={xy_err_latch * 1000:.1f}mm, "
+                            f"(xy_err={xy_err_latch * 1000:.1f}mm "
+                            f"eX={ex_l * 1000:+.2f}mm eY={ey_l * 1000:+.2f}mm "
                             f"plug_dz={dz_plug * 1000:.1f}mm) — "
                             f"freezing XY/orientation, Z-only from here")
                 except TransformException:
