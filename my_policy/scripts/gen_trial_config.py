@@ -29,10 +29,17 @@ MOUNT_RAIL_MIN, MOUNT_RAIL_MAX = -0.09425, 0.09425
 
 # Task-board pose randomization. z is fixed at the table height; roll/pitch=0
 # per the sample configs. Yaw is unconstrained per the organizer on Discourse.
-# xy bounds keep the board inside the UR5e kinematic workspace — derived from
-# the two sample poses (0.15,-0.2) and (0.17,0.0), widened by ±0.05m margin.
-BOARD_X_MIN, BOARD_X_MAX = 0.10, 0.25
-BOARD_Y_MIN, BOARD_Y_MAX = -0.30, 0.30
+# xy bounds tightened 2026-04-29 after a 50-trial batch_500 run showed the
+# CheatCode policy plateauing at xy_err 100-150 mm on samples where the port
+# landed outside reliable UR5e reach: APPROACH error decreases for ~3 s then
+# freezes (admittance controller saturates at the closest reachable point,
+# not at the commanded pose). Previous bounds [0.10, 0.25] × [-0.30, 0.30]
+# put many samples ~30 cm from the robot base. Tightened to ±0.05 m around
+# the sample-config poses (0.15, -0.20) and (0.17, 0.0). The qualification
+# docs explicitly say "start ~few cm from port, target always in view" so
+# our oracle data should not exceed the eval distribution.
+BOARD_X_MIN, BOARD_X_MAX = 0.12, 0.22  # was 0.10, 0.25
+BOARD_Y_MIN, BOARD_Y_MAX = -0.20, 0.20  # was -0.30, 0.30
 BOARD_Z = 1.14
 
 # Entity-pose small-angle jitter (radians) for distractor yaw. Keep small to
