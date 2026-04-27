@@ -50,9 +50,9 @@ class CheatCodeRobust(Policy):
     # cable's lateral inertia + admittance compliance gives the loop enough
     # phase lag that 0.5 over-reacts. 0.3 still drives the steady-state
     # error fast enough that the I term doesn't have to work alone.
-    PROPORTIONAL_GAIN = 0.3
-    INTEGRATOR_GAIN = 0.15
-    MAX_INTEGRATOR_WINDUP = 0.10     # 15 mm max I correction; typical
+    PROPORTIONAL_GAIN = 0.2
+    INTEGRATOR_GAIN = 0.1
+    MAX_INTEGRATOR_WINDUP = 0.15     # 15 mm max I correction; typical
                                      # steady-state cable offset after settling
 
     # Timing / kinematics.
@@ -67,7 +67,7 @@ class CheatCodeRobust(Policy):
     INSERT_Z_OFFSET = -0.015         # final descent depth (upstream value)
     APPROACH_STEPS = 100
     APPROACH_SLEEP = 0.05            # 100 * 0.05 = 5 s approach
-    DESCENT_STEP = 0.0002            # 0.2 mm per tick
+    DESCENT_STEP = 0.0004            # 0.2 mm per tick
     DESCENT_SLEEP = 0.05             # -> 4 mm/s (graceful insertion descent)
 
     # ALIGN phase: gate descent on actual XY convergence. Tightened to
@@ -252,6 +252,15 @@ class CheatCodeRobust(Policy):
 
         xy_err_mm = float("nan")
         z_err_mm = float("nan")
+        # Plug-local-frame decomposition. SC plug has chamfers on only one
+        # local axis, so a given xy_err magnitude is forgiving along the
+        # chamfer axis but jamming along the orthogonal "tight" axis. Log
+        # both components so we can identify which plug-local axis is
+        # chamfered for SC by correlating per-axis error with success/fail
+        # outcomes across trials. SFP is symmetric so this is purely
+        # diagnostic for it.
+        err_local_x_mm = float("nan")
+        err_local_y_mm = float("nan")
         try:
             plug_tf = self._parent_node._tf_buffer.lookup_transform(
                 "base_link",
@@ -263,6 +272,23 @@ class CheatCodeRobust(Policy):
             dz = port_transform.translation.z - plug_tf.transform.translation.z
             xy_err_mm = (dx * dx + dy * dy) ** 0.5 * 1000.0
             z_err_mm = dz * 1000.0
+
+            # Rotate the world-frame error vector into the plug's local
+            # frame: v_local = q_plug^-1 * v_world * q_plug, with the
+            # vector treated as a pure quaternion (0, vx, vy, vz). Convention
+            # matches transforms3d._gohlketransforms (w, x, y, z).
+            q_plug = (
+                plug_tf.transform.rotation.w,
+                plug_tf.transform.rotation.x,
+                plug_tf.transform.rotation.y,
+                plug_tf.transform.rotation.z,
+            )
+            q_plug_inv = (q_plug[0], -q_plug[1], -q_plug[2], -q_plug[3])
+            qv = (0.0, dx, dy, dz)
+            tmp = quaternion_multiply(q_plug_inv, qv)
+            err_local = quaternion_multiply(tmp, q_plug)
+            err_local_x_mm = err_local[1] * 1000.0
+            err_local_y_mm = err_local[2] * 1000.0
         except TransformException:
             pass
 
@@ -279,6 +305,7 @@ class CheatCodeRobust(Policy):
         z_str = f" z_off={z_offset * 1000:6.1f}mm" if z_offset is not None else ""
         self.get_logger().info(
             f"[{phase} t={t_traj:5.1f}s xy_err={xy_err_mm:5.1f}mm "
+            f"(eX={err_local_x_mm:+6.2f}mm eY={err_local_y_mm:+6.2f}mm) "
             f"z_err={z_err_mm:6.1f}mm Fz={fz:6.2f}N{z_str}]"
         )
 
