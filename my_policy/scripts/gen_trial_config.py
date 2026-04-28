@@ -309,6 +309,7 @@ def gen_sfp_trial(rng: random.Random, distractor_count: int) -> dict:
     """
     nic_index = rng.randint(0, 4)
     nic_rail_choice = NIC_RAILS[nic_index]
+    sfp_port_choice = rng.choice(("sfp_port_0", "sfp_port_1"))
 
     scene_rails = {}
     for rail in NIC_RAILS:
@@ -352,7 +353,7 @@ def gen_sfp_trial(rng: random.Random, distractor_count: int) -> dict:
             "plug_type": "sfp",
             "plug_name": "sfp_tip",
             "port_type": "sfp",
-            "port_name": "sfp_port_0",
+            "port_name": sfp_port_choice,
             "target_module_name": f"nic_card_mount_{nic_index}",
             "time_limit": 40,
         },
