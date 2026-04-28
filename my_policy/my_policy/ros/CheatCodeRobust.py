@@ -109,6 +109,22 @@ class CheatCodeRobust(Policy):
     HOLD_RETREAT_STEP = 0.0001       # 2 mm/s retreat at 50 ms tick
     HOLD_RETREAT_MAX = 0.005         # cap retreat per single hold at 5 mm
 
+    # Spiral search during chamfer contact. When the plug is descending and
+    # making contact (force in the "chamfer rim" range, not yet smashing) we
+    # superimpose a small circular XY oscillation on the commanded gripper
+    # pose. The chamfer redirects the plug into the port hole as the spiral
+    # sweeps past the opening. Triggers when the force is in
+    # [SPIRAL_FORCE_LO_N, FORCE_STOP_N] and we're in the INSERT phase below
+    # hover. Disengages when force drops below SPIRAL_FORCE_LO_N (slipped
+    # past chamfer) or escalates above FORCE_STOP_N (force gate takes over).
+    # SC trials in 2026-04-29 logs showed a stuck force-cycle pattern at
+    # z_off ≈ 20-50 mm where the plug body catches on the SC mount housing
+    # rim and the existing 2 mm retreat-during-hold can't disengage; spiral
+    # searches a wider area to find the housing opening.
+    SPIRAL_FORCE_LO_N = 8.0
+    SPIRAL_RADIUS_M = 0.002          # 2 mm radius
+    SPIRAL_FREQUENCY_HZ = 0.5        # one full revolution per 2 s
+
     # Inside-port XY lock. Once the plug body is past the port's chamfer the
     # mechanical walls constrain XY — continued P/I corrections fight that
     # constraint, generating lateral forces that bind the plug or amplify
@@ -750,6 +766,12 @@ class CheatCodeRobust(Policy):
             task.plug_type, self.INSIDE_DEPTH_DEFAULT)
         locked_pose: Pose | None = None
         locked_z_offset: float | None = None
+        # Spiral search state — engages when force is in [SPIRAL_FORCE_LO_N,
+        # FORCE_STOP_N] and we're below hover. Stays engaged until force drops
+        # below SPIRAL_FORCE_LO_N (slipped past chamfer) or escalates above
+        # FORCE_STOP_N (force gate takes over).
+        spiral_start_t: Time | None = None
+        spiral_engagements = 0
 
         while z_offset > self.INSERT_Z_OFFSET:
             if self._should_abort():
@@ -857,6 +879,35 @@ class CheatCodeRobust(Policy):
                 except TransformException:
                     pass
 
+            # Spiral search: when force is in the chamfer-contact band and
+            # we're not in force-hold or latched, superimpose a small circular
+            # XY oscillation on the commanded pose so the chamfer can redirect
+            # the plug. Engage on entry to the band; disengage when force
+            # leaves it (either dropped below LO = slipped past, or above
+            # FORCE_STOP_N = force gate takes over the next tick).
+            in_spiral_band = (
+                self.SPIRAL_FORCE_LO_N <= force_mag < self.FORCE_STOP_N
+                and hold_start is None
+                and not self._inside_latched
+            )
+            if in_spiral_band and spiral_start_t is None:
+                spiral_start_t = now
+                spiral_engagements += 1
+                self.get_logger().info(
+                    f"INSERT: spiral search engaged at |F|={force_mag:.1f}N, "
+                    f"z_offset={effective_z * 1000:.1f}mm"
+                )
+            elif not in_spiral_band and spiral_start_t is not None:
+                spiral_start_t = None
+
+            spiral_dx = 0.0
+            spiral_dy = 0.0
+            if spiral_start_t is not None:
+                spiral_t = (now - spiral_start_t).nanoseconds / 1e9
+                ang = 2.0 * 3.14159265358979 * self.SPIRAL_FREQUENCY_HZ * spiral_t
+                spiral_dx = self.SPIRAL_RADIUS_M * np.cos(ang)
+                spiral_dy = self.SPIRAL_RADIUS_M * np.sin(ang)
+
             try:
                 if self._inside_latched and locked_pose is not None:
                     target_z = (locked_pose.position.z
@@ -872,6 +923,12 @@ class CheatCodeRobust(Policy):
                 else:
                     pose = self._calc_gripper_pose(
                         port_transform, z_offset=effective_z)
+                    # Apply spiral perturbation only on the pre-latch path —
+                    # post-latch the plug is mechanically inside the port and
+                    # XY is frozen, no chamfer search needed.
+                    if spiral_start_t is not None:
+                        pose.position.x += spiral_dx
+                        pose.position.y += spiral_dy
                 self.set_pose_target(move_robot=move_robot, pose=pose)
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insert: {ex}")
@@ -884,6 +941,7 @@ class CheatCodeRobust(Policy):
 
         self.get_logger().info(
             f"INSERT done — force gate engaged {force_stopped_count} times, "
+            f"spiral engaged {spiral_engagements} times, "
             f"final z_offset={z_offset * 1000:.1f}mm")
 
         # No STABILIZE dwell — once /scoring/insertion_event has fired the
