@@ -54,8 +54,8 @@ class CheatCodeRobust(Policy):
     # cable's lateral inertia + admittance compliance gives the loop enough
     # phase lag that 0.5 over-reacts. 0.3 still drives the steady-state
     # error fast enough that the I term doesn't have to work alone.
-    PROPORTIONAL_GAIN = 0.35
-    INTEGRATOR_GAIN = 0.15
+    PROPORTIONAL_GAIN = 0.25
+    INTEGRATOR_GAIN = 0.1
     # Derivative term — added 2026-04-29 after observing oscillation in
     # ALIGN/INSERT (port appearing to "oscillate over the plug" is the
     # gripper commanded XY swinging around steady-state). D opposes the
