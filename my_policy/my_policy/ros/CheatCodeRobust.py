@@ -56,6 +56,15 @@ class CheatCodeRobust(Policy):
     # error fast enough that the I term doesn't have to work alone.
     PROPORTIONAL_GAIN = 0.3
     INTEGRATOR_GAIN = 0.15
+    # Derivative term — added 2026-04-29 after observing oscillation in
+    # ALIGN/INSERT (port appearing to "oscillate over the plug" is the
+    # gripper commanded XY swinging around steady-state). D opposes the
+    # rate of change of error and damps that oscillation. Kept small
+    # (0.05, well below P=0.3) because TF measurement noise gets amplified
+    # by raw differencing — larger D would inject jitter. If 0.05 is too
+    # weak, raise toward 0.10; if it adds noise to the commanded pose,
+    # add a low-pass filter on the error history before differencing.
+    DERIVATIVE_GAIN = 0.05
     MAX_INTEGRATOR_WINDUP = 0.30     # 15 mm max I correction; typical
                                      # steady-state cable offset after settling
 
@@ -124,6 +133,18 @@ class CheatCodeRobust(Policy):
     SPIRAL_FORCE_LO_N = 8.0
     SPIRAL_RADIUS_M = 0.002          # 2 mm radius
     SPIRAL_FREQUENCY_HZ = 0.5        # one full revolution per 2 s
+    # Per-plug-type spiral shape, expressed in plug-LOCAL frame and rotated
+    # into base_link by the plug's current orientation before being applied to
+    # the commanded gripper pose. SFP is symmetric (chamfer on both local X
+    # and Y) — full circular spiral. SC has a tight local Y (~0.5 mm) and a
+    # forgiving local X (~3 mm chamfer) — oscillate along X only so we don't
+    # repeatedly drive the plug into the tight axis. Empirically, the
+    # symmetric spiral didn't help SC trials in 2026-04-29 logs (plug
+    # descended through chamfer band without finding the port; eY held at
+    # +0.4 mm at the edge of tolerance and the Y component of the spiral
+    # was actively pushing the plug across the tight-axis edge).
+    SPIRAL_MODE_BY_PLUG = {"sc": "x_only", "sfp": "circular"}
+    SPIRAL_MODE_DEFAULT = "circular"
 
     # Inside-port XY lock. Once the plug body is past the port's chamfer the
     # mechanical walls constrain XY — continued P/I corrections fight that
@@ -155,11 +176,14 @@ class CheatCodeRobust(Policy):
     INSIDE_TIGHT_THRESHOLD_M = 0.0005    # match ALIGN: tight before latching
     INSIDE_CHAMFER_THRESHOLD_M = 0.003
 
-    # Status print throttle. Periodic 1Hz line during APPROACH/ALIGN/INSERT
-    # with the metrics we actually want to see (xy err, z err, traj time,
-    # Fz). Replaces the framework's bare "insert_cable execute loop" heartbeat
-    # in aic_model.py — that's policy-agnostic and can't see these values.
-    STATUS_LOG_PERIOD_S = 1.0
+    # Status print throttle. APPROACH/ALIGN log at 1 Hz (slow phases, plenty
+    # of time to react). INSERT logs at 5 Hz — chamfer-contact dynamics evolve
+    # in tens of ms and we need finer time resolution to debug stuck-force
+    # cycles, spiral engagement, and plug body sliding events. The cost of
+    # 5× more log lines during INSERT is small (a few hundred extra lines
+    # per trial vs. tens before).
+    STATUS_LOG_PERIOD_S = 1.0          # APPROACH / ALIGN
+    INSERT_LOG_PERIOD_S = 0.2          # INSERT — 5 Hz
 
     # Noise injection for the localizer-accuracy bench. When the env vars
     # are set, every port-pose lookup from TF is perturbed by a deterministic
@@ -176,6 +200,11 @@ class CheatCodeRobust(Policy):
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
+        # Previous-tick error for D term. Reset alongside the integrator
+        # so the first tick of APPROACH gives D=0 (no false-alarm derivative
+        # from stale state).
+        self._tip_x_error_prev = 0.0
+        self._tip_y_error_prev = 0.0
         self._task = None
         self._last_status_log_t = None
         # Latched on first "inserted" event; reset at the start of each
@@ -435,12 +464,16 @@ class CheatCodeRobust(Policy):
         z_offset: float | None = None,
         get_observation=None,
     ) -> None:
-        """1 Hz status print: traj time, xy err, z err, Fz, current z_offset."""
+        """Phase-throttled status print: traj time, xy err (incl plug-local),
+        z err, F=(fx,fy,fz,|F|), z_off. APPROACH/ALIGN at 1 Hz, INSERT at 5 Hz
+        for finer chamfer-contact diagnostics."""
         now = self.time_now()
+        period_s = (
+            self.INSERT_LOG_PERIOD_S if "INSERT" in phase
+            else self.STATUS_LOG_PERIOD_S
+        )
         if self._last_status_log_t is not None:
-            if (now - self._last_status_log_t).nanoseconds < int(
-                self.STATUS_LOG_PERIOD_S * 1e9
-            ):
+            if (now - self._last_status_log_t).nanoseconds < int(period_s * 1e9):
                 return
         self._last_status_log_t = now
 
@@ -467,13 +500,19 @@ class CheatCodeRobust(Policy):
         except TransformException:
             pass
 
+        fx = float("nan")
+        fy = float("nan")
         fz = float("nan")
+        fmag = float("nan")
         if get_observation is not None:
             try:
                 obs = get_observation()
                 wr = obs.wrist_wrench.wrench
                 tare = obs.controller_state.fts_tare_offset.wrench
+                fx = wr.force.x - tare.force.x
+                fy = wr.force.y - tare.force.y
                 fz = wr.force.z - tare.force.z
+                fmag = (fx * fx + fy * fy + fz * fz) ** 0.5
             except Exception:
                 pass
 
@@ -481,7 +520,9 @@ class CheatCodeRobust(Policy):
         self.get_logger().info(
             f"[{phase} t={t_traj:5.1f}s xy_err={xy_err_mm:5.1f}mm "
             f"(eX={err_local_x_mm:+6.2f}mm eY={err_local_y_mm:+6.2f}mm) "
-            f"z_err={z_err_mm:6.1f}mm Fz={fz:6.2f}N{z_str}]"
+            f"z_err={z_err_mm:6.1f}mm "
+            f"F=(Fx={fx:+6.2f} Fy={fy:+6.2f} Fz={fz:+6.2f} |F|={fmag:5.2f})N"
+            f"{z_str}]"
         )
 
     # ------------------------------------------------------------------
@@ -552,6 +593,11 @@ class CheatCodeRobust(Policy):
         if reset_xy_integrator:
             self._tip_x_error_integrator = 0.0
             self._tip_y_error_integrator = 0.0
+            # Also reset the previous-error state so D = 0 on the first
+            # tick — otherwise a stale prev from a previous trial would
+            # produce a spurious derivative kick.
+            self._tip_x_error_prev = tip_x_error
+            self._tip_y_error_prev = tip_y_error
         else:
             self._tip_x_error_integrator = np.clip(
                 self._tip_x_error_integrator + tip_x_error,
@@ -564,20 +610,32 @@ class CheatCodeRobust(Policy):
                 self.MAX_INTEGRATOR_WINDUP,
             )
 
+        # Derivative term: opposes rate of change of error to damp oscillation.
+        # Computed as (current_error - prev_error) — one-tick difference, no
+        # explicit dt because the loop runs at a fixed rate (50 ms / 60 ms tick).
+        # Update prev_error AFTER the term is computed.
+        tip_x_error_d = tip_x_error - self._tip_x_error_prev
+        tip_y_error_d = tip_y_error - self._tip_y_error_prev
+        self._tip_x_error_prev = tip_x_error
+        self._tip_y_error_prev = tip_y_error
+
         # Z feedforward: static offset (gravity-dominated), safe to apply.
-        # XY: PI controller on (port - plug) error. P reacts to current
+        # XY: PID controller on (port - plug) error. P reacts to current
         # error immediately so the gripper pulls toward a position that
         # puts the plug at the port; I handles steady-state offset from
-        # cable hang. See PROPORTIONAL_GAIN / MAX_INTEGRATOR_WINDUP above.
+        # cable hang; D damps the oscillation observed when P/I overshoot
+        # (the "port appears to swing over the plug" pattern in the visualizer).
         target_x = (
             port_xy[0]
             + self.PROPORTIONAL_GAIN * tip_x_error
             + self.INTEGRATOR_GAIN * self._tip_x_error_integrator
+            + self.DERIVATIVE_GAIN * tip_x_error_d
         )
         target_y = (
             port_xy[1]
             + self.PROPORTIONAL_GAIN * tip_y_error
             + self.INTEGRATOR_GAIN * self._tip_y_error_integrator
+            + self.DERIVATIVE_GAIN * tip_y_error_d
         )
         target_z = port_transform.translation.z + z_offset - plug_tip_gripper_offset[2]
 
@@ -905,8 +963,39 @@ class CheatCodeRobust(Policy):
             if spiral_start_t is not None:
                 spiral_t = (now - spiral_start_t).nanoseconds / 1e9
                 ang = 2.0 * 3.14159265358979 * self.SPIRAL_FREQUENCY_HZ * spiral_t
-                spiral_dx = self.SPIRAL_RADIUS_M * np.cos(ang)
-                spiral_dy = self.SPIRAL_RADIUS_M * np.sin(ang)
+                # Compute spiral offset in plug-LOCAL frame, then rotate into
+                # base_link via current plug orientation. For SC: oscillate
+                # along local X only (the chamfer-tolerant axis). For SFP:
+                # full circular (chamfer is symmetric).
+                mode = self.SPIRAL_MODE_BY_PLUG.get(
+                    task.plug_type, self.SPIRAL_MODE_DEFAULT)
+                if mode == "x_only":
+                    local_dx = self.SPIRAL_RADIUS_M * np.cos(ang)
+                    local_dy = 0.0
+                else:  # "circular"
+                    local_dx = self.SPIRAL_RADIUS_M * np.cos(ang)
+                    local_dy = self.SPIRAL_RADIUS_M * np.sin(ang)
+                # Rotate (local_dx, local_dy, 0) into base_link by plug
+                # orientation. v_base = q_plug ⊗ v_local ⊗ q_plug_inv.
+                try:
+                    plug_tf_spiral = self._parent_node._tf_buffer.lookup_transform(
+                        "base_link", cable_tip_frame, Time())
+                    qp = (
+                        plug_tf_spiral.transform.rotation.w,
+                        plug_tf_spiral.transform.rotation.x,
+                        plug_tf_spiral.transform.rotation.y,
+                        plug_tf_spiral.transform.rotation.z,
+                    )
+                    qp_inv = (qp[0], -qp[1], -qp[2], -qp[3])
+                    qv = (0.0, local_dx, local_dy, 0.0)
+                    tmp = quaternion_multiply(qp, qv)
+                    res = quaternion_multiply(tmp, qp_inv)
+                    spiral_dx = float(res[1])
+                    spiral_dy = float(res[2])
+                except TransformException:
+                    # Fall back to base-link frame if TF unavailable.
+                    spiral_dx = local_dx
+                    spiral_dy = local_dy
 
             try:
                 if self._inside_latched and locked_pose is not None:
