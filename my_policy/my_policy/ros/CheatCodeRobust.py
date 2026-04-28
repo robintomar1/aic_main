@@ -54,7 +54,7 @@ class CheatCodeRobust(Policy):
     # cable's lateral inertia + admittance compliance gives the loop enough
     # phase lag that 0.5 over-reacts. 0.3 still drives the steady-state
     # error fast enough that the I term doesn't have to work alone.
-    PROPORTIONAL_GAIN = 0.3
+    PROPORTIONAL_GAIN = 0.35
     INTEGRATOR_GAIN = 0.15
     # Derivative term — added 2026-04-29 after observing oscillation in
     # ALIGN/INSERT (port appearing to "oscillate over the plug" is the
@@ -64,7 +64,7 @@ class CheatCodeRobust(Policy):
     # by raw differencing — larger D would inject jitter. If 0.05 is too
     # weak, raise toward 0.10; if it adds noise to the commanded pose,
     # add a low-pass filter on the error history before differencing.
-    DERIVATIVE_GAIN = 0.05
+    DERIVATIVE_GAIN = 0.08
     MAX_INTEGRATOR_WINDUP = 0.30     # 15 mm max I correction; typical
                                      # steady-state cable offset after settling
 
