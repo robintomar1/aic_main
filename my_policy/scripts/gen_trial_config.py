@@ -40,11 +40,12 @@ MOUNT_RAIL_MIN, MOUNT_RAIL_MAX = -0.09425, 0.09425
 # Bounds history:
 #   pass 0: [0.10, 0.25] × [-0.30, 0.30], yaw [0, 2π)
 #   pass 1: [0.12, 0.22] × [-0.20, 0.20], yaw [0, 2π)
-#   pass 2: [0.13, 0.20] × [-0.15, 0.15], yaw [-π/2, π/2)  ← current
+#   pass 2: [0.13, 0.20] × [-0.15, 0.15], yaw [-π/2, π/2)
+#   pass 3: [0.13, 0.20] × [-0.10, 0.10], yaw [-35°, 35°]  ← current
 BOARD_X_MIN, BOARD_X_MAX = 0.13, 0.20
-BOARD_Y_MIN, BOARD_Y_MAX = -0.15, 0.15
-BOARD_YAW_MIN = -math.pi / 2
-BOARD_YAW_MAX = math.pi / 2
+BOARD_Y_MIN, BOARD_Y_MAX = -0.10, 0.10
+BOARD_YAW_MIN = math.radians(-35.0)
+BOARD_YAW_MAX = math.radians(35.0)
 BOARD_Z = 1.14
 
 # Entity-pose small-angle jitter (radians) for distractor yaw. Keep small to
