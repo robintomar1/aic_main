@@ -231,3 +231,133 @@ class LocalizerDataset:
                 "port_name": port_name,
             },
         }
+
+
+class MultiBatchLocalizerDataset:
+    """Concatenates several `LocalizerDataset`s into one duck-typed dataset.
+
+    Episode indices are remapped to globally unique consecutive ints so the
+    train_localizer episode-split logic works unchanged. `_ep_to_label`,
+    `_ep_to_target`, `_ep_to_one_hot`, `_ep_to_trial`, and `_episode_index`
+    mirror the LocalizerDataset surface area.
+
+    `__getitem__` dispatches to the owning child by global frame index.
+    """
+
+    def __init__(
+        self,
+        roots: list[Path],
+        batch_yamls: list[Path],
+        summary_jsons: list[Path],
+        *,
+        cameras: tuple[str, ...] = ("center_camera",),
+        image_transform: Callable | None = None,
+        repo_id: str = "local/localizer",
+    ):
+        if not (len(roots) == len(batch_yamls) == len(summary_jsons)):
+            raise ValueError("roots, batch_yamls, summary_jsons must be same length")
+        if not roots:
+            raise ValueError("need at least one batch")
+
+        self._children: list[LocalizerDataset] = [
+            LocalizerDataset(
+                r, y, s,
+                cameras=cameras,
+                image_transform=image_transform,
+                repo_id=f"{repo_id}/{i}",
+            )
+            for i, (r, y, s) in enumerate(zip(roots, batch_yamls, summary_jsons))
+        ]
+
+        # Per-child cumulative frame offset for global → (child_idx, local_idx).
+        lengths = [len(c) for c in self._children]
+        self._cum_offsets = np.cumsum([0] + lengths)
+        total = int(self._cum_offsets[-1])
+
+        # Per-child episode offset; child-local episode `ep` becomes
+        # `ep_offsets[k] + ep`. Offsets jump by max-local-ep+1 to keep ints
+        # tight and consecutive-ish without collision.
+        self._ep_offsets: list[int] = []
+        running = 0
+        for c in self._children:
+            self._ep_offsets.append(running)
+            local_max = max(c._ep_to_label.keys()) if c._ep_to_label else -1
+            running += int(local_max) + 1
+
+        # Build combined dicts and the global episode_index column.
+        self._ep_to_label: dict[int, LocalizerLabel] = {}
+        self._ep_to_target: dict[int, tuple[str, str]] = {}
+        self._ep_to_one_hot: dict[int, np.ndarray] = {}
+        self._ep_to_trial: dict[int, str] = {}
+        self._ep_to_child: dict[int, int] = {}
+        for k, c in enumerate(self._children):
+            off = self._ep_offsets[k]
+            for ep, lbl in c._ep_to_label.items():
+                gep = off + ep
+                self._ep_to_label[gep] = lbl
+                self._ep_to_target[gep] = c._ep_to_target[ep]
+                self._ep_to_one_hot[gep] = c._ep_to_one_hot[ep]
+                self._ep_to_trial[gep] = c._ep_to_trial[ep]
+                self._ep_to_child[gep] = k
+
+        # Remapped per-frame episode_index. Concatenate child arrays + offsets.
+        self._episode_index = np.concatenate([
+            c._episode_index + self._ep_offsets[k]
+            for k, c in enumerate(self._children)
+        ]).astype(np.int64)
+        self._frame_index = np.concatenate([
+            c._frame_index for c in self._children
+        ]).astype(np.int64)
+        self._total = total
+
+    @classmethod
+    def from_collection_dir(
+        cls,
+        collection_dir: Path,
+        batch_names: list[str],
+        *,
+        cameras: tuple[str, ...] = ("center_camera",),
+        image_transform: Callable | None = None,
+    ) -> "MultiBatchLocalizerDataset":
+        """Convenience: assumes recorder layout `<name>/`, `<name>.yaml`,
+        `<name>_logs/summary.json` under `collection_dir`.
+        """
+        cd = Path(collection_dir)
+        roots = [cd / n for n in batch_names]
+        yamls = [cd / f"{n}.yaml" for n in batch_names]
+        summaries = [cd / f"{n}_logs" / "summary.json" for n in batch_names]
+        for p in roots + yamls + summaries:
+            if not p.exists():
+                raise FileNotFoundError(f"missing: {p}")
+        return cls(roots, yamls, summaries,
+                   cameras=cameras, image_transform=image_transform)
+
+    def __len__(self) -> int:
+        return self._total
+
+    @property
+    def num_episodes(self) -> int:
+        return len(self._ep_to_label)
+
+    def label_for_episode(self, episode_index: int) -> LocalizerLabel:
+        return self._ep_to_label[episode_index]
+
+    def target_for_episode(self, episode_index: int) -> tuple[str, str]:
+        return self._ep_to_target[episode_index]
+
+    def port_pose_baselink(self, frame_index: int) -> np.ndarray:
+        k = int(np.searchsorted(self._cum_offsets, frame_index, side="right") - 1)
+        local = frame_index - int(self._cum_offsets[k])
+        return self._children[k].port_pose_baselink(local)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if idx < 0 or idx >= self._total:
+            raise IndexError(idx)
+        k = int(np.searchsorted(self._cum_offsets, idx, side="right") - 1)
+        local = idx - int(self._cum_offsets[k])
+        sample = self._children[k][local]
+        # Remap _meta.episode_index to the global value used by _ep_to_label.
+        local_ep = sample["_meta"]["episode_index"]
+        sample["_meta"]["episode_index"] = self._ep_offsets[k] + local_ep
+        sample["_meta"]["batch_index"] = k
+        return sample

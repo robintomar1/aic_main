@@ -44,7 +44,10 @@ from torchvision.transforms import functional as TF
 _PACKAGE_PARENT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PACKAGE_PARENT))
 
-from my_policy.localizer.dataset import LocalizerDataset  # noqa: E402
+from my_policy.localizer.dataset import (  # noqa: E402
+    LocalizerDataset,
+    MultiBatchLocalizerDataset,
+)
 from my_policy.localizer.model import (  # noqa: E402
     BoardPoseRegressor,
     BoardPoseRegressorConfig,
@@ -96,19 +99,96 @@ def _preprocess_image(image) -> torch.Tensor:
     return chw
 
 
+def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+    """Photometric + JPEG augmentation. Input/output: (3, H, W) float in [0, 1].
+
+    Order: color jitter → JPEG round-trip (sometimes) → gaussian noise. Each
+    op is gated by an independent probability so a fraction of samples pass
+    through clean, which keeps the loss surface from collapsing to "compensate
+    for noise" behavior.
+    """
+    img = chw_float01
+    # Brightness ±0.2 (≈ ±20% intensity).
+    if rng.random() < 0.8:
+        img = TF.adjust_brightness(img, float(1.0 + rng.uniform(-0.2, 0.2)))
+    # Contrast ±0.2.
+    if rng.random() < 0.8:
+        img = TF.adjust_contrast(img, float(1.0 + rng.uniform(-0.2, 0.2)))
+    # Saturation ±0.2.
+    if rng.random() < 0.5:
+        img = TF.adjust_saturation(img, float(1.0 + rng.uniform(-0.2, 0.2)))
+    # Hue ±0.03 (small — colors of cables matter).
+    if rng.random() < 0.3:
+        img = TF.adjust_hue(img, float(rng.uniform(-0.03, 0.03)))
+    img = img.clamp(0.0, 1.0)
+
+    # JPEG compression round-trip at q ∈ [60, 95].
+    if rng.random() < 0.5:
+        from torchvision.io import decode_jpeg, encode_jpeg
+        u8 = (img * 255).clamp(0, 255).to(torch.uint8)
+        try:
+            jpeg = encode_jpeg(u8, quality=int(rng.integers(60, 96)))
+            img = decode_jpeg(jpeg).to(torch.float32) / 255.0
+        except Exception:
+            pass  # fall through silently if libjpeg path fails for this sample
+
+    # Gaussian noise σ=0.01 in [0,1] space.
+    if rng.random() < 0.5:
+        img = (img + torch.randn_like(img) * 0.01).clamp(0.0, 1.0)
+
+    return img
+
+
+def _augment_tcp(tcp: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
+    """Add ±2 mm position noise, ±0.5° orientation noise (small-angle approx).
+
+    Input: (7,) float — xyz + xyzw quat. Output: same shape, normalized quat.
+    """
+    out = tcp.clone()
+    out[0:3] += torch.from_numpy(rng.normal(0.0, 0.002, size=3).astype(np.float32))
+    # Small-angle quaternion perturbation: tangent vector with σ ≈ 0.5° (radians).
+    sigma = math.radians(0.5)
+    omega = rng.normal(0.0, sigma, size=3)
+    half = 0.5 * omega
+    dq = np.array([half[0], half[1], half[2], 1.0], dtype=np.float32)  # xyzw
+    dq /= np.linalg.norm(dq)
+    # Quat multiply (xyzw): q_new = q ⊗ dq.
+    qx, qy, qz, qw = out[3].item(), out[4].item(), out[5].item(), out[6].item()
+    dx, dy, dz, dw = dq
+    nx = qw*dx + qx*dw + qy*dz - qz*dy
+    ny = qw*dy - qx*dz + qy*dw + qz*dx
+    nz = qw*dz + qx*dy - qy*dx + qz*dw
+    nw = qw*dw - qx*dx - qy*dy - qz*dz
+    n = math.sqrt(nx*nx + ny*ny + nz*nz + nw*nw) or 1.0
+    out[3:7] = torch.tensor([nx/n, ny/n, nz/n, nw/n], dtype=torch.float32)
+    return out
+
+
 class TrainSampleWrapper(Dataset):
     """Wraps a LocalizerDataset for PyTorch training.
 
     Returns torch tensors only (DataLoader auto-batches), drops _meta to keep
     the collation simple. Applies image preprocessing here so the underlying
     dataset stays raw and other tools can consume it as-is.
+
+    `augment=True` enables D3 photometric + JPEG augmentations on the image
+    and (if `tcp_noise=True`) small TCP pose perturbations. Should be off for
+    val so the metrics measure real generalization, not noise robustness.
     """
 
-    def __init__(self, base: LocalizerDataset, indices: list[int],
-                 camera: str = "center_camera"):
+    def __init__(self, base, indices: list[int],
+                 camera: str = "center_camera",
+                 *, augment: bool = False, tcp_noise: bool = False,
+                 augment_seed: int = 0):
         self.base = base
         self.indices = list(indices)
         self.camera = camera
+        self.augment = augment
+        self.tcp_noise = tcp_noise
+        # Per-worker RNG seeded by (augment_seed, index) inside __getitem__ so
+        # that DataLoader workers don't share state and reseeding across
+        # epochs keeps the augmentation distribution non-degenerate.
+        self._augment_seed = augment_seed
 
     def __len__(self) -> int:
         return len(self.indices)
@@ -120,8 +200,18 @@ class TrainSampleWrapper(Dataset):
                 f"camera {self.camera!r} not in images dict; got "
                 f"{list(sample['images'].keys())}"
             )
-        image = _preprocess_image(sample["images"][self.camera])
+        image = _to_chw_float01(sample["images"][self.camera])
         tcp = torch.from_numpy(sample["tcp_pose"]).float()
+        if self.augment:
+            rng = np.random.default_rng(
+                (self._augment_seed, self.indices[i], int(torch.empty(()).uniform_(0, 1e9).item()))
+            )
+            image = _augment_image(image, rng)
+            if self.tcp_noise:
+                tcp = _augment_tcp(tcp, rng)
+        # Resize + ImageNet normalize after augmentation.
+        image = TF.resize(image, [_MODEL_INPUT_SIZE, _MODEL_INPUT_SIZE], antialias=True)
+        image = TF.normalize(image, mean=list(_IMAGENET_MEAN), std=list(_IMAGENET_STD))
         oh = torch.from_numpy(sample["task_one_hot"]).float()
         target = torch.from_numpy(sample["target"]).float()
         return image, tcp, oh, target
@@ -196,13 +286,28 @@ def train(args: argparse.Namespace) -> int:
         print(f"  CUDA name: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
-    # --- Dataset
-    print(f"opening dataset at {args.dataset}")
-    base = LocalizerDataset(
-        args.dataset, args.batch_yaml, args.summary,
-        cameras=(args.camera,),
-        repo_id=args.repo_id,
-    )
+    # --- Dataset (single-batch or multi-batch)
+    if args.collection_dir is not None:
+        if not args.batches:
+            print("error: --collection-dir requires --batches", file=sys.stderr)
+            return 2
+        print(f"opening multi-batch dataset at {args.collection_dir}; "
+              f"batches: {args.batches}")
+        base = MultiBatchLocalizerDataset.from_collection_dir(
+            args.collection_dir, args.batches,
+            cameras=(args.camera,),
+        )
+    else:
+        if args.dataset is None or args.batch_yaml is None or args.summary is None:
+            print("error: need either --collection-dir + --batches OR "
+                  "--dataset + --batch-yaml + --summary", file=sys.stderr)
+            return 2
+        print(f"opening dataset at {args.dataset}")
+        base = LocalizerDataset(
+            args.dataset, args.batch_yaml, args.summary,
+            cameras=(args.camera,),
+            repo_id=args.repo_id,
+        )
     print(f"  episodes: {base.num_episodes}; frames: {len(base)}")
     train_idx, val_idx = episode_split(
         base, val_fraction=args.val_fraction, seed=args.split_seed
@@ -217,8 +322,12 @@ def train(args: argparse.Namespace) -> int:
         print("error: empty train or val set after split+stride", file=sys.stderr)
         return 2
 
-    train_ds = TrainSampleWrapper(base, train_idx, camera=args.camera)
-    val_ds = TrainSampleWrapper(base, val_idx, camera=args.camera)
+    train_ds = TrainSampleWrapper(
+        base, train_idx, camera=args.camera,
+        augment=args.augment, tcp_noise=args.tcp_noise,
+        augment_seed=args.split_seed,
+    )
+    val_ds = TrainSampleWrapper(base, val_idx, camera=args.camera, augment=False)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
@@ -308,12 +417,18 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--dataset", type=Path, required=True,
-                   help="LeRobot dataset directory (e.g. /root/aic_data/batch_500_dataset)")
-    p.add_argument("--batch-yaml", type=Path, required=True,
-                   help="The batch config YAML used by the eval container.")
-    p.add_argument("--summary", type=Path, required=True,
-                   help="The recorder's summary.json (in <dataset>_logs/).")
+    p.add_argument("--dataset", type=Path, default=None,
+                   help="LeRobot dataset directory (single-batch mode).")
+    p.add_argument("--batch-yaml", type=Path, default=None,
+                   help="Batch config YAML (single-batch mode).")
+    p.add_argument("--summary", type=Path, default=None,
+                   help="Recorder summary.json (single-batch mode).")
+    p.add_argument("--collection-dir", type=Path, default=None,
+                   help="Multi-batch mode: parent dir holding <name>/, "
+                        "<name>.yaml, <name>_logs/summary.json triplets.")
+    p.add_argument("--batches", type=str, nargs="+", default=None,
+                   help="Multi-batch mode: list of batch names under "
+                        "--collection-dir (e.g. batch_100_a batch_100_b).")
     p.add_argument("--output", type=Path, required=True,
                    help="Path to save the best checkpoint (.pt).")
     p.add_argument("--repo-id", type=str, default="local/localizer")
@@ -335,6 +450,11 @@ def main() -> int:
     p.add_argument("--pretrained", action="store_true", default=True,
                    help="Use ImageNet-pretrained ResNet18 backbone (default: on).")
     p.add_argument("--no-pretrained", action="store_false", dest="pretrained")
+    p.add_argument("--augment", action="store_true", default=True,
+                   help="Enable photometric + JPEG image augmentation on train split (default: on).")
+    p.add_argument("--no-augment", action="store_false", dest="augment")
+    p.add_argument("--tcp-noise", action="store_true", default=False,
+                   help="Add ±2mm / ±0.5° noise to the TCP pose input (default: off).")
     args = p.parse_args()
     return train(args)
 
