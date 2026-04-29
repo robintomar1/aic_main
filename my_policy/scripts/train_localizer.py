@@ -145,15 +145,8 @@ def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch
         img = TF.adjust_hue(img, float(rng.uniform(-0.03, 0.03)))
     img = img.clamp(0.0, 1.0)
 
-    # JPEG compression round-trip at q ∈ [60, 95].
-    if rng.random() < 0.5:
-        from torchvision.io import decode_jpeg, encode_jpeg
-        u8 = (img * 255).clamp(0, 255).to(torch.uint8)
-        try:
-            jpeg = encode_jpeg(u8, quality=int(rng.integers(60, 96)))
-            img = decode_jpeg(jpeg).to(torch.float32) / 255.0
-        except Exception:
-            pass  # fall through silently if libjpeg path fails for this sample
+    # JPEG aug removed — eval ROS topics are raw images, so JPEG round-trip
+    # is wasted CPU and a confounding source of artifact.
 
     # Gaussian noise σ=0.01 in [0,1] space.
     if rng.random() < 0.5:

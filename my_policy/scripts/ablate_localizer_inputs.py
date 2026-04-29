@@ -36,6 +36,7 @@ from train_localizer import (  # noqa: E402
     TrainSampleWrapper, episode_split, apply_stride,
 )
 from torch.utils.data import DataLoader
+from my_policy.localizer.model import denormalize_pred  # noqa: E402
 
 
 def evaluate_with_mask(
@@ -93,16 +94,29 @@ def main() -> int:
     )
     print(f"  episodes: {base.num_episodes}; frames: {len(base)}")
 
-    _, val_idx = episode_split(
+    train_idx, val_idx = episode_split(
         base, val_fraction=args.val_fraction, seed=args.split_seed
     )
+    train_idx = apply_stride(train_idx, args.frame_stride)
     val_idx = apply_stride(val_idx, args.frame_stride)
+    # Subsample train to roughly match val size — we want to know how the
+    # model does on TRAINING data with no augmentation, so the diagnostic
+    # discriminates "can't fit" from "overfits but doesn't generalize".
+    train_eval_n = min(len(val_idx), len(train_idx))
+    rng_np = np.random.default_rng(args.split_seed)
+    train_eval_idx = list(rng_np.choice(train_idx, size=train_eval_n, replace=False))
+    train_eval_ds = TrainSampleWrapper(base, train_eval_idx, camera=args.camera, augment=False)
     val_ds = TrainSampleWrapper(base, val_idx, camera=args.camera, augment=False)
-    loader = DataLoader(
+    val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
     )
-    print(f"  val frames: {len(val_idx)}")
+    train_eval_loader = DataLoader(
+        train_eval_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+    )
+    loader = val_loader  # alias for the existing ablation block below
+    print(f"  train_eval frames: {len(train_eval_idx)}; val frames: {len(val_idx)}")
 
     config = BoardPoseRegressorConfig(backbone_pretrained=False)
     model = BoardPoseRegressor(config).to(device)
@@ -110,7 +124,38 @@ def main() -> int:
     model.load_state_dict(ckpt["model_state_dict"])
     print(f"  loaded epoch {ckpt.get('epoch', '?')}, best_val={ckpt.get('best_val', '?')}")
 
-    print("\nrunning ablations...")
+    # --- Train-vs-val diagnostic: distinguishes "can't fit" from "overfit".
+    print("\ntrain-vs-val (no input ablation):")
+    train_m = evaluate_with_mask(model, train_eval_loader, device)
+    val_m = evaluate_with_mask(model, val_loader, device)
+    for name, m in (("train_eval", train_m), ("val       ", val_m)):
+        print(f"  {name}  xy_mm={m['board_xy_mm_mean']:.2f}/{m['board_xy_mm_p95']:.2f}  "
+              f"yaw_deg={m['yaw_deg_mean']:.2f}  rail_mm={m['rail_t_mm_mean']:.2f}")
+
+    # --- Distribution check: does the model emit varied predictions or cluster
+    # at the marginal mean? std(pred) close to 0 => mean-predicting.
+    model.eval()
+    preds_phys = []
+    targets_phys = []
+    with torch.no_grad():
+        for image, tcp, oh, target in val_loader:
+            pred = model(image.to(device), tcp.to(device), oh.to(device))
+            preds_phys.append(denormalize_pred(pred).cpu())
+            targets_phys.append(target.cpu())
+    P = torch.cat(preds_phys).numpy()
+    T = torch.cat(targets_phys).numpy()
+    print("\nval prediction distribution (physical units):")
+    print(f"  pred xy mean=({P[:,0].mean():.4f}, {P[:,1].mean():.4f})  "
+          f"std=({P[:,0].std():.4f}, {P[:,1].std():.4f})")
+    print(f"  tgt  xy mean=({T[:,0].mean():.4f}, {T[:,1].mean():.4f})  "
+          f"std=({T[:,0].std():.4f}, {T[:,1].std():.4f})")
+    print(f"  pred rail_t mean={P[:,4].mean():.4f}  std={P[:,4].std():.4f}")
+    print(f"  tgt  rail_t mean={T[:,4].mean():.4f}  std={T[:,4].std():.4f}")
+    pred_std_ratio_xy = (P[:, :2].std(axis=0) / T[:, :2].std(axis=0)).mean()
+    print(f"  pred_std / target_std (xy avg) = {pred_std_ratio_xy:.3f}  "
+          f"(<0.3 => mean-predicting; ~1.0 => varied predictions)")
+
+    print("\nrunning input ablations on val...")
     cases = [
         ("baseline    ", dict()),
         ("zero_image  ", dict(zero_image=True)),
