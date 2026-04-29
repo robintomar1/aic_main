@@ -120,37 +120,47 @@ def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch
     """
     img = chw_float01
 
-    # --- Geometric: random resized crop. Crop a [scale²] fraction of area
-    # at a random location, then the downstream resize-to-224 fills back.
-    if rng.random() < 0.9:
+    # --- Geometric: aggressive random resized crop. v3 used scale 0.80-1.0
+    # which left enough per-episode pixels intact for the model to memorize
+    # via episode-specific features. v4 widens to 0.5-1.0 so episode mates
+    # rarely share crop windows; the model has to learn pose from generic
+    # board features.
+    if rng.random() < 0.95:
         _, h, w = img.shape
-        scale = float(rng.uniform(0.80, 1.0))
+        scale = float(rng.uniform(0.5, 1.0))
         new_h = max(1, int(h * scale))
         new_w = max(1, int(w * scale))
         top = int(rng.integers(0, h - new_h + 1))
         left = int(rng.integers(0, w - new_w + 1))
         img = img[:, top:top + new_h, left:left + new_w]
 
-    # Brightness ±0.2 (≈ ±20% intensity).
-    if rng.random() < 0.8:
-        img = TF.adjust_brightness(img, float(1.0 + rng.uniform(-0.2, 0.2)))
-    # Contrast ±0.2.
-    if rng.random() < 0.8:
-        img = TF.adjust_contrast(img, float(1.0 + rng.uniform(-0.2, 0.2)))
-    # Saturation ±0.2.
-    if rng.random() < 0.5:
-        img = TF.adjust_saturation(img, float(1.0 + rng.uniform(-0.2, 0.2)))
-    # Hue ±0.03 (small — colors of cables matter).
-    if rng.random() < 0.3:
-        img = TF.adjust_hue(img, float(rng.uniform(-0.03, 0.03)))
+    # Brightness ±0.4 (was ±0.2 — episode-stable lighting was a memorization
+    # foothold; widen to break it).
+    if rng.random() < 0.9:
+        img = TF.adjust_brightness(img, float(1.0 + rng.uniform(-0.4, 0.4)))
+    if rng.random() < 0.9:
+        img = TF.adjust_contrast(img, float(1.0 + rng.uniform(-0.4, 0.4)))
+    if rng.random() < 0.7:
+        img = TF.adjust_saturation(img, float(1.0 + rng.uniform(-0.4, 0.4)))
+    # Hue still kept narrow — cable color is informative for some tasks.
+    if rng.random() < 0.4:
+        img = TF.adjust_hue(img, float(rng.uniform(-0.05, 0.05)))
     img = img.clamp(0.0, 1.0)
 
-    # JPEG aug removed — eval ROS topics are raw images, so JPEG round-trip
-    # is wasted CPU and a confounding source of artifact.
+    # Gaussian noise σ=0.02 (was 0.01).
+    if rng.random() < 0.7:
+        img = (img + torch.randn_like(img) * 0.02).clamp(0.0, 1.0)
 
-    # Gaussian noise σ=0.01 in [0,1] space.
+    # Random erasing (cutout): zeroes a small rectangle. Forces the model not
+    # to rely on a single visual landmark. Done AFTER photometric so the
+    # erased region is unambiguous black.
     if rng.random() < 0.5:
-        img = (img + torch.randn_like(img) * 0.01).clamp(0.0, 1.0)
+        _, h, w = img.shape
+        eh = int(rng.integers(int(h * 0.05), int(h * 0.20) + 1))
+        ew = int(rng.integers(int(w * 0.05), int(w * 0.20) + 1))
+        et = int(rng.integers(0, h - eh + 1))
+        el = int(rng.integers(0, w - ew + 1))
+        img[:, et:et + eh, el:el + ew] = 0.0
 
     return img
 
@@ -490,7 +500,7 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr-backbone", type=float, default=1e-4)
     p.add_argument("--lr-head", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-3)
     p.add_argument("--frame-stride", type=int, default=10,
                    help="Sample every Nth frame within each episode (1 = all frames).")
     p.add_argument("--val-fraction", type=float, default=0.2,

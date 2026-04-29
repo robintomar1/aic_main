@@ -73,6 +73,7 @@ class BoardPoseRegressorConfig:
     head_hidden_dim: int = 256
     output_dim: int = 5
     backbone_pretrained: bool = True
+    head_dropout: float = 0.3
 
 
 class FiLM(nn.Module):
@@ -133,11 +134,15 @@ class BoardPoseRegressor(nn.Module):
             feature_dim=feature_dim,
         )
 
+        p = self.config.head_dropout
         self.head = nn.Sequential(
+            nn.Dropout(p),
             nn.Linear(feature_dim, self.config.head_hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(p),
             nn.Linear(self.config.head_hidden_dim, self.config.head_hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(p),
             nn.Linear(self.config.head_hidden_dim, self.config.output_dim),
         )
 
