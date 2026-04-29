@@ -48,6 +48,7 @@ from my_policy.localizer.dataset import (  # noqa: E402
     LocalizerDataset,
     MultiBatchLocalizerDataset,
 )
+from my_policy.localizer.labels import TASK_ONE_HOT_ORDER  # noqa: E402
 from my_policy.localizer.model import (  # noqa: E402
     BoardPoseRegressor,
     BoardPoseRegressorConfig,
@@ -361,11 +362,49 @@ def train(args: argparse.Namespace) -> int:
         optim, T_max=args.epochs
     )
 
-    # --- Train
+    # --- Resume support
     best_val = float("inf")
+    start_epoch = 0
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    log = []
-    for epoch in range(args.epochs):
+    latest_path = args.output.with_name(args.output.stem + "_latest.pt")
+    log: list = []
+    log_path = args.output.with_suffix(".log.json")
+
+    if args.resume is not None:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optim_state_dict" in ckpt:
+            optim.load_state_dict(ckpt["optim_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0))
+        best_val = float(ckpt.get("best_val", float("inf")))
+        if log_path.exists():
+            log = json.loads(log_path.read_text())
+        print(f"resumed from {args.resume} at epoch {start_epoch}, "
+              f"best_val={best_val:.5f}")
+
+    def _ckpt_payload(epoch: int, val: dict | None) -> dict:
+        return {
+            "model_state_dict": model.state_dict(),
+            "optim_state_dict": optim.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "config": vars(config),
+            "args": vars(args),
+            "epoch": epoch,
+            "best_val": best_val,
+            "val": val,
+            # Inference-side metadata: pin invariants so a future code change
+            # can't silently break the saved checkpoint.
+            "task_one_hot_order": list(TASK_ONE_HOT_ORDER),
+            "image_size": _MODEL_INPUT_SIZE,
+            "imagenet_mean": list(_IMAGENET_MEAN),
+            "imagenet_std": list(_IMAGENET_STD),
+            "cameras": [args.camera],
+        }
+
+    # --- Train
+    for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
         model.train()
         train_losses = []
@@ -396,19 +435,17 @@ def train(args: argparse.Namespace) -> int:
         log.append({"epoch": epoch + 1, "train_loss": train_loss, **val,
                     "elapsed_s": elapsed})
 
-        if val["loss"] < best_val:
+        # Always save latest (for resume); save best (for inference) when val improves.
+        is_best = val["loss"] < best_val
+        if is_best:
             best_val = val["loss"]
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "config": vars(config),
-                "args": vars(args),
-                "epoch": epoch + 1,
-                "val": val,
-            }, args.output)
+        payload = _ckpt_payload(epoch + 1, val)
+        torch.save(payload, latest_path)
+        if is_best:
+            torch.save(payload, args.output)
             print(f"  saved best checkpoint to {args.output} (val_loss={best_val:.5f})")
-
-    log_path = args.output.with_suffix(".log.json")
-    log_path.write_text(json.dumps(log, indent=2))
+        # Flush log every epoch so progress survives a crash.
+        log_path.write_text(json.dumps(log, indent=2))
     print(f"\ntraining done. best_val_loss={best_val:.5f}; log at {log_path}")
     return 0
 
@@ -455,6 +492,8 @@ def main() -> int:
     p.add_argument("--no-augment", action="store_false", dest="augment")
     p.add_argument("--tcp-noise", action="store_true", default=False,
                    help="Add ±2mm / ±0.5° noise to the TCP pose input (default: off).")
+    p.add_argument("--resume", type=Path, default=None,
+                   help="Path to <output>_latest.pt to resume training from.")
     args = p.parse_args()
     return train(args)
 
