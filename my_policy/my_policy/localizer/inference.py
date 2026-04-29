@@ -132,6 +132,28 @@ class PortLocalizer:
             port_in_board_quat if port_in_board_quat is not None
             else DEFAULT_PORT_IN_BOARD_QUAT
         )
+        # Camera ordering bound to the checkpoint. The model was trained with
+        # this exact order (cam_fuse Linear weights are positional); a runtime
+        # caller passing a dict is safer than a list because we look up by
+        # name and reorder here, rather than trusting the caller to remember
+        # which slot is which.
+        self._cameras: list[str] = list(ckpt.get("cameras", []))
+        if not self._cameras:
+            raise ValueError(
+                f"checkpoint {checkpoint_path} has no 'cameras' metadata. "
+                f"This checkpoint was saved before v7's multi-cam contract; "
+                f"retrain or set self._cameras manually."
+            )
+        if len(self._cameras) != self.model.config.num_cameras:
+            raise ValueError(
+                f"checkpoint cameras={self._cameras} (len {len(self._cameras)}) "
+                f"disagrees with model num_cameras={self.model.config.num_cameras}"
+            )
+
+    @property
+    def cameras(self) -> list[str]:
+        """Camera names the model expects, in the order it was trained on."""
+        return list(self._cameras)
 
     def set_port_in_board_quat(
         self, port_type: str, port_name: str,
@@ -144,7 +166,7 @@ class PortLocalizer:
     @torch.no_grad()
     def predict_port_pose(
         self,
-        images: list | np.ndarray | torch.Tensor,
+        images: dict | list | np.ndarray | torch.Tensor,
         tcp_pose: np.ndarray | torch.Tensor,
         target_module_name: str,
         port_name: str,
@@ -152,18 +174,36 @@ class PortLocalizer:
     ) -> PortPose:
         """Run one forward pass + URDF composition. Returns 7-DoF port pose.
 
-        `images`: list of per-camera images in the same order the model was
-        trained with (see ckpt['cameras']). For backward compat a single
-        ndarray/Tensor is accepted when the model is single-cam.
+        `images` accepts:
+          - dict[str, image]: keyed by camera name (left_camera/center_camera/
+            right_camera). Reordered by `self.cameras` automatically — this is
+            the SAFE form, ordering can't go wrong by accident.
+          - list[image]: assumed already ordered to match self.cameras. Used
+            only when the caller has explicitly verified the order.
+          - single ndarray/Tensor: only valid for a 1-cam model.
         """
-        if isinstance(images, (np.ndarray, torch.Tensor)) and not isinstance(images, list):
-            images = [images]
-        if len(images) != self.model.config.num_cameras:
+        # Normalize to an ordered list matching self._cameras.
+        if isinstance(images, dict):
+            missing = [c for c in self._cameras if c not in images]
+            if missing:
+                raise KeyError(
+                    f"images dict missing camera keys {missing!r}; "
+                    f"have {list(images.keys())!r}, need {self._cameras!r}"
+                )
+            ordered = [images[c] for c in self._cameras]
+        elif isinstance(images, list):
+            ordered = images
+        else:
+            # single image — only valid for 1-cam model.
+            ordered = [images]
+
+        if len(ordered) != self.model.config.num_cameras:
             raise ValueError(
-                f"got {len(images)} images but model expects "
-                f"{self.model.config.num_cameras} cameras"
+                f"got {len(ordered)} images but model expects "
+                f"{self.model.config.num_cameras} cameras "
+                f"({self._cameras!r})"
             )
-        per_cam = [_preprocess_image(im) for im in images]
+        per_cam = [_preprocess_image(im) for im in ordered]
         img_tensor = torch.stack(per_cam, dim=0).unsqueeze(0).to(self.device)  # (1, num_cams, 3, H, W)
         if isinstance(tcp_pose, np.ndarray):
             tcp = torch.from_numpy(tcp_pose).float()
