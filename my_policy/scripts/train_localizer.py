@@ -106,14 +106,31 @@ def _preprocess_image(image) -> torch.Tensor:
 
 
 def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
-    """Photometric + JPEG augmentation. Input/output: (3, H, W) float in [0, 1].
+    """Photometric + geometric + JPEG augmentation. Input/output: (3, H, W).
 
-    Order: color jitter → JPEG round-trip (sometimes) → gaussian noise. Each
-    op is gated by an independent probability so a fraction of samples pass
-    through clean, which keeps the loss surface from collapsing to "compensate
-    for noise" behavior.
+    Geometric (random resized crop + translation): the dominant failure mode
+    seen in v1/v2 was the model memorizing per-episode visual signatures
+    rather than learning pose-from-pixels. Photometric aug alone left the
+    geometric layout of each episode pixel-stable, so memorization still
+    worked. A random crop per frame breaks that — every frame from the same
+    episode now lands at a different pixel offset, forcing the network to
+    learn pose-invariant features.
+    No rotation (would confuse perceived board yaw with image rotation).
+    No horizontal flip (board layout has chirality — sc_port_0 vs _1 etc.).
     """
     img = chw_float01
+
+    # --- Geometric: random resized crop. Crop a [scale²] fraction of area
+    # at a random location, then the downstream resize-to-224 fills back.
+    if rng.random() < 0.9:
+        _, h, w = img.shape
+        scale = float(rng.uniform(0.80, 1.0))
+        new_h = max(1, int(h * scale))
+        new_w = max(1, int(w * scale))
+        top = int(rng.integers(0, h - new_h + 1))
+        left = int(rng.integers(0, w - new_w + 1))
+        img = img[:, top:top + new_h, left:left + new_w]
+
     # Brightness ±0.2 (≈ ±20% intensity).
     if rng.random() < 0.8:
         img = TF.adjust_brightness(img, float(1.0 + rng.uniform(-0.2, 0.2)))
