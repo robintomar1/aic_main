@@ -31,10 +31,45 @@ import torch.nn as nn
 from torchvision.models import ResNet18_Weights, resnet18
 
 
+# Approximate per-dim target means and stds for the 5-vector
+# (board_x, board_y, sin_yaw, cos_yaw, rail_t). Derived from the
+# `gen_trial_config.py` randomization bounds:
+#   board_x ∈ [0.13, 0.20], board_y ∈ [-0.10, 0.10], yaw ∈ ±35°,
+#   rail_t ∈ [0, 0.05].
+# Without normalization, sin_yaw/cos_yaw (magnitude ~1) dominated the MSE
+# gradient and the 0.04-magnitude xy targets got ~12× less signal. Scaling to
+# unit-std equalizes the per-dim gradient and lets each output learn at the
+# same rate.
+TARGET_MEAN = (0.165, 0.000, 0.000, 0.940, 0.025)
+TARGET_STD = (0.022, 0.058, 0.340, 0.050, 0.014)
+
+
+def _stats_tensors(device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = torch.tensor(TARGET_MEAN, dtype=torch.float32)
+    std = torch.tensor(TARGET_STD, dtype=torch.float32)
+    if device is not None:
+        mean = mean.to(device)
+        std = std.to(device)
+    return mean, std
+
+
+def normalize_target(t: torch.Tensor) -> torch.Tensor:
+    """Convert physical-units target (5,) or (B,5) to z-scored space."""
+    mean, std = _stats_tensors(t.device)
+    return (t - mean) / std
+
+
+def denormalize_pred(pred: torch.Tensor) -> torch.Tensor:
+    """Convert z-scored model output back to physical units."""
+    mean, std = _stats_tensors(pred.device)
+    return pred * std + mean
+
+
 @dataclass
 class BoardPoseRegressorConfig:
     task_one_hot_dim: int = 7
     tcp_pose_dim: int = 7
+    tcp_embed_dim: int = 64
     head_hidden_dim: int = 256
     output_dim: int = 5
     backbone_pretrained: bool = True
@@ -78,13 +113,28 @@ class BoardPoseRegressor(nn.Module):
         self.backbone = backbone
         self.feature_dim = feature_dim
 
-        self.film = FiLM(
+        self.film_task = FiLM(
             conditioning_dim=self.config.task_one_hot_dim,
             feature_dim=feature_dim,
         )
 
+        # Project TCP to a richer embedding before FiLM-modulating the image
+        # feature. Concat alone (previous arch) let the 512-dim image feature
+        # dominate the head by fan-in, so TCP got near-zero gradient and was
+        # ignored — confirmed empirically by ablation. FiLM gives TCP equal
+        # multiplicative say in every feature channel.
+        self.tcp_proj = nn.Sequential(
+            nn.Linear(self.config.tcp_pose_dim, self.config.tcp_embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.config.tcp_embed_dim, self.config.tcp_embed_dim),
+        )
+        self.film_tcp = FiLM(
+            conditioning_dim=self.config.tcp_embed_dim,
+            feature_dim=feature_dim,
+        )
+
         self.head = nn.Sequential(
-            nn.Linear(feature_dim + self.config.tcp_pose_dim, self.config.head_hidden_dim),
+            nn.Linear(feature_dim, self.config.head_hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(self.config.head_hidden_dim, self.config.head_hidden_dim),
             nn.ReLU(inplace=True),
@@ -97,22 +147,26 @@ class BoardPoseRegressor(nn.Module):
         tcp_pose: torch.Tensor,     # (B, 7) float32, base_link xyz + xyzw
         task_one_hot: torch.Tensor, # (B, 7) float32
     ) -> torch.Tensor:
-        feat = self.backbone(image)             # (B, 512)
-        feat = self.film(feat, task_one_hot)    # (B, 512)
-        x = torch.cat([feat, tcp_pose], dim=1)  # (B, 519)
-        return self.head(x)                      # (B, 5)
+        feat = self.backbone(image)                  # (B, 512)
+        feat = self.film_task(feat, task_one_hot)    # (B, 512)
+        tcp_emb = self.tcp_proj(tcp_pose)            # (B, tcp_embed_dim)
+        feat = self.film_tcp(feat, tcp_emb)          # (B, 512)
+        return self.head(feat)                        # (B, 5)
 
 
 def loss_fn(
     pred: torch.Tensor, target: torch.Tensor, *, return_components: bool = False
 ) -> torch.Tensor | dict[str, torch.Tensor]:
-    """MSE on the 5-vector. Components reported separately for diagnostics —
-    yaw and rail_t scales differ from board_xy by ~10×, so a single scalar
-    loss can hide which axis is failing to converge.
+    """MSE between model output (z-scored) and z-scored target.
+
+    `target` is in physical units; we normalize it here so callers don't have
+    to remember the convention. Per-dim contributions are equalized because
+    each dim has ~unit std after normalization.
     """
     if pred.shape != target.shape:
         raise ValueError(f"shape mismatch: pred {pred.shape} vs target {target.shape}")
-    diff = pred - target
+    target_n = normalize_target(target)
+    diff = pred - target_n
     sq = diff ** 2
     total = sq.mean()
     if not return_components:
@@ -126,32 +180,30 @@ def loss_fn(
     }
 
 
-def predicted_yaw_rad(pred: torch.Tensor) -> torch.Tensor:
+def predicted_yaw_rad(pred_physical: torch.Tensor) -> torch.Tensor:
     """Recover yaw from (sin, cos) outputs via atan2. Returns radians in (-π, π].
-
-    pred can be the raw 5-vector output; we slice [2:4]. The (sin, cos) pair
-    isn't constrained to the unit circle by training (just toward it via
-    MSE), so atan2 is correct without renormalization.
+    Input must already be in physical units (denormalized).
     """
-    return torch.atan2(pred[..., 2], pred[..., 3])
+    return torch.atan2(pred_physical[..., 2], pred_physical[..., 3])
 
 
 def reconstruct_metric_errors(
     pred: torch.Tensor, target: torch.Tensor
 ) -> dict[str, torch.Tensor]:
-    """Per-axis metric errors for monitoring (mean abs error, in physical units).
+    """Per-axis metric errors in physical units.
 
-    Returns a dict with: board_xy_mm, yaw_deg, rail_t_mm. These are the values
-    we actually care about — sub-mm board pose, sub-degree yaw, sub-mm rail
-    translation are the targets.
+    `pred` is the raw model output (z-scored); `target` is in physical units.
+    Both are converted to physical units for error computation so the metrics
+    stay interpretable (mm, degrees) regardless of what the loss space is.
     """
-    diff_xy = pred[..., :2] - target[..., :2]
-    err_xy_mm = diff_xy.norm(dim=-1) * 1000.0  # per-sample 2D xy error
-    pred_yaw = predicted_yaw_rad(pred)
+    pred_p = denormalize_pred(pred)
+    diff_xy = pred_p[..., :2] - target[..., :2]
+    err_xy_mm = diff_xy.norm(dim=-1) * 1000.0
+    pred_yaw = predicted_yaw_rad(pred_p)
     target_yaw = predicted_yaw_rad(target)
     yaw_diff = (pred_yaw - target_yaw + torch.pi) % (2.0 * torch.pi) - torch.pi
     err_yaw_deg = yaw_diff.abs() * (180.0 / torch.pi)
-    err_rail_mm = (pred[..., 4] - target[..., 4]).abs() * 1000.0
+    err_rail_mm = (pred_p[..., 4] - target[..., 4]).abs() * 1000.0
     return {
         "board_xy_mm": err_xy_mm,
         "yaw_deg": err_yaw_deg,

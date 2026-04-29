@@ -25,7 +25,9 @@ from my_policy.localizer.model import (  # noqa: E402
     BoardPoseRegressor,
     BoardPoseRegressorConfig,
     FiLM,
+    denormalize_pred,
     loss_fn,
+    normalize_target,
     predicted_yaw_rad,
     reconstruct_metric_errors,
 )
@@ -61,51 +63,64 @@ def test_film_identity_at_zero_conditioning():
 
 
 def test_loss_fn_zero_at_match():
-    """loss_fn returns 0 when pred == target."""
-    pred = torch.randn(4, 5)
-    out = loss_fn(pred, pred)
+    """loss_fn returns 0 when pred (normalized) matches the normalized target."""
+    target_phys = torch.randn(4, 5) * 0.1  # arbitrary physical values
+    pred_norm = normalize_target(target_phys)  # what a perfect model emits
+    out = loss_fn(pred_norm, target_phys)
     assert out.item() < 1e-9, f"expected ~0, got {out.item()}"
 
 
-def test_loss_fn_components_sum_correctly():
-    """Per-axis component breakdown is internally consistent."""
-    pred = torch.zeros(4, 5)
-    target = torch.tensor([
-        [0.1, 0.0, 0.0, 0.0, 0.0],   # board_x off by 0.1
-        [0.0, 0.2, 0.0, 0.0, 0.0],   # board_y off by 0.2
-        [0.0, 0.0, 0.3, 0.0, 0.0],   # sin off by 0.3
-        [0.0, 0.0, 0.0, 0.0, 0.5],   # rail_t off by 0.5
-    ])
+def test_loss_fn_normalization_equalizes_axes():
+    """An equal-relative-error perturbation on every axis should produce
+    roughly equal per-axis loss components after normalization."""
+    # Use a non-trivial reference target close to the expected mean.
+    target = torch.tensor([[0.165, 0.0, 0.0, 0.94, 0.025]])
+    target_n = normalize_target(target)
+    # Pred = perfect prediction perturbed by 0.5 std on every dim.
+    pred = target_n + 0.5
     comps = loss_fn(pred, target, return_components=True)
-    # board_x: 0.01 / 4 = 0.0025
-    assert abs(comps["board_x"].item() - 0.0025) < 1e-9
-    assert abs(comps["board_y"].item() - 0.01) < 1e-9
-    assert abs(comps["yaw_sincos"].item() - (0.09 / 8)) < 1e-9
-    assert abs(comps["rail_t"].item() - 0.0625) < 1e-9
+    # Each component should be ~0.25 (since (0.5)² = 0.25).
+    for k in ("board_x", "board_y", "rail_t"):
+        assert abs(comps[k].item() - 0.25) < 1e-6, f"{k}: {comps[k].item()}"
+    # yaw_sincos averages two channels, both 0.25.
+    assert abs(comps["yaw_sincos"].item() - 0.25) < 1e-6
 
 
 def test_predicted_yaw_rad_atan2():
-    """atan2 of (sin, cos) recovers the yaw."""
+    """atan2 of (sin, cos) recovers the yaw — input must be physical units."""
     yaws = torch.tensor([0.0, math.pi / 2, math.pi, -math.pi / 2, 1.234])
-    pred = torch.zeros(len(yaws), 5)
-    pred[:, 2] = torch.sin(yaws)
-    pred[:, 3] = torch.cos(yaws)
-    recovered = predicted_yaw_rad(pred)
+    pred_physical = torch.zeros(len(yaws), 5)
+    pred_physical[:, 2] = torch.sin(yaws)
+    pred_physical[:, 3] = torch.cos(yaws)
+    recovered = predicted_yaw_rad(pred_physical)
     diff = (recovered - yaws + math.pi) % (2.0 * math.pi) - math.pi
     assert torch.all(torch.abs(diff) < 1e-6), f"yaw recovery off: {diff}"
 
 
 def test_reconstruct_metric_errors_basic():
-    """Verify the metric conversions (m → mm, rad → deg) are consistent."""
-    target = torch.tensor([[0.1, -0.2, 0.0, 1.0, 0.05]])  # yaw = 0
-    # pred: board_xy off by (0.001, 0), yaw off by sin(0.01)~=0.01 rad ≈ 0.573 deg,
-    # rail_t off by 0.002.
-    pred = torch.tensor([[0.101, -0.2, math.sin(0.01), math.cos(0.01), 0.052]])
+    """Verify the metric conversions (m → mm, rad → deg) are consistent.
+
+    `pred` is the model's z-scored output; metrics denormalize internally so
+    we construct pred = normalize(target_perturbed_in_physical_units).
+    """
+    target = torch.tensor([[0.165, 0.0, 0.0, 1.0, 0.025]])  # yaw = 0
+    pred_physical = torch.tensor([
+        [0.166, 0.0, math.sin(0.01), math.cos(0.01), 0.027]
+    ])  # xy off by 1mm, yaw off by 0.01 rad, rail off by 2mm
+    pred = normalize_target(pred_physical)  # what the model would emit
     errs = reconstruct_metric_errors(pred, target)
     assert abs(errs["board_xy_mm"].item() - 1.0) < 1e-3
-    # Yaw should be ~0.573 degrees.
     assert abs(errs["yaw_deg"].item() - math.degrees(0.01)) < 1e-3
-    assert abs(errs["rail_t_mm"].item() - 2.0) < 1e-6
+    assert abs(errs["rail_t_mm"].item() - 2.0) < 1e-3
+
+
+def test_normalize_denormalize_roundtrip():
+    """normalize ∘ denormalize = identity."""
+    x = torch.randn(8, 5)
+    y = normalize_target(denormalize_pred(x))
+    assert torch.allclose(x, y, atol=1e-6)
+    z = denormalize_pred(normalize_target(x))
+    assert torch.allclose(x, z, atol=1e-6)
 
 
 def test_pretrained_backbone_loads():
@@ -132,9 +147,10 @@ if __name__ == "__main__":
         test_forward_shape,
         test_film_identity_at_zero_conditioning,
         test_loss_fn_zero_at_match,
-        test_loss_fn_components_sum_correctly,
+        test_loss_fn_normalization_equalizes_axes,
         test_predicted_yaw_rad_atan2,
         test_reconstruct_metric_errors_basic,
+        test_normalize_denormalize_roundtrip,
         test_pretrained_backbone_loads,
     ]
     failures = 0

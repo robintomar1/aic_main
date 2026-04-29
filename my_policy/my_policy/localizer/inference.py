@@ -26,7 +26,12 @@ import torch
 from torchvision.transforms import functional as TF
 
 from .labels import LocalizerLabel, reconstruct_port_in_baselink, task_one_hot
-from .model import BoardPoseRegressor, BoardPoseRegressorConfig, predicted_yaw_rad
+from .model import (
+    BoardPoseRegressor,
+    BoardPoseRegressorConfig,
+    denormalize_pred,
+    predicted_yaw_rad,
+)
 
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -154,7 +159,8 @@ class PortLocalizer:
         tcp = tcp.unsqueeze(0).to(self.device)
         oh = torch.from_numpy(task_one_hot(target_module_name)).float().unsqueeze(0).to(self.device)
 
-        pred = self.model(img, tcp, oh).squeeze(0).cpu().numpy()
+        pred_n = self.model(img, tcp, oh)               # z-scored model output
+        pred = denormalize_pred(pred_n).squeeze(0).cpu().numpy()
         bx, by, sin_yaw, cos_yaw, rail_t = pred.tolist()
         yaw = float(np.arctan2(sin_yaw, cos_yaw))
 
