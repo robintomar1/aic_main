@@ -42,6 +42,11 @@ from .labels import (
     match_episodes_to_trials,
     task_one_hot,
 )
+from .projection import (
+    LEROBOT_CAM_TO_SHORT,
+    compute_static_tcp_to_camera_optical,
+    project_port_to_pixels,
+)
 
 
 def _load_state_names(dataset_root: Path) -> list[str]:
@@ -79,6 +84,10 @@ _PORT_POSE_NAMES = [
     "groundtruth.port_pose.y",
     "groundtruth.port_pose.z",
 ]
+# Original Gazebo image resolution (before any resize). Used to normalize
+# the projected port-pixel target to [0, 1] for the v8 aux head supervision.
+_ORIGINAL_IMG_W = 1152
+_ORIGINAL_IMG_H = 1024
 
 
 class LocalizerDataset:
@@ -128,8 +137,12 @@ class LocalizerDataset:
         state_names = _load_state_names(self._dataset_root)
         self._tcp_idx = _slice_indices(state_names, _TCP_POSE_NAMES)
         # Port pose indices kept for the killer test's parity check; not in
-        # __getitem__ output (would make the model cheat).
+        # __getitem__ output (would make the model cheat). Also used by the
+        # v8 heatmap aux to project recorded port to per-camera pixels.
         self._port_idx = _slice_indices(state_names, _PORT_POSE_NAMES)
+        # `cameras` is the LeRobot camera key list (e.g. "left_camera"); map
+        # to the short names used by gen_trial_config.CAMERA_OPTICAL_IN_BASE_LINK.
+        self._cam_short_names = [LEROBOT_CAM_TO_SHORT[c] for c in self._cameras]
 
         # --- Load the parquet table once. observation.state is a per-row list
         # (variable-typed in older lerobot, fixed-shape numpy in newer); we
@@ -156,6 +169,17 @@ class LocalizerDataset:
                 f"episode_index column has {unique_eps} but summary join "
                 f"yields {expected_eps}; dataset and summary out of sync"
             )
+
+        # --- Compute static `tcp → camera_optical` (one per camera) from a
+        # frame where the robot is at HOME pose. Recorder convention: every
+        # episode's frame_index 0 starts at HOME. Use any episode's first
+        # frame to derive the static rigid extrinsic.
+        home_frame_idx = int(np.where(self._frame_index == 0)[0][0])
+        home_tcp = self._state[home_frame_idx, self._tcp_idx]
+        self._static_tcp_to_cam = compute_static_tcp_to_camera_optical(
+            home_tcp_xyz=home_tcp[:3],
+            home_tcp_quat_xyzw=home_tcp[3:7],
+        )
 
         # --- Optional LeRobot handle for image decoding. Use the plain
         # constructor (NOT .resume() — that opens in "recording" mode and
@@ -203,6 +227,23 @@ class LocalizerDataset:
         tcp = self._state[idx, self._tcp_idx].astype(np.float32)
         target = label.as_target_5()
 
+        # v8 aux: project recorded port pose into each requested camera at
+        # this frame's TCP. Returns (num_cams, 3) array of [u_norm, v_norm,
+        # valid] where (u_norm, v_norm) is in [0, 1] of the original 1152×1024
+        # image, and valid=1 iff port is in front of cam AND inside image.
+        port_xyz = self._state[idx, self._port_idx]
+        pixels_dict = project_port_to_pixels(
+            port_xyz, tcp[:3], tcp[3:7], self._static_tcp_to_cam,
+        )
+        port_pixels = np.zeros((len(self._cameras), 3), dtype=np.float32)
+        for i, short in enumerate(self._cam_short_names):
+            u, v, z = pixels_dict[short]
+            in_front = z > 0
+            in_frame = in_front and (0 <= u < _ORIGINAL_IMG_W) and (0 <= v < _ORIGINAL_IMG_H)
+            port_pixels[i, 0] = u / _ORIGINAL_IMG_W if in_front else 0.0
+            port_pixels[i, 1] = v / _ORIGINAL_IMG_H if in_front else 0.0
+            port_pixels[i, 2] = 1.0 if in_frame else 0.0
+
         images: dict[str, torch.Tensor] = {}
         if self._lr is not None:
             frame = self._lr[idx]
@@ -223,6 +264,7 @@ class LocalizerDataset:
             "tcp_pose": tcp,
             "task_one_hot": one_hot.astype(np.float32),
             "target": target,
+            "port_pixels": port_pixels,
             "_meta": {
                 "episode_index": ep,
                 "frame_index": int(self._frame_index[idx]),
@@ -309,6 +351,9 @@ class MultiBatchLocalizerDataset:
             c._frame_index for c in self._children
         ]).astype(np.int64)
         self._total = total
+        # Static extrinsics are robot-rigid; should match across batches.
+        # Trust the first child's value (children compute their own at init).
+        self._static_tcp_to_cam = self._children[0]._static_tcp_to_cam
 
     @classmethod
     def from_collection_dir(

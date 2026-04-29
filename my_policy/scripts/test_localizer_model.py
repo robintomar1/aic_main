@@ -62,6 +62,41 @@ def test_forward_shape_singlecam_backcompat():
     assert out.shape == (B, 5)
 
 
+def test_forward_return_aux_shapes():
+    """v8: return_aux=True returns (pred, aux_pixels) with aux in [0,1]."""
+    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3,
+                                   aux_pixel_head=True)
+    model = BoardPoseRegressor(cfg)
+    model.eval()
+    B, NC = 4, 3
+    images = torch.randn(B, NC, 3, 224, 224)
+    tcp = torch.randn(B, 7)
+    oh = torch.zeros(B, 7); oh[:, 0] = 1.0
+    with torch.no_grad():
+        pred, aux = model(images, tcp, oh, return_aux=True)
+    assert pred.shape == (B, 5)
+    assert aux.shape == (B, NC, 2)
+    # Sigmoid output is bounded.
+    assert (aux >= 0).all() and (aux <= 1).all()
+
+
+def test_aux_pixel_loss_masks_invalid():
+    """v8: aux loss ignores frames marked invalid (valid=0)."""
+    from my_policy.localizer.model import aux_pixel_loss
+    B, NC = 2, 3
+    pred = torch.full((B, NC, 2), 0.5)
+    # All targets valid=0 → loss should be exactly 0 (no NaN).
+    target = torch.zeros((B, NC, 3))
+    target[..., 0:2] = 0.9
+    target[..., 2] = 0.0
+    loss_zero = aux_pixel_loss(pred, target)
+    assert torch.allclose(loss_zero, torch.tensor(0.0))
+    # One valid sample → loss = (0.5-0.9)^2 = 0.16 averaged over 2 channels = 0.16.
+    target[0, 0, 2] = 1.0
+    loss_one = aux_pixel_loss(pred, target)
+    assert abs(loss_one.item() - 0.16) < 1e-6, f"got {loss_one.item()}"
+
+
 def test_film_identity_at_zero_conditioning():
     """FiLM with zero conditioning leaves features unchanged at init.
 
@@ -161,6 +196,8 @@ if __name__ == "__main__":
     tests = [
         test_forward_shape_multicam,
         test_forward_shape_singlecam_backcompat,
+        test_forward_return_aux_shapes,
+        test_aux_pixel_loss_masks_invalid,
         test_film_identity_at_zero_conditioning,
         test_loss_fn_zero_at_match,
         test_loss_fn_normalization_equalizes_axes,

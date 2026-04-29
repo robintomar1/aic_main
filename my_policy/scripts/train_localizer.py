@@ -55,8 +55,10 @@ from my_policy.localizer.dataset import (  # noqa: E402
 )
 from my_policy.localizer.labels import TASK_ONE_HOT_ORDER  # noqa: E402
 from my_policy.localizer.model import (  # noqa: E402
+    AUX_PIXEL_WEIGHT,
     BoardPoseRegressor,
     BoardPoseRegressorConfig,
+    aux_pixel_loss,
     loss_fn,
     reconstruct_metric_errors,
 )
@@ -105,8 +107,12 @@ def _preprocess_image(image) -> torch.Tensor:
     return chw
 
 
-def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
-    """Photometric + geometric + JPEG augmentation. Input/output: (3, H, W).
+def _augment_image(
+    chw_float01: torch.Tensor, rng: np.random.Generator,
+) -> tuple[torch.Tensor, tuple | None]:
+    """Photometric + geometric + JPEG augmentation. Input: (3, H, W).
+    Returns (augmented_image, crop_info) where crop_info is None or
+    (top_norm, left_norm, h_norm, w_norm) in [0,1] of the input image.
 
     Geometric (random resized crop + translation): the dominant failure mode
     seen in v1/v2 was the model memorizing per-episode visual signatures
@@ -125,6 +131,7 @@ def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch
     # aug isn't needed and makes fitting slower without much generalization
     # gain. Keep enough geometric variation to break per-episode pixel
     # memorization without strangling the fit.
+    crop = None  # (top_norm, left_norm, h_norm, w_norm) in [0,1] of input img
     if rng.random() < 0.9:
         _, h, w = img.shape
         scale = float(rng.uniform(0.65, 1.0))
@@ -133,6 +140,7 @@ def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch
         top = int(rng.integers(0, h - new_h + 1))
         left = int(rng.integers(0, w - new_w + 1))
         img = img[:, top:top + new_h, left:left + new_w]
+        crop = (top / h, left / w, new_h / h, new_w / w)
 
     # Photometric: ±0.25 (between v3's 0.2 and v4's 0.4).
     if rng.random() < 0.85:
@@ -158,7 +166,29 @@ def _augment_image(chw_float01: torch.Tensor, rng: np.random.Generator) -> torch
         el = int(rng.integers(0, w - ew + 1))
         img[:, et:et + eh, el:el + ew] = 0.0
 
-    return img
+    return img, crop
+
+
+def _adjust_pixel_target_for_crop(
+    uv_norm_with_valid: np.ndarray,  # shape (3,): [u_norm, v_norm, valid]
+    crop: tuple | None,              # (top_norm, left_norm, h_norm, w_norm)
+) -> np.ndarray:
+    """Adjust a port-pixel target after a random crop. The pixel positions
+    in the crop are remapped to [0, 1] of the cropped region; samples that
+    fall outside the crop are marked invalid (valid=0)."""
+    out = uv_norm_with_valid.copy()
+    if crop is None:
+        return out
+    top, left, h_n, w_n = crop
+    u, v, valid = float(out[0]), float(out[1]), float(out[2])
+    if valid <= 0:
+        return out
+    if u < left or u >= left + w_n or v < top or v >= top + h_n:
+        out[2] = 0.0
+        return out
+    out[0] = (u - left) / w_n
+    out[1] = (v - top) / h_n
+    return out
 
 
 def _augment_tcp(tcp: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
@@ -228,17 +258,22 @@ class TrainSampleWrapper(Dataset):
             )
 
         # Process each camera independently. Different crops per cam = more
-        # aug diversity. Resize + ImageNet-normalize last so the model sees
-        # standard 224×224 ImageNet-mean inputs regardless of crop size.
+        # aug diversity. Adjust the v8 pixel target by the crop applied to
+        # that camera so the aux supervision lines up with what the model
+        # actually sees.
+        port_pixels_in = sample["port_pixels"]   # (num_cams, 3) [u_norm, v_norm, valid]
         per_cam = []
+        adjusted_pixels = np.zeros_like(port_pixels_in)
         for j, cam in enumerate(self.cameras):
             img = _to_chw_float01(sample["images"][cam])
+            crop = None
             if self.augment:
                 rng_cam = np.random.default_rng(
                     (self._augment_seed, self.indices[i], j,
                      int(torch.empty(()).uniform_(0, 1e9).item()))
                 )
-                img = _augment_image(img, rng_cam)
+                img, crop = _augment_image(img, rng_cam)
+            adjusted_pixels[j] = _adjust_pixel_target_for_crop(port_pixels_in[j], crop)
             img = TF.resize(img, [_MODEL_INPUT_SIZE, _MODEL_INPUT_SIZE], antialias=True)
             img = TF.normalize(img, mean=list(_IMAGENET_MEAN), std=list(_IMAGENET_STD))
             per_cam.append(img)
@@ -250,7 +285,8 @@ class TrainSampleWrapper(Dataset):
 
         oh = torch.from_numpy(sample["task_one_hot"]).float()
         target = torch.from_numpy(sample["target"]).float()
-        return images, tcp, oh, target
+        port_pixels = torch.from_numpy(adjusted_pixels).float()
+        return images, tcp, oh, target, port_pixels
 
 
 def episode_split(
@@ -300,7 +336,7 @@ def evaluate(
         "board_xy_mm": [], "yaw_deg": [], "rail_t_mm": [],
     }
     with torch.no_grad():
-        for images, tcp, oh, target in loader:
+        for images, tcp, oh, target, _port_pix in loader:
             images = images.to(device, non_blocking=True)
             tcp = tcp.to(device, non_blocking=True)
             oh = oh.to(device, non_blocking=True)
@@ -455,23 +491,33 @@ def train(args: argparse.Namespace) -> int:
         t0 = time.time()
         model.train()
         train_losses = []
-        for step, (images, tcp, oh, target) in enumerate(train_loader):
+        train_aux_losses = []
+        for step, (images, tcp, oh, target, port_pix) in enumerate(train_loader):
             images = images.to(device, non_blocking=True)
             tcp = tcp.to(device, non_blocking=True)
             oh = oh.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            pred = model(images, tcp, oh)
-            loss = loss_fn(pred, target)
+            port_pix = port_pix.to(device, non_blocking=True)
+            pred, aux_pred = model(images, tcp, oh, return_aux=True)
+            pose_loss = loss_fn(pred, target)
+            if aux_pred is not None:
+                aux_loss = aux_pixel_loss(aux_pred, port_pix)
+                loss = pose_loss + AUX_PIXEL_WEIGHT * aux_loss
+                train_aux_losses.append(aux_loss.item())
+            else:
+                loss = pose_loss
             optim.zero_grad(set_to_none=True)
             loss.backward()
             optim.step()
             train_losses.append(loss.item())
         scheduler.step()
         train_loss = float(np.mean(train_losses))
+        train_aux = float(np.mean(train_aux_losses)) if train_aux_losses else 0.0
         val = evaluate(model, val_loader, device)
         elapsed = time.time() - t0
+        aux_str = f"  aux_pix={train_aux:.5f}" if train_aux_losses else ""
         msg = (
-            f"epoch {epoch + 1:>3d}/{args.epochs}  train_loss={train_loss:.5f}  "
+            f"epoch {epoch + 1:>3d}/{args.epochs}  train_loss={train_loss:.5f}{aux_str}  "
             f"val_loss={val['loss']:.5f}  "
             f"xy_mm={val['board_xy_mm_mean']:.2f}/{val['board_xy_mm_p95']:.2f}/{val['board_xy_mm_max']:.2f}  "
             f"yaw_deg={val['yaw_deg_mean']:.2f}/{val['yaw_deg_p95']:.2f}/{val['yaw_deg_max']:.2f}  "
@@ -479,7 +525,8 @@ def train(args: argparse.Namespace) -> int:
             f"({elapsed:.0f}s)"
         )
         print(msg)
-        log.append({"epoch": epoch + 1, "train_loss": train_loss, **val,
+        log.append({"epoch": epoch + 1, "train_loss": train_loss,
+                    "train_aux_pixel_loss": train_aux, **val,
                     "elapsed_s": elapsed})
 
         # Always save latest (for resume); save best (for inference) when val improves.

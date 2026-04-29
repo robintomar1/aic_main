@@ -48,7 +48,8 @@ def evaluate_with_mask(
     model.eval()
     buckets = {"board_xy_mm": [], "yaw_deg": [], "rail_t_mm": []}
     with torch.no_grad():
-        for images, tcp, oh, target in loader:
+        for batch in loader:
+            images, tcp, oh, target = batch[0], batch[1], batch[2], batch[3]
             images = images.to(device)
             tcp = tcp.to(device)
             oh = oh.to(device)
@@ -140,7 +141,8 @@ def main() -> int:
     preds_phys = []
     targets_phys = []
     with torch.no_grad():
-        for images, tcp, oh, target in val_loader:
+        for batch in val_loader:
+            images, tcp, oh, target = batch[0], batch[1], batch[2], batch[3]
             pred = model(images.to(device), tcp.to(device), oh.to(device))
             preds_phys.append(denormalize_pred(pred).cpu())
             targets_phys.append(target.cpu())

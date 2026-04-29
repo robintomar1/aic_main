@@ -75,6 +75,7 @@ class BoardPoseRegressorConfig:
     backbone_pretrained: bool = True
     head_dropout: float = 0.1
     num_cameras: int = 3  # v7: 3-cam concat for absolute-position parallax
+    aux_pixel_head: bool = True  # v8: per-cam port-pixel regression aux loss
 
 
 class FiLM(nn.Module):
@@ -171,6 +172,20 @@ class BoardPoseRegressor(nn.Module):
             nn.Linear(self.config.head_hidden_dim, self.config.output_dim),
         )
 
+        # v8: auxiliary per-camera port-pixel regression head. Sigmoid output
+        # so predictions stay in [0, 1] image-normalized space. Operates on
+        # the per-camera pooled feature (BEFORE cam_fuse), so each camera's
+        # aux output reflects only its own image.
+        if self.config.aux_pixel_head:
+            self.aux_head = nn.Sequential(
+                nn.Linear(feature_dim, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, 2),
+                nn.Sigmoid(),
+            )
+        else:
+            self.aux_head = None
+
     def _extract_features(
         self, images: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -186,7 +201,13 @@ class BoardPoseRegressor(nn.Module):
         images: torch.Tensor,       # (B, num_cams, 3, H, W) float32, ImageNet-norm
         tcp_pose: torch.Tensor,     # (B, 7) float32, base_link xyz + xyzw
         task_one_hot: torch.Tensor, # (B, 7) float32
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """If `return_aux=True` and aux head is enabled, returns (pred_5,
+        aux_pixels) where aux_pixels has shape (B, num_cams, 2) in [0,1].
+        At inference (no aux supervision), default `return_aux=False` keeps
+        the call site identical to v7.
+        """
         # Accept (B, 3, H, W) for legacy single-cam paths and reshape.
         if images.dim() == 4:
             images = images.unsqueeze(1)
@@ -198,12 +219,24 @@ class BoardPoseRegressor(nn.Module):
             )
         flat = images.view(B * num_cams, C, H, W)
         _, pooled_flat = self._extract_features(flat)         # (B*num_cams, 512)
+
+        # v8 aux: per-camera pixel regression from the per-cam pooled feature.
+        # Computed BEFORE cam_fuse so each cam's aux output sees only its
+        # own image (matches the per-cam pixel target).
+        aux_pixels = None
+        if return_aux and self.aux_head is not None:
+            aux_flat = self.aux_head(pooled_flat)              # (B*num_cams, 2)
+            aux_pixels = aux_flat.view(B, num_cams, 2)
+
         pooled = pooled_flat.view(B, num_cams * self.feature_dim)
         feat = self.cam_fuse(pooled)                           # (B, 512)
         feat = self.film_task(feat, task_one_hot)
         tcp_emb = self.tcp_proj(tcp_pose)
         feat = self.film_tcp(feat, tcp_emb)
-        return self.head(feat)
+        pred = self.head(feat)
+        if return_aux:
+            return pred, aux_pixels
+        return pred
 
 
 # Per-dim loss weights. v7: boost xy 3× since yaw/rail were close to target
@@ -212,6 +245,36 @@ class BoardPoseRegressor(nn.Module):
 # the bottleneck axis without de-rating the others below useful learning
 # signal.
 LOSS_WEIGHTS = (3.0, 3.0, 1.0, 1.0, 1.0)
+
+# v8: weight for the auxiliary per-camera port-pixel MSE loss. The aux
+# target is in [0, 1] image-normalized space, so MSE is naturally O(0.01).
+# AUX_WEIGHT scales it to be a non-trivial fraction of the pose loss
+# (which is O(1) in z-space) — large enough to force the spatial features
+# to encode "where is the port" info, small enough not to dominate the
+# pose head's gradient.
+AUX_PIXEL_WEIGHT = 5.0
+
+
+def aux_pixel_loss(
+    pred_pixels: torch.Tensor,    # (B, num_cams, 2)  in [0, 1]
+    target_pixels: torch.Tensor,  # (B, num_cams, 3)  [u_norm, v_norm, valid]
+) -> torch.Tensor:
+    """Masked MSE on per-camera port pixel positions.
+
+    Frames where the projected port is out-of-frame or behind the camera
+    have valid=0 and contribute zero to the loss (and to the denominator
+    for normalization). Returns the per-valid-sample mean. If no sample is
+    valid in the batch, returns 0 (so the optimizer step is a no-op rather
+    than a NaN).
+    """
+    target_uv = target_pixels[..., :2]    # (B, num_cams, 2)
+    valid = target_pixels[..., 2:3]       # (B, num_cams, 1)
+    sq = (pred_pixels - target_uv) ** 2   # (B, num_cams, 2)
+    masked = sq * valid                    # zero where invalid
+    n_valid = valid.sum() * 2              # 2 channels per valid sample
+    if n_valid.item() == 0:
+        return torch.zeros((), device=pred_pixels.device, dtype=pred_pixels.dtype)
+    return masked.sum() / n_valid
 
 
 def loss_fn(
