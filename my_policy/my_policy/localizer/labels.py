@@ -370,59 +370,51 @@ def match_episodes_to_trials(
 ) -> dict[int, str]:
     """Map saved-episode-index → trial_N key.
 
-    `summary` is the parsed contents of the recorder's summary.json
-    (has `trials: [...]` with per-attempt outcomes). `yaml_trials` is the
-    `trials` dict from a batch-config YAML.
+    The eval engine processes trial_1, trial_2, ... in YAML key order; the
+    recorder's summary.json captures every attempt (saved or discarded) in
+    that same chronological order. So summary entry at position i ALWAYS
+    corresponds to yaml trial_(i+1), regardless of outcome.
 
-    Only trials whose outcome is "saved_inserted" appear on disk; their
-    saved-episode-index runs 0, 1, 2, ... in the order they were recorded.
+    We walk summary in order, count discards, and assign each saved entry to
+    the yaml trial at that position. task_meta is cross-checked against the
+    yaml's task to catch any mid-run summary corruption (e.g. recorder
+    restart that overwrites summary.json while the dataset keeps appending).
 
-    Join key is (target_module_name, cable_name) which uniquely identifies a
-    trial within a typical batch (gen_trial_config.py never emits two trials
-    with both keys identical, since cable_name picks per port_type and
-    target_module_name picks the rail). Falls back to ordinal-among-equals if
-    the key isn't unique.
+    The previous bucket-and-ordinal-fallback implementation was incorrect:
+    its key (target_module_name, cable_name) didn't include port_name, so
+    SFP trials with the same target module but different sfp_port_0/_1 got
+    mixed up. The simpler positional match avoids that class of bug entirely
+    AND validates task_meta as a sanity check.
     """
-    # Build (target_module_name, cable_name) → list[trial_key] index over yaml.
-    yaml_index: dict[tuple[str, str], list[str]] = {}
-    for tkey, trial in yaml_trials.items():
-        task = trial["tasks"]["task_1"]
-        k = (task["target_module_name"], task["cable_name"])
-        yaml_index.setdefault(k, []).append(tkey)
-    # Sort each bucket by ordinal so the fallback is deterministic.
-    for k in yaml_index:
-        yaml_index[k].sort(key=lambda t: int(t.rsplit("_", 1)[-1]))
-
-    # yaml_consumed[k] = how many of the bucket's trial keys have already been
-    # claimed; used by the duplicate-key fallback.
-    yaml_consumed: dict[tuple[str, str], int] = {k: 0 for k in yaml_index}
-
     out: dict[int, str] = {}
     saved_idx = 0
-    for entry in summary.get("trials", []):
+    for i, entry in enumerate(summary.get("trials", [])):
+        yaml_key = f"trial_{i + 1}"
+        if yaml_key not in yaml_trials:
+            raise ValueError(
+                f"summary has entry at position {i} but yaml has no {yaml_key!r}; "
+                f"summary and yaml are out of sync (mid-run crash + restart "
+                f"with overwritten summary.json is a known cause)"
+            )
         outcome = entry.get("outcome", "")
         if outcome != "saved_inserted":
             continue
+
+        # Verify task_meta agrees with the positionally-matched yaml trial.
+        # Catches the corruption case where summary.json was overwritten while
+        # the dataset kept appending across runs.
         meta_str = entry.get("task_meta", "")
-        if not meta_str:
-            raise ValueError(
-                f"summary trial idx={entry.get('idx', '?')} missing task_meta"
-            )
-        meta = json.loads(meta_str)
-        k = (meta["target_module_name"], meta["cable_name"])
-        bucket = yaml_index.get(k)
-        if not bucket:
-            raise ValueError(
-                f"summary trial idx={entry.get('idx', '?')} has key {k!r} "
-                f"with no matching trial in yaml"
-            )
-        n_consumed = yaml_consumed[k]
-        if n_consumed >= len(bucket):
-            raise ValueError(
-                f"summary has more saved episodes for key {k!r} than yaml has "
-                f"trials ({len(bucket)})"
-            )
-        out[saved_idx] = bucket[n_consumed]
-        yaml_consumed[k] = n_consumed + 1
+        if meta_str:
+            meta = json.loads(meta_str)
+            yaml_task = yaml_trials[yaml_key]["tasks"]["task_1"]
+            for field in ("target_module_name", "port_name", "cable_name"):
+                if meta.get(field) != yaml_task.get(field):
+                    raise ValueError(
+                        f"task_meta mismatch at summary position {i} -> {yaml_key}: "
+                        f"summary {field}={meta.get(field)!r} vs yaml "
+                        f"{field}={yaml_task.get(field)!r}. Dataset/summary "
+                        f"out of sync."
+                    )
+        out[saved_idx] = yaml_key
         saved_idx += 1
     return out

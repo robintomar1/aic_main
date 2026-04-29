@@ -342,25 +342,54 @@ def test_match_episodes_to_trials_with_discard():
     assert out == {0: "trial_1", 1: "trial_3"}, f"got {out}"
 
 
-def test_match_episodes_disambiguates_duplicate_module():
-    """Two trials with the same target_module_name but different cable_name
-    must each match correctly."""
-    # Both target nic_card_mount_2; one with cable_0 (sfp) one with cable_2 (also sfp,
-    # different cable instance).
-    t1 = _make_sfp_trial(nic_index=2)
-    t2 = _make_sfp_trial(nic_index=2)
-    t2["tasks"]["task_1"]["cable_name"] = "cable_2"
-    yaml_trials = {"trial_1": t1, "trial_2": t2}
+def test_match_episodes_disambiguates_within_module_port_variants():
+    """SFP trials targeting the same module but different sfp_port_0/_1 must
+    each map to the correct yaml trial. With the new position-based match,
+    yaml ordering IS the recorder ordering, so summary[i] -> trial_(i+1).
+
+    The bug fixed in 2026-04-29: previously the join key used only
+    (target_module_name, cable_name), missing port_name. With multiple SFP
+    trials on the same module differing only in port_0/_1, the
+    bucket-and-ordinal fallback assigned the wrong port_name in some cases,
+    producing ~20-200mm label errors on real datasets.
+    """
+    # All target nic_card_mount_2, all cable_0; differ only in port_0/_1.
+    t1 = _make_sfp_trial(nic_index=2); t1["tasks"]["task_1"]["port_name"] = "sfp_port_1"
+    t2 = _make_sfp_trial(nic_index=2); t2["tasks"]["task_1"]["port_name"] = "sfp_port_0"
+    t3 = _make_sfp_trial(nic_index=2); t3["tasks"]["task_1"]["port_name"] = "sfp_port_1"
+    yaml_trials = {"trial_1": t1, "trial_2": t2, "trial_3": t3}
     summary = {
         "trials": [
             {"idx": 0, "outcome": "saved_inserted",
-             "task_meta": '{"cable_name": "cable_2", "target_module_name": "nic_card_mount_2", "port_name": "sfp_port_0", "port_type": "sfp", "plug_type": "sfp"}'},
+             "task_meta": '{"cable_name": "cable_0", "target_module_name": "nic_card_mount_2", "port_name": "sfp_port_1", "port_type": "sfp", "plug_type": "sfp"}'},
             {"idx": 1, "outcome": "saved_inserted",
              "task_meta": '{"cable_name": "cable_0", "target_module_name": "nic_card_mount_2", "port_name": "sfp_port_0", "port_type": "sfp", "plug_type": "sfp"}'},
+            {"idx": 2, "outcome": "saved_inserted",
+             "task_meta": '{"cable_name": "cable_0", "target_module_name": "nic_card_mount_2", "port_name": "sfp_port_1", "port_type": "sfp", "plug_type": "sfp"}'},
         ],
     }
     out = match_episodes_to_trials(summary, yaml_trials)
-    assert out == {0: "trial_2", 1: "trial_1"}, f"got {out}"
+    assert out == {0: "trial_1", 1: "trial_2", 2: "trial_3"}, f"got {out}"
+
+
+def test_match_episodes_raises_on_task_meta_mismatch():
+    """If summary's task_meta disagrees with the positionally-matched yaml
+    trial, raise — that signals data corruption (e.g. mid-run recorder
+    restart that overwrote summary.json)."""
+    yaml_trials = {"trial_1": _make_sfp_trial(nic_index=0)}
+    summary = {
+        "trials": [
+            # task_meta says mount_2 but yaml trial_1 is mount_0.
+            {"idx": 0, "outcome": "saved_inserted",
+             "task_meta": '{"cable_name": "cable_0", "target_module_name": "nic_card_mount_2", "port_name": "sfp_port_0", "port_type": "sfp", "plug_type": "sfp"}'},
+        ],
+    }
+    try:
+        match_episodes_to_trials(summary, yaml_trials)
+    except ValueError as ex:
+        assert "task_meta mismatch" in str(ex), f"unexpected message: {ex}"
+        return
+    raise AssertionError("expected ValueError on task_meta mismatch")
 
 
 # ============================================================================
@@ -380,7 +409,8 @@ if __name__ == "__main__":
         test_yaw_wrap_to_pi,
         test_label_as_target_5_sincos_identity,
         test_match_episodes_to_trials_with_discard,
-        test_match_episodes_disambiguates_duplicate_module,
+        test_match_episodes_disambiguates_within_module_port_variants,
+        test_match_episodes_raises_on_task_meta_mismatch,
     ]
     failures = 0
     for t in tests:
