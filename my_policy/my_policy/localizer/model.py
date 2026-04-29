@@ -73,7 +73,7 @@ class BoardPoseRegressorConfig:
     head_hidden_dim: int = 256
     output_dim: int = 5
     backbone_pretrained: bool = True
-    head_dropout: float = 0.3
+    head_dropout: float = 0.1
 
 
 class FiLM(nn.Module):

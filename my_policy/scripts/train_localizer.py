@@ -504,7 +504,7 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr-backbone", type=float, default=1e-4)
     p.add_argument("--lr-head", type=float, default=1e-3)
-    p.add_argument("--weight-decay", type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=3e-4)
     p.add_argument("--frame-stride", type=int, default=10,
                    help="Sample every Nth frame within each episode (1 = all frames).")
     p.add_argument("--val-fraction", type=float, default=0.2,
