@@ -354,15 +354,19 @@ def train(args: argparse.Namespace) -> int:
         augment_seed=args.split_seed,
     )
     val_ds = TrainSampleWrapper(base, val_idx, camera=args.camera, augment=False)
+    _loader_kw = dict(
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
-        drop_last=False, persistent_workers=(args.num_workers > 0),
+        drop_last=False, **_loader_kw,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
-        drop_last=False, persistent_workers=(args.num_workers > 0),
+        drop_last=False, **_loader_kw,
     )
 
     # --- Model
