@@ -38,6 +38,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+
+# Avoid /dev/shm exhaustion when running in the dev container (default shm=64M
+# is far too small for multi-worker DataLoaders carrying batched images). The
+# 'file_system' strategy uses tmpfile fds instead of POSIX shared memory.
+torch.multiprocessing.set_sharing_strategy("file_system")
 from torchvision.models import ResNet18_Weights
 from torchvision.transforms import functional as TF
 
