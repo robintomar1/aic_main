@@ -33,18 +33,33 @@ from my_policy.localizer.model import (  # noqa: E402
 )
 
 
-def test_forward_shape():
-    """Forward pass returns (B, 5)."""
-    model = BoardPoseRegressor(BoardPoseRegressorConfig(backbone_pretrained=False))
+def test_forward_shape_multicam():
+    """Forward pass with (B, num_cams, 3, H, W) returns (B, 5)."""
+    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3)
+    model = BoardPoseRegressor(cfg)
     model.eval()
     B = 4
-    image = torch.randn(B, 3, 224, 224)
+    images = torch.randn(B, 3, 3, 224, 224)
     tcp = torch.randn(B, 7)
     oh = torch.zeros(B, 7)
     oh[torch.arange(B), torch.tensor([0, 2, 5, 6])] = 1.0
     with torch.no_grad():
-        out = model(image, tcp, oh)
+        out = model(images, tcp, oh)
     assert out.shape == (B, 5), f"expected (4, 5), got {out.shape}"
+
+
+def test_forward_shape_singlecam_backcompat():
+    """Single-cam config still works for legacy paths."""
+    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=1)
+    model = BoardPoseRegressor(cfg)
+    model.eval()
+    B = 2
+    images = torch.randn(B, 1, 3, 224, 224)  # explicit num_cams=1
+    tcp = torch.randn(B, 7)
+    oh = torch.zeros(B, 7); oh[:, 0] = 1.0
+    with torch.no_grad():
+        out = model(images, tcp, oh)
+    assert out.shape == (B, 5)
 
 
 def test_film_identity_at_zero_conditioning():
@@ -144,7 +159,8 @@ def test_pretrained_backbone_loads():
 
 if __name__ == "__main__":
     tests = [
-        test_forward_shape,
+        test_forward_shape_multicam,
+        test_forward_shape_singlecam_backcompat,
         test_film_identity_at_zero_conditioning,
         test_loss_fn_zero_at_match,
         test_loss_fn_normalization_equalizes_axes,

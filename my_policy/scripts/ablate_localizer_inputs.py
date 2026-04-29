@@ -48,18 +48,18 @@ def evaluate_with_mask(
     model.eval()
     buckets = {"board_xy_mm": [], "yaw_deg": [], "rail_t_mm": []}
     with torch.no_grad():
-        for image, tcp, oh, target in loader:
-            image = image.to(device)
+        for images, tcp, oh, target in loader:
+            images = images.to(device)
             tcp = tcp.to(device)
             oh = oh.to(device)
             target = target.to(device)
             if zero_image:
-                image = torch.zeros_like(image)
+                images = torch.zeros_like(images)
             if zero_tcp:
                 tcp = torch.zeros_like(tcp)
             if zero_task:
                 oh = torch.zeros_like(oh)
-            pred = model(image, tcp, oh)
+            pred = model(images, tcp, oh)
             errs = reconstruct_metric_errors(pred, target)
             for k, v in errs.items():
                 buckets[k].append(v.detach().cpu())
@@ -76,7 +76,8 @@ def main() -> int:
     p.add_argument("--collection-dir", type=Path, required=True)
     p.add_argument("--batches", nargs="+", required=True)
     p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--camera", type=str, default="center_camera")
+    p.add_argument("--cameras", type=str, nargs="+",
+                   default=["left_camera", "center_camera", "right_camera"])
     p.add_argument("--frame-stride", type=int, default=5)
     p.add_argument("--val-fraction", type=float, default=0.2)
     p.add_argument("--split-seed", type=int, default=42)
@@ -89,8 +90,9 @@ def main() -> int:
     device = torch.device(args.device)
     print(f"device: {device}; checkpoint: {args.checkpoint}")
 
+    cameras = tuple(args.cameras)
     base = MultiBatchLocalizerDataset.from_collection_dir(
-        args.collection_dir, args.batches, cameras=(args.camera,),
+        args.collection_dir, args.batches, cameras=cameras,
     )
     print(f"  episodes: {base.num_episodes}; frames: {len(base)}")
 
@@ -105,8 +107,8 @@ def main() -> int:
     train_eval_n = min(len(val_idx), len(train_idx))
     rng_np = np.random.default_rng(args.split_seed)
     train_eval_idx = list(rng_np.choice(train_idx, size=train_eval_n, replace=False))
-    train_eval_ds = TrainSampleWrapper(base, train_eval_idx, camera=args.camera, augment=False)
-    val_ds = TrainSampleWrapper(base, val_idx, camera=args.camera, augment=False)
+    train_eval_ds = TrainSampleWrapper(base, train_eval_idx, cameras=cameras, augment=False)
+    val_ds = TrainSampleWrapper(base, val_idx, cameras=cameras, augment=False)
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
@@ -118,7 +120,7 @@ def main() -> int:
     loader = val_loader  # alias for the existing ablation block below
     print(f"  train_eval frames: {len(train_eval_idx)}; val frames: {len(val_idx)}")
 
-    config = BoardPoseRegressorConfig(backbone_pretrained=False)
+    config = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=len(cameras))
     model = BoardPoseRegressor(config).to(device)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -138,8 +140,8 @@ def main() -> int:
     preds_phys = []
     targets_phys = []
     with torch.no_grad():
-        for image, tcp, oh, target in val_loader:
-            pred = model(image.to(device), tcp.to(device), oh.to(device))
+        for images, tcp, oh, target in val_loader:
+            pred = model(images.to(device), tcp.to(device), oh.to(device))
             preds_phys.append(denormalize_pred(pred).cpu())
             targets_phys.append(target.cpu())
     P = torch.cat(preds_phys).numpy()

@@ -144,14 +144,27 @@ class PortLocalizer:
     @torch.no_grad()
     def predict_port_pose(
         self,
-        image: np.ndarray | torch.Tensor,
+        images: list | np.ndarray | torch.Tensor,
         tcp_pose: np.ndarray | torch.Tensor,
         target_module_name: str,
         port_name: str,
         port_type: str,
     ) -> PortPose:
-        """Run one forward pass + URDF composition. Returns 7-DoF port pose."""
-        img = _preprocess_image(image).unsqueeze(0).to(self.device)
+        """Run one forward pass + URDF composition. Returns 7-DoF port pose.
+
+        `images`: list of per-camera images in the same order the model was
+        trained with (see ckpt['cameras']). For backward compat a single
+        ndarray/Tensor is accepted when the model is single-cam.
+        """
+        if isinstance(images, (np.ndarray, torch.Tensor)) and not isinstance(images, list):
+            images = [images]
+        if len(images) != self.model.config.num_cameras:
+            raise ValueError(
+                f"got {len(images)} images but model expects "
+                f"{self.model.config.num_cameras} cameras"
+            )
+        per_cam = [_preprocess_image(im) for im in images]
+        img_tensor = torch.stack(per_cam, dim=0).unsqueeze(0).to(self.device)  # (1, num_cams, 3, H, W)
         if isinstance(tcp_pose, np.ndarray):
             tcp = torch.from_numpy(tcp_pose).float()
         else:
@@ -159,7 +172,7 @@ class PortLocalizer:
         tcp = tcp.unsqueeze(0).to(self.device)
         oh = torch.from_numpy(task_one_hot(target_module_name)).float().unsqueeze(0).to(self.device)
 
-        pred_n = self.model(img, tcp, oh)               # z-scored model output
+        pred_n = self.model(img_tensor, tcp, oh)         # z-scored model output
         pred = denormalize_pred(pred_n).squeeze(0).cpu().numpy()
         bx, by, sin_yaw, cos_yaw, rail_t = pred.tolist()
         yaw = float(np.arctan2(sin_yaw, cos_yaw))

@@ -187,29 +187,25 @@ def _augment_tcp(tcp: torch.Tensor, rng: np.random.Generator) -> torch.Tensor:
 
 
 class TrainSampleWrapper(Dataset):
-    """Wraps a LocalizerDataset for PyTorch training.
+    """Wraps a LocalizerDataset for PyTorch training. v7: multi-cam.
 
-    Returns torch tensors only (DataLoader auto-batches), drops _meta to keep
-    the collation simple. Applies image preprocessing here so the underlying
-    dataset stays raw and other tools can consume it as-is.
-
-    `augment=True` enables D3 photometric + JPEG augmentations on the image
-    and (if `tcp_noise=True`) small TCP pose perturbations. Should be off for
-    val so the metrics measure real generalization, not noise robustness.
+    Returns `(images, tcp, task_one_hot, target)` where `images` is a
+    stacked tensor of shape `(num_cameras, 3, H, W)` ordered by `cameras`.
+    Per-camera augmentation is applied independently — different crops/
+    photometrics per cam — which gives more diverse training samples than
+    sharing transforms across views, and at test time all 3 views are
+    seen unaugmented anyway.
     """
 
     def __init__(self, base, indices: list[int],
-                 camera: str = "center_camera",
+                 cameras: tuple[str, ...] = ("left_camera", "center_camera", "right_camera"),
                  *, augment: bool = False, tcp_noise: bool = False,
                  augment_seed: int = 0):
         self.base = base
         self.indices = list(indices)
-        self.camera = camera
+        self.cameras = tuple(cameras)
         self.augment = augment
         self.tcp_noise = tcp_noise
-        # Per-worker RNG seeded by (augment_seed, index) inside __getitem__ so
-        # that DataLoader workers don't share state and reseeding across
-        # epochs keeps the augmentation distribution non-degenerate.
         self._augment_seed = augment_seed
 
     def __len__(self) -> int:
@@ -217,26 +213,44 @@ class TrainSampleWrapper(Dataset):
 
     def __getitem__(self, i: int):
         sample = self.base[self.indices[i]]
-        if self.camera not in sample["images"]:
-            raise KeyError(
-                f"camera {self.camera!r} not in images dict; got "
-                f"{list(sample['images'].keys())}"
-            )
-        image = _to_chw_float01(sample["images"][self.camera])
-        tcp = torch.from_numpy(sample["tcp_pose"]).float()
+        for cam in self.cameras:
+            if cam not in sample["images"]:
+                raise KeyError(
+                    f"camera {cam!r} not in images dict; got "
+                    f"{list(sample['images'].keys())}"
+                )
+
+        rng_for_tcp = None
         if self.augment:
-            rng = np.random.default_rng(
-                (self._augment_seed, self.indices[i], int(torch.empty(()).uniform_(0, 1e9).item()))
+            rng_for_tcp = np.random.default_rng(
+                (self._augment_seed, self.indices[i],
+                 int(torch.empty(()).uniform_(0, 1e9).item()))
             )
-            image = _augment_image(image, rng)
-            if self.tcp_noise:
-                tcp = _augment_tcp(tcp, rng)
-        # Resize + ImageNet normalize after augmentation.
-        image = TF.resize(image, [_MODEL_INPUT_SIZE, _MODEL_INPUT_SIZE], antialias=True)
-        image = TF.normalize(image, mean=list(_IMAGENET_MEAN), std=list(_IMAGENET_STD))
+
+        # Process each camera independently. Different crops per cam = more
+        # aug diversity. Resize + ImageNet-normalize last so the model sees
+        # standard 224×224 ImageNet-mean inputs regardless of crop size.
+        per_cam = []
+        for j, cam in enumerate(self.cameras):
+            img = _to_chw_float01(sample["images"][cam])
+            if self.augment:
+                rng_cam = np.random.default_rng(
+                    (self._augment_seed, self.indices[i], j,
+                     int(torch.empty(()).uniform_(0, 1e9).item()))
+                )
+                img = _augment_image(img, rng_cam)
+            img = TF.resize(img, [_MODEL_INPUT_SIZE, _MODEL_INPUT_SIZE], antialias=True)
+            img = TF.normalize(img, mean=list(_IMAGENET_MEAN), std=list(_IMAGENET_STD))
+            per_cam.append(img)
+        images = torch.stack(per_cam, dim=0)  # (num_cameras, 3, H, W)
+
+        tcp = torch.from_numpy(sample["tcp_pose"]).float()
+        if self.augment and self.tcp_noise:
+            tcp = _augment_tcp(tcp, rng_for_tcp)
+
         oh = torch.from_numpy(sample["task_one_hot"]).float()
         target = torch.from_numpy(sample["target"]).float()
-        return image, tcp, oh, target
+        return images, tcp, oh, target
 
 
 def episode_split(
@@ -286,12 +300,12 @@ def evaluate(
         "board_xy_mm": [], "yaw_deg": [], "rail_t_mm": [],
     }
     with torch.no_grad():
-        for image, tcp, oh, target in loader:
-            image = image.to(device, non_blocking=True)
+        for images, tcp, oh, target in loader:
+            images = images.to(device, non_blocking=True)
             tcp = tcp.to(device, non_blocking=True)
             oh = oh.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            pred = model(image, tcp, oh)
+            pred = model(images, tcp, oh)
             losses.append(loss_fn(pred, target).item())
             errs = reconstruct_metric_errors(pred, target)
             for k, v in errs.items():
@@ -308,26 +322,31 @@ def train(args: argparse.Namespace) -> int:
         print(f"  CUDA name: {torch.cuda.get_device_name(0)}")
         print(f"  VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
+    cameras = tuple(args.cameras)
+    if not cameras:
+        print("error: --cameras must list at least one camera", file=sys.stderr)
+        return 2
+
     # --- Dataset (single-batch or multi-batch)
     if args.collection_dir is not None:
         if not args.batches:
             print("error: --collection-dir requires --batches", file=sys.stderr)
             return 2
         print(f"opening multi-batch dataset at {args.collection_dir}; "
-              f"batches: {args.batches}")
+              f"batches: {args.batches}; cameras: {cameras}")
         base = MultiBatchLocalizerDataset.from_collection_dir(
             args.collection_dir, args.batches,
-            cameras=(args.camera,),
+            cameras=cameras,
         )
     else:
         if args.dataset is None or args.batch_yaml is None or args.summary is None:
             print("error: need either --collection-dir + --batches OR "
                   "--dataset + --batch-yaml + --summary", file=sys.stderr)
             return 2
-        print(f"opening dataset at {args.dataset}")
+        print(f"opening dataset at {args.dataset}; cameras: {cameras}")
         base = LocalizerDataset(
             args.dataset, args.batch_yaml, args.summary,
-            cameras=(args.camera,),
+            cameras=cameras,
             repo_id=args.repo_id,
         )
     print(f"  episodes: {base.num_episodes}; frames: {len(base)}")
@@ -345,11 +364,11 @@ def train(args: argparse.Namespace) -> int:
         return 2
 
     train_ds = TrainSampleWrapper(
-        base, train_idx, camera=args.camera,
+        base, train_idx, cameras=cameras,
         augment=args.augment, tcp_noise=args.tcp_noise,
         augment_seed=args.split_seed,
     )
-    val_ds = TrainSampleWrapper(base, val_idx, camera=args.camera, augment=False)
+    val_ds = TrainSampleWrapper(base, val_idx, cameras=cameras, augment=False)
     _loader_kw = dict(
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
@@ -366,7 +385,10 @@ def train(args: argparse.Namespace) -> int:
     )
 
     # --- Model
-    config = BoardPoseRegressorConfig(backbone_pretrained=args.pretrained)
+    config = BoardPoseRegressorConfig(
+        backbone_pretrained=args.pretrained,
+        num_cameras=len(cameras),
+    )
     model = BoardPoseRegressor(config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  model params: {n_params / 1e6:.2f} M")
@@ -425,7 +447,7 @@ def train(args: argparse.Namespace) -> int:
             "image_size": _MODEL_INPUT_SIZE,
             "imagenet_mean": list(_IMAGENET_MEAN),
             "imagenet_std": list(_IMAGENET_STD),
-            "cameras": [args.camera],
+            "cameras": list(cameras),
         }
 
     # --- Train
@@ -433,12 +455,12 @@ def train(args: argparse.Namespace) -> int:
         t0 = time.time()
         model.train()
         train_losses = []
-        for step, (image, tcp, oh, target) in enumerate(train_loader):
-            image = image.to(device, non_blocking=True)
+        for step, (images, tcp, oh, target) in enumerate(train_loader):
+            images = images.to(device, non_blocking=True)
             tcp = tcp.to(device, non_blocking=True)
             oh = oh.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            pred = model(image, tcp, oh)
+            pred = model(images, tcp, oh)
             loss = loss_fn(pred, target)
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -494,8 +516,9 @@ def main() -> int:
     p.add_argument("--output", type=Path, required=True,
                    help="Path to save the best checkpoint (.pt).")
     p.add_argument("--repo-id", type=str, default="local/localizer")
-    p.add_argument("--camera", type=str, default="center_camera",
-                   help="Which camera to use (center_camera | left_camera | right_camera).")
+    p.add_argument("--cameras", type=str, nargs="+",
+                   default=["left_camera", "center_camera", "right_camera"],
+                   help="Cameras to feed the model (multi-cam concat). Default: 3 wrist cams.")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr-backbone", type=float, default=1e-4)

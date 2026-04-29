@@ -74,6 +74,7 @@ class BoardPoseRegressorConfig:
     output_dim: int = 5
     backbone_pretrained: bool = True
     head_dropout: float = 0.1
+    num_cameras: int = 3  # v7: 3-cam concat for absolute-position parallax
 
 
 class FiLM(nn.Module):
@@ -101,7 +102,21 @@ class FiLM(nn.Module):
 
 
 class BoardPoseRegressor(nn.Module):
-    """Image + TCP pose + task one-hot → 5-dim board-pose / rail-translation."""
+    """Multi-cam images + TCP pose + task one-hot → 5-dim board-pose / rail-t.
+
+    v7: takes `num_cameras` images (default 3 for left/center/right wrist
+    cams). All cameras share the ResNet18 backbone — same physical sensor,
+    same visual statistics, 3× separate weights would just overfit. Per-cam
+    pooled features concat to (B, num_cameras*512) and project back to 512
+    via cam_fuse so FiLM dimensions stay constant.
+
+    The shared-backbone forward processes all camera images in one batched
+    pass `view(B*num_cameras, 3, H, W)` for GPU efficiency.
+
+    Spatial feature maps (pre-pool) are NOT yet used but the architecture
+    keeps them around so v8's heatmap aux loss can layer on without a
+    rewrite.
+    """
 
     def __init__(self, config: BoardPoseRegressorConfig | None = None):
         super().__init__()
@@ -111,19 +126,29 @@ class BoardPoseRegressor(nn.Module):
         backbone = resnet18(weights=weights)
         feature_dim = backbone.fc.in_features  # 512 for resnet18
         backbone.fc = nn.Identity()
-        self.backbone = backbone
+
+        # Split backbone into the trunk (gives spatial maps (B,512,7,7)) and
+        # the avgpool (gives (B,512)). Keeping them separate exposes the
+        # spatial maps for v8 heatmap aux without changing pooled-feature
+        # behavior in v7.
+        self.backbone_trunk = nn.Sequential(*list(backbone.children())[:-2])
+        self.backbone_avgpool = backbone.avgpool
         self.feature_dim = feature_dim
+
+        # Multi-cam fusion: concat per-cam pooled features and project back.
+        nc = self.config.num_cameras
+        if nc > 1:
+            self.cam_fuse = nn.Sequential(
+                nn.Linear(feature_dim * nc, feature_dim),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.cam_fuse = nn.Identity()
 
         self.film_task = FiLM(
             conditioning_dim=self.config.task_one_hot_dim,
             feature_dim=feature_dim,
         )
-
-        # Project TCP to a richer embedding before FiLM-modulating the image
-        # feature. Concat alone (previous arch) let the 512-dim image feature
-        # dominate the head by fan-in, so TCP got near-zero gradient and was
-        # ignored — confirmed empirically by ablation. FiLM gives TCP equal
-        # multiplicative say in every feature channel.
         self.tcp_proj = nn.Sequential(
             nn.Linear(self.config.tcp_pose_dim, self.config.tcp_embed_dim),
             nn.ReLU(inplace=True),
@@ -146,34 +171,66 @@ class BoardPoseRegressor(nn.Module):
             nn.Linear(self.config.head_hidden_dim, self.config.output_dim),
         )
 
+    def _extract_features(
+        self, images: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the backbone trunk + pool on (B*num_cams, 3, H, W).
+        Returns (spatial: (B*num_cams, 512, h, w), pooled: (B*num_cams, 512)).
+        """
+        spatial = self.backbone_trunk(images)
+        pooled = self.backbone_avgpool(spatial).flatten(1)
+        return spatial, pooled
+
     def forward(
         self,
-        image: torch.Tensor,        # (B, 3, H, W) float32 normalized for ImageNet
+        images: torch.Tensor,       # (B, num_cams, 3, H, W) float32, ImageNet-norm
         tcp_pose: torch.Tensor,     # (B, 7) float32, base_link xyz + xyzw
         task_one_hot: torch.Tensor, # (B, 7) float32
     ) -> torch.Tensor:
-        feat = self.backbone(image)                  # (B, 512)
-        feat = self.film_task(feat, task_one_hot)    # (B, 512)
-        tcp_emb = self.tcp_proj(tcp_pose)            # (B, tcp_embed_dim)
-        feat = self.film_tcp(feat, tcp_emb)          # (B, 512)
-        return self.head(feat)                        # (B, 5)
+        # Accept (B, 3, H, W) for legacy single-cam paths and reshape.
+        if images.dim() == 4:
+            images = images.unsqueeze(1)
+        B, num_cams, C, H, W = images.shape
+        if num_cams != self.config.num_cameras:
+            raise ValueError(
+                f"got {num_cams} camera images but model configured for "
+                f"num_cameras={self.config.num_cameras}"
+            )
+        flat = images.view(B * num_cams, C, H, W)
+        _, pooled_flat = self._extract_features(flat)         # (B*num_cams, 512)
+        pooled = pooled_flat.view(B, num_cams * self.feature_dim)
+        feat = self.cam_fuse(pooled)                           # (B, 512)
+        feat = self.film_task(feat, task_one_hot)
+        tcp_emb = self.tcp_proj(tcp_pose)
+        feat = self.film_tcp(feat, tcp_emb)
+        return self.head(feat)
+
+
+# Per-dim loss weights. v7: boost xy 3× since yaw/rail were close to target
+# at v6's plateau (3.1° and 3.3mm) but xy was 8× over (24mm vs <3mm target).
+# Scaling xy components in normalized-MSE space redirects gradient toward
+# the bottleneck axis without de-rating the others below useful learning
+# signal.
+LOSS_WEIGHTS = (3.0, 3.0, 1.0, 1.0, 1.0)
 
 
 def loss_fn(
     pred: torch.Tensor, target: torch.Tensor, *, return_components: bool = False
 ) -> torch.Tensor | dict[str, torch.Tensor]:
-    """MSE between model output (z-scored) and z-scored target.
+    """Weighted MSE between model output (z-scored) and z-scored target.
 
-    `target` is in physical units; we normalize it here so callers don't have
-    to remember the convention. Per-dim contributions are equalized because
-    each dim has ~unit std after normalization.
+    `target` is in physical units; we normalize it here so callers don't
+    have to remember the convention. Per-dim weights `LOSS_WEIGHTS` shape
+    the gradient — see module-level note.
     """
     if pred.shape != target.shape:
         raise ValueError(f"shape mismatch: pred {pred.shape} vs target {target.shape}")
     target_n = normalize_target(target)
     diff = pred - target_n
     sq = diff ** 2
-    total = sq.mean()
+    w = torch.tensor(LOSS_WEIGHTS, dtype=sq.dtype, device=sq.device)
+    weighted = sq * w
+    total = weighted.mean()
     if not return_components:
         return total
     return {
