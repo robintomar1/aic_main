@@ -34,8 +34,12 @@ from my_policy.localizer.model import (  # noqa: E402
 
 
 def test_forward_shape_multicam():
-    """Forward pass with (B, num_cams, 3, H, W) returns (B, 5)."""
-    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3)
+    """Forward pass with (B, num_cams, 3, H, W) returns (B, 5).
+    Pinned to backbone='resnet18' so the test doesn't try to fetch DINOv2
+    when this branch's default backbone is dinov2_vits14."""
+    cfg = BoardPoseRegressorConfig(
+        backbone="resnet18", backbone_pretrained=False, num_cameras=3,
+    )
     model = BoardPoseRegressor(cfg)
     model.eval()
     B = 4
@@ -49,8 +53,11 @@ def test_forward_shape_multicam():
 
 
 def test_forward_shape_singlecam_backcompat():
-    """Single-cam config still works for legacy paths."""
-    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=1)
+    """Single-cam config still works for legacy paths.
+    Pinned to backbone='resnet18' for the same reason as above."""
+    cfg = BoardPoseRegressorConfig(
+        backbone="resnet18", backbone_pretrained=False, num_cameras=1,
+    )
     model = BoardPoseRegressor(cfg)
     model.eval()
     B = 2
@@ -66,7 +73,7 @@ def test_forward_return_aux_shapes():
     """v8: return_aux=True returns (pred, aux_pixels) with aux in [0,1]."""
     # Explicit aux_pathway=False — the dataclass default is now True (v9), and
     # both modes are mutually exclusive.
-    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3,
+    cfg = BoardPoseRegressorConfig(backbone="resnet18", backbone_pretrained=False, num_cameras=3,
                                    aux_pixel_head=True, aux_pathway=False)
     model = BoardPoseRegressor(cfg)
     model.eval()
@@ -89,7 +96,7 @@ def test_forward_return_aux_shapes_v9_pathway():
     the pooled feature cam_fuse consumes), addressing the v8 bug where the two
     losses competed for the 512-d bottleneck.
     """
-    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3,
+    cfg = BoardPoseRegressorConfig(backbone="resnet18", backbone_pretrained=False, num_cameras=3,
                                    aux_pixel_head=False, aux_pathway=True)
     model = BoardPoseRegressor(cfg)
     model.eval()
@@ -118,7 +125,7 @@ def test_forward_pose_only_no_aux():
     `return_aux=True` and skips the aux-loss term when the second tuple
     element is None. Don't add a guard that errors here.
     """
-    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3,
+    cfg = BoardPoseRegressorConfig(backbone="resnet18", backbone_pretrained=False, num_cameras=3,
                                    aux_pixel_head=False, aux_pathway=False)
     model = BoardPoseRegressor(cfg)
     assert model.aux_head is None
@@ -384,10 +391,15 @@ def test_pretrained_backbone_loads():
     """ResNet18 pretrained weights load without crashing.
 
     Skipped when offline (CI / no internet). Catches the common bug of
-    ImageNet weights mismatch with torchvision version.
+    ImageNet weights mismatch with torchvision version. Explicit `backbone=
+    "resnet18"` here so this test is decoupled from whatever the branch's
+    dataclass default happens to be (v9-dino-v7arch flips the default to
+    dinov2_vits14, and we don't want that to download 84MB at test time).
     """
     try:
-        model = BoardPoseRegressor(BoardPoseRegressorConfig(backbone_pretrained=True))
+        model = BoardPoseRegressor(BoardPoseRegressorConfig(
+            backbone="resnet18", backbone_pretrained=True,
+        ))
     except Exception as ex:
         # Network errors are non-deterministic in some envs; skip rather than fail.
         if "URL" in str(ex) or "connection" in str(ex).lower():

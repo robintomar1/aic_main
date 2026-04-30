@@ -714,43 +714,44 @@ def main() -> int:
     p.add_argument("--resume", type=Path, default=None,
                    help="Path to <output>_latest.pt to resume training from.")
     p.add_argument(
-        "--aux-mode", type=str, default="spatial",
+        "--aux-mode", type=str, default="none",
         choices=["none", "pooled", "spatial"],
         help=(
             "Auxiliary per-camera port-pixel supervision integration point.\n"
-            "  none    - no aux loss; pose-only training (matches v7).\n"
+            "  none    - no aux loss; pose-only training (this branch's\n"
+            "            default — matches v7's recipe).\n"
             "  pooled  - aux head reads the shared pooled feature (v8).\n"
             "  spatial - aux head reads spatial features via its own conv\n"
-            "            pathway (v9-pathway, default). Avoids the v8 bug\n"
-            "            where the pooled feature got pulled in two\n"
-            "            directions by aux + cam_fuse."
+            "            pathway (v9-pathway). Code path stays available for\n"
+            "            cross-run comparison."
         ),
     )
     p.add_argument(
-        "--backbone", type=str, default="resnet18",
+        "--backbone", type=str, default="dinov2_vits14",
         choices=["resnet18", "dinov2_vits14"],
         help=(
-            "Visual backbone. resnet18 (default) matches v6/v7/v8/v9-pathway\n"
-            "training. dinov2_vits14 swaps in DINOv2 ViT-S/14 (v9-dino):\n"
-            "stronger self-supervised priors and 16x16 patch grid (vs 7x7\n"
-            "for ResNet18). Frozen by default — see --no-freeze-backbone."
+            "Visual backbone. resnet18 matches v6/v7/v8/v9-pathway training.\n"
+            "dinov2_vits14 (this branch's default) swaps in DINOv2 ViT-S/14:\n"
+            "stronger self-supervised priors, 16x16 patch grid (vs 7x7),\n"
+            "feature dim 384 (vs 512). Fine-tuned by default on this branch\n"
+            "to match v7's training recipe — see --freeze-backbone."
         ),
     )
     p.add_argument(
-        "--freeze-backbone", action="store_true", default=True,
-        help="Freeze the backbone (default: on; only meaningful for dinov2).",
+        "--freeze-backbone", action="store_true", default=False,
+        help="Freeze the backbone (default off on this branch — v7 fine-tuned). "
+             "Pass to switch DINOv2 into linear-probe mode instead.",
     )
     p.add_argument(
         "--no-freeze-backbone", action="store_false", dest="freeze_backbone",
-        help="Fine-tune the backbone. For dinov2 this raises overfit risk on "
-             "354 episodes; only use after frozen training plateaus.",
+        help="(Default — kept as an explicit alias for clarity.)",
     )
     p.add_argument(
-        "--tcp-relative-target", action="store_true", default=True,
+        "--tcp-relative-target", action="store_true", default=False,
         help=(
             "Predict (board_xy − tcp_xy) instead of absolute board_xy in "
-            "base_link. Default on. Pure-vision regression — yaw/rail "
-            "components are unchanged (already TCP-invariant)."
+            "base_link. Default off on this branch — v7 used absolute targets, "
+            "and this branch tests the v7 recipe with DINOv2 swapped in."
         ),
     )
     p.add_argument(

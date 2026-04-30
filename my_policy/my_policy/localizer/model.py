@@ -97,36 +97,25 @@ class BoardPoseRegressorConfig:
     backbone_pretrained: bool = True
     head_dropout: float = 0.1
     num_cameras: int = 3  # v7: 3-cam concat for absolute-position parallax
-    # Visual backbone choice. "resnet18" matches v6/v7/v8/v9-pathway training.
-    # "dinov2_vits14" (v9-dino) swaps in DINOv2's small ViT, which has stronger
-    # self-supervised priors and preserves spatial info via patch tokens
-    # (16x16 grid for 224 input, vs ResNet18's 7x7). Different feature dim
-    # (384 vs 512) so cam_fuse / FiLM / head dimensions all key off
-    # `self.feature_dim` set in __init__ rather than a hardcoded 512.
-    backbone: str = "resnet18"
-    # When using dinov2, freeze its parameters by default. DINOv2 features are
-    # designed to be useful out of the box (the canonical recipe is "frozen
-    # features + linear probe"), and 21M params unfrozen on 354 episodes is a
-    # real overfit risk. Set to False (--no-freeze-backbone) for full fine-
-    # tuning if frozen features stagnate. Ignored when backbone="resnet18".
-    backbone_freeze: bool = True
-    # Auxiliary supervision modes — at most one may be True. Both False = pose-only
-    # (v7). Defaults below ship the v9-pathway architecture for new training while
-    # preserving the ability to load older v7/v8 checkpoints (PortLocalizer auto-
-    # detects the saved mode from state-dict key prefixes).
-    aux_pixel_head: bool = False  # v8: per-cam pixel head reading the POOLED
-                                  # backbone feature; competed with cam_fuse
-                                  # for use of that 512-d bottleneck and
-                                  # destabilized pose val (acknowledged 2026-04-30)
-    aux_pathway: bool = True       # v9: separate conv pathway from spatial
-                                   # features, so the pose-path pooled feature
-                                   # is no longer constrained to encode pixels
-    # Predict (board_x − tcp_x, board_y − tcp_y) instead of absolute board xy.
-    # Shrinks the regression range and makes the xy answer purely a function
-    # of what the camera sees (not "image + auxiliary TCP scalar"), which
-    # better matches what frozen self-supervised features can do. Yaw and
-    # rail are unchanged — they're already TCP-invariant.
-    tcp_relative_target: bool = True
+    # === v9-dino-v7arch defaults ===
+    # This branch (v9-dino-v7arch) tests the hypothesis: "v7 was our best run
+    # so far; what does v7's exact training recipe do with a DINOv2 backbone
+    # instead of ResNet18?" So we revert four flags back to their v7 values:
+    #   backbone:            resnet18       → dinov2_vits14
+    #   backbone_freeze:     True           → False  (v7 fine-tuned its backbone)
+    #   aux_pathway:         True           → False  (v7 had no aux head)
+    #   tcp_relative_target: True           → False  (v7 predicted absolute pose)
+    # All other defaults (multi-cam, FiLM, LOSS_WEIGHTS, dropout, head dims)
+    # remain unchanged from v7. Older flags are still wired so you can override
+    # via CLI for cross-run comparison.
+    backbone: str = "dinov2_vits14"
+    backbone_freeze: bool = False  # fine-tune like v7 did (with the existing
+                                   # surgical optim grouping that puts
+                                   # backbone_dinov2.* in the lr_backbone=1e-4
+                                   # group instead of lr_head=1e-3)
+    aux_pixel_head: bool = False   # v7/v8 not used here
+    aux_pathway: bool = False      # v9-pathway aux disabled — pose-only loss
+    tcp_relative_target: bool = False  # absolute base_link target like v7
 
     def __post_init__(self) -> None:
         if self.aux_pixel_head and self.aux_pathway:
