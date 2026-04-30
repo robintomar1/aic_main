@@ -146,6 +146,88 @@ def test_config_aux_modes_are_mutually_exclusive():
     raise AssertionError("expected ValueError, got none")
 
 
+def test_config_unknown_backbone_raises():
+    """Unknown backbone choice fails fast at config construction."""
+    try:
+        BoardPoseRegressorConfig(backbone="resnet50")
+    except ValueError as ex:
+        assert "unknown backbone" in str(ex) or "supported" in str(ex)
+        return
+    raise AssertionError("expected ValueError, got none")
+
+
+def test_dinov2_forward_shape():
+    """v9-dino: backbone='dinov2_vits14' produces (B, 5) pose pred + (B, NC, 2)
+    aux pixel pred, and the spatial feature map fed into the aux pathway is
+    16x16 (vs 7x7 for ResNet18). Skip cleanly if torch.hub can't reach GitHub
+    (offline CI / no internet)."""
+    cfg = BoardPoseRegressorConfig(
+        backbone="dinov2_vits14",
+        backbone_pretrained=False,  # don't download weights for the test
+        backbone_freeze=True,
+        num_cameras=3,
+        aux_pixel_head=False,
+        aux_pathway=True,
+    )
+    try:
+        model = BoardPoseRegressor(cfg)
+    except Exception as ex:
+        msg = str(ex).lower()
+        if any(s in msg for s in ("url", "connection", "network", "http")):
+            print(f"  skipping: torch.hub offline ({ex})")
+            return
+        raise
+    model.eval()
+    assert model.feature_dim == 384, f"expected 384, got {model.feature_dim}"
+    B, NC = 2, 3
+    images = torch.randn(B, NC, 3, 224, 224)
+    tcp = torch.randn(B, 7)
+    oh = torch.zeros(B, 7); oh[:, 0] = 1.0
+    with torch.no_grad():
+        pred, aux = model(images, tcp, oh, return_aux=True)
+    assert pred.shape == (B, 5)
+    assert aux.shape == (B, NC, 2)
+    assert (aux >= 0).all() and (aux <= 1).all()
+
+
+def test_dinov2_freeze_excludes_backbone_from_grad():
+    """v9-dino with freeze=True: backbone params have requires_grad=False so
+    the optimizer can skip them."""
+    cfg = BoardPoseRegressorConfig(
+        backbone="dinov2_vits14",
+        backbone_pretrained=False,
+        backbone_freeze=True,
+        num_cameras=3,
+    )
+    try:
+        model = BoardPoseRegressor(cfg)
+    except Exception as ex:
+        msg = str(ex).lower()
+        if any(s in msg for s in ("url", "connection", "network", "http")):
+            print(f"  skipping: torch.hub offline ({ex})")
+            return
+        raise
+    n_trainable_backbone = sum(
+        p.numel() for n, p in model.named_parameters()
+        if n.startswith("backbone_dinov2.") and p.requires_grad
+    )
+    n_total_backbone = sum(
+        p.numel() for n, p in model.named_parameters()
+        if n.startswith("backbone_dinov2.")
+    )
+    assert n_trainable_backbone == 0, (
+        f"freeze=True but {n_trainable_backbone} backbone params still trainable"
+    )
+    assert n_total_backbone > 1_000_000, (
+        f"DINOv2 should have millions of params; got {n_total_backbone}"
+    )
+    # Toggle train mode → backbone should still be in eval (override path).
+    model.train()
+    assert not model.backbone_dinov2.training, (
+        "frozen backbone should stay in eval() even after model.train()"
+    )
+
+
 def test_aux_pixel_loss_masks_invalid():
     """v8: aux loss ignores frames marked invalid (valid=0)."""
     from my_policy.localizer.model import aux_pixel_loss
@@ -255,7 +337,10 @@ def test_pretrained_backbone_loads():
         raise
     n = sum(p.numel() for p in model.parameters())
     # ResNet18 base ~11M params + heads + film ≈ slightly more.
-    assert 10e6 < n < 13e6, f"unexpected param count {n}"
+    # Bound is generous: ResNet18 trunk (~11.7M) + heads/film/cam_fuse (~1M)
+    # plus optional aux_conv (~50K) lands ~12.8M. Upper bound 14M leaves
+    # headroom for small future tweaks without flagging as a regression.
+    assert 10e6 < n < 14e6, f"unexpected param count {n}"
 
 
 if __name__ == "__main__":
@@ -266,6 +351,9 @@ if __name__ == "__main__":
         test_forward_return_aux_shapes_v9_pathway,
         test_forward_pose_only_no_aux,
         test_config_aux_modes_are_mutually_exclusive,
+        test_config_unknown_backbone_raises,
+        test_dinov2_forward_shape,
+        test_dinov2_freeze_excludes_backbone_from_grad,
         test_aux_pixel_loss_masks_invalid,
         test_film_identity_at_zero_conditioning,
         test_loss_fn_zero_at_match,

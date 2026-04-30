@@ -149,21 +149,28 @@ class PortLocalizer:
         # checkpoint, no need to download from torchvision (and no internet
         # at submission anyway).
         config.backbone_pretrained = False
-        # Auto-detect aux head presence from the saved state_dict — older
-        # checkpoints (v7 pre-aux, v8 pooled-aux) were saved before the
-        # aux_pathway field existed, so their saved config either doesn't
-        # carry the right defaults or carries values incompatible with the
-        # current dataclass defaults. Trust the weights over the saved config.
-        # Anchor checks at startswith() so v8's "aux_head.*" doesn't match
-        # any v9 prefix and vice versa.
+        # Auto-detect arch flags from the saved state_dict — older checkpoints
+        # (v7 pre-aux, v8 pooled-aux) were saved before later config fields
+        # existed, so their saved config either lacks the right defaults or
+        # carries values incompatible with the current dataclass defaults.
+        # Trust the weights over the saved config. Anchor checks at
+        # startswith() so prefixes don't accidentally collide.
         sd = ckpt["model_state_dict"]
         has_aux_head = any(k.startswith("aux_head.") for k in sd)
         has_aux_pathway = (
             any(k.startswith("aux_conv.") for k in sd)
             or any(k.startswith("aux_pathway_head.") for k in sd)
         )
+        has_dinov2 = any(k.startswith("backbone_dinov2.") for k in sd)
         config.aux_pixel_head = has_aux_head
         config.aux_pathway = has_aux_pathway
+        config.backbone = "dinov2_vits14" if has_dinov2 else "resnet18"
+        # We're loading weights from disk; don't redownload DINOv2 from hub.
+        config.backbone_pretrained = False
+        # Inference mode: freezing is irrelevant (no grads), but set False so
+        # the .eval() call below doesn't get overridden by backbone.eval()
+        # logic in __init__.
+        config.backbone_freeze = False
         self.model = BoardPoseRegressor(config).to(self.device)
         self.model.load_state_dict(sd)
         self.model.eval()

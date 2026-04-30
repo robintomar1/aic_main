@@ -75,6 +75,19 @@ class BoardPoseRegressorConfig:
     backbone_pretrained: bool = True
     head_dropout: float = 0.1
     num_cameras: int = 3  # v7: 3-cam concat for absolute-position parallax
+    # Visual backbone choice. "resnet18" matches v6/v7/v8/v9-pathway training.
+    # "dinov2_vits14" (v9-dino) swaps in DINOv2's small ViT, which has stronger
+    # self-supervised priors and preserves spatial info via patch tokens
+    # (16x16 grid for 224 input, vs ResNet18's 7x7). Different feature dim
+    # (384 vs 512) so cam_fuse / FiLM / head dimensions all key off
+    # `self.feature_dim` set in __init__ rather than a hardcoded 512.
+    backbone: str = "resnet18"
+    # When using dinov2, freeze its parameters by default. DINOv2 features are
+    # designed to be useful out of the box (the canonical recipe is "frozen
+    # features + linear probe"), and 21M params unfrozen on 354 episodes is a
+    # real overfit risk. Set to False (--no-freeze-backbone) for full fine-
+    # tuning if frozen features stagnate. Ignored when backbone="resnet18".
+    backbone_freeze: bool = True
     # Auxiliary supervision modes — at most one may be True. Both False = pose-only
     # (v7). Defaults below ship the v9-pathway architecture for new training while
     # preserving the ability to load older v7/v8 checkpoints (PortLocalizer auto-
@@ -93,6 +106,11 @@ class BoardPoseRegressorConfig:
                 "aux_pixel_head (v8) and aux_pathway (v9) are mutually "
                 "exclusive — they're alternative integration points for the "
                 "per-camera port-pixel auxiliary supervision."
+            )
+        if self.backbone not in ("resnet18", "dinov2_vits14"):
+            raise ValueError(
+                f"unknown backbone {self.backbone!r}; "
+                f"supported: resnet18 | dinov2_vits14"
             )
 
 
@@ -141,17 +159,36 @@ class BoardPoseRegressor(nn.Module):
         super().__init__()
         self.config = config or BoardPoseRegressorConfig()
 
-        weights = ResNet18_Weights.IMAGENET1K_V1 if self.config.backbone_pretrained else None
-        backbone = resnet18(weights=weights)
-        feature_dim = backbone.fc.in_features  # 512 for resnet18
-        backbone.fc = nn.Identity()
-
-        # Split backbone into the trunk (gives spatial maps (B,512,7,7)) and
-        # the avgpool (gives (B,512)). Keeping them separate exposes the
-        # spatial maps for v8 heatmap aux without changing pooled-feature
-        # behavior in v7.
-        self.backbone_trunk = nn.Sequential(*list(backbone.children())[:-2])
-        self.backbone_avgpool = backbone.avgpool
+        if self.config.backbone == "resnet18":
+            weights = ResNet18_Weights.IMAGENET1K_V1 if self.config.backbone_pretrained else None
+            backbone = resnet18(weights=weights)
+            feature_dim = backbone.fc.in_features  # 512 for resnet18
+            backbone.fc = nn.Identity()
+            # Split into trunk (spatial (B,512,7,7)) and avgpool ((B,512)) so
+            # the v9 aux pathway can read the spatial maps directly.
+            self.backbone_trunk = nn.Sequential(*list(backbone.children())[:-2])
+            self.backbone_avgpool = backbone.avgpool
+            self.backbone_dinov2 = None
+        elif self.config.backbone == "dinov2_vits14":
+            # DINOv2 ViT-S/14: 21M params, 384-dim features. patch_size=14, so
+            # 224x224 input → 16x16 patch grid (256 tokens) + 1 CLS token. We
+            # use the CLS token as the pooled summary (its design role) and
+            # reshape patch tokens to a (B, 384, 16, 16) spatial map for the
+            # v9 aux pathway. Freezing on by default per config.backbone_freeze.
+            self.backbone_dinov2 = torch.hub.load(
+                "facebookresearch/dinov2",
+                "dinov2_vits14",
+                pretrained=self.config.backbone_pretrained,
+            )
+            feature_dim = 384  # ViT-S/14 embedding dim
+            if self.config.backbone_freeze:
+                for p in self.backbone_dinov2.parameters():
+                    p.requires_grad = False
+                self.backbone_dinov2.eval()
+            self.backbone_trunk = None
+            self.backbone_avgpool = None
+        else:
+            raise ValueError(f"unsupported backbone {self.config.backbone!r}")
         self.feature_dim = feature_dim
 
         # Multi-cam fusion: concat per-cam pooled features and project back.
@@ -236,12 +273,44 @@ class BoardPoseRegressor(nn.Module):
             self.aux_conv = None
             self.aux_pathway_head = None
 
+    def train(self, mode: bool = True) -> "BoardPoseRegressor":
+        """Override train() so a frozen backbone stays in eval() mode across
+        the per-epoch train/eval mode toggles. Without this, `model.train()`
+        in the train loop would recursively flip the backbone's submodules
+        (e.g. BatchNorm running-stats updates, dropout activation) which
+        defeats the point of freezing."""
+        super().train(mode)
+        if self.backbone_dinov2 is not None and self.config.backbone_freeze:
+            self.backbone_dinov2.eval()
+        return self
+
     def _extract_features(
         self, images: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the backbone trunk + pool on (B*num_cams, 3, H, W).
-        Returns (spatial: (B*num_cams, 512, h, w), pooled: (B*num_cams, 512)).
+        """Run the visual backbone on (B*num_cams, 3, H, W).
+        Returns (spatial, pooled), each shape:
+          spatial: (B*num_cams, feature_dim, h, w)
+          pooled : (B*num_cams, feature_dim)
+        ResNet18: spatial 7×7, pooled = avgpool over spatial.
+        DINOv2:   spatial 16×16 (patch tokens reshaped), pooled = CLS token.
         """
+        if self.backbone_dinov2 is not None:
+            # DINOv2's `forward_features` returns the LayerNorm'd tokens. The
+            # CLS token is the global summary the network was self-supervised
+            # to produce; the patch tokens preserve per-region info.
+            out = self.backbone_dinov2.forward_features(images)
+            cls = out["x_norm_clstoken"]                          # (BN, 384)
+            patches = out["x_norm_patchtokens"]                   # (BN, N, 384)
+            BN, N, D = patches.shape
+            side = int(round(N ** 0.5))
+            if side * side != N:
+                raise RuntimeError(
+                    f"DINOv2 patch token count {N} is not a perfect square; "
+                    f"input size must be divisible by patch_size (14)."
+                )
+            spatial = patches.transpose(1, 2).reshape(BN, D, side, side)
+            return spatial, cls
+        # ResNet18 path (default).
         spatial = self.backbone_trunk(images)
         pooled = self.backbone_avgpool(spatial).flatten(1)
         return spatial, pooled

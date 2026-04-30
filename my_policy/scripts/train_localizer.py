@@ -422,13 +422,14 @@ def train(args: argparse.Namespace) -> int:
 
     # --- Model
     # Resume-path safety: when continuing from a checkpoint trained with a
-    # different aux mode, the saved state_dict won't match a freshly-built
-    # model. Detect the saved mode from the state_dict key prefixes and
-    # override the CLI flag (with a warning) so resume "just works".
-    resume_aux_mode: str | None = None
+    # different aux mode or backbone, the saved state_dict won't match a
+    # freshly-built model. Peek at the state_dict + saved config and override
+    # the CLI flags (with warnings) so resume "just works".
     if args.resume is not None and args.resume.exists():
         peek = torch.load(args.resume, map_location="cpu", weights_only=False)
         sd = peek.get("model_state_dict", {})
+        peek_cfg = peek.get("config", {})
+
         has_pooled = any(k.startswith("aux_head.") for k in sd)
         has_spatial = any(
             k.startswith("aux_conv.") or k.startswith("aux_pathway_head.")
@@ -440,36 +441,76 @@ def train(args: argparse.Namespace) -> int:
         if resume_aux_mode != args.aux_mode:
             print(
                 f"  --resume override: ckpt has aux_mode={resume_aux_mode!r} "
-                f"but --aux-mode={args.aux_mode!r}; using ckpt's mode so the "
-                f"state_dict loads cleanly"
+                f"but --aux-mode={args.aux_mode!r}; using ckpt's mode."
             )
             args.aux_mode = resume_aux_mode
+
+        has_dinov2 = any(k.startswith("backbone_dinov2.") for k in sd)
+        resume_backbone = (
+            "dinov2_vits14" if has_dinov2
+            else peek_cfg.get("backbone", "resnet18")
+        )
+        if resume_backbone != args.backbone:
+            print(
+                f"  --resume override: ckpt has backbone={resume_backbone!r} "
+                f"but --backbone={args.backbone!r}; using ckpt's backbone."
+            )
+            args.backbone = resume_backbone
         del peek  # release the peek copy before the actual load below
 
     aux_pixel_head = (args.aux_mode == "pooled")
     aux_pathway = (args.aux_mode == "spatial")
     config = BoardPoseRegressorConfig(
+        backbone=args.backbone,
         backbone_pretrained=args.pretrained,
+        backbone_freeze=args.freeze_backbone,
         num_cameras=len(cameras),
         aux_pixel_head=aux_pixel_head,
         aux_pathway=aux_pathway,
     )
     model = BoardPoseRegressor(config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  model params: {n_params / 1e6:.2f} M  aux_mode={args.aux_mode}")
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"  model params: {n_params / 1e6:.2f} M total, "
+        f"{n_trainable / 1e6:.2f} M trainable  "
+        f"backbone={args.backbone} freeze={args.freeze_backbone} "
+        f"aux_mode={args.aux_mode}"
+    )
 
     # --- Optim
     # Conservative LR for the pretrained backbone, higher LR for head/film.
+    # NOTE on prefix: ResNet18 path uses `backbone_trunk` / `backbone_avgpool`
+    # which do NOT match `backbone.` (with the dot) — historical behavior is
+    # therefore that ALL ResNet18 params got lr_head; preserve that here so
+    # we don't silently change v7-era training dynamics. DINOv2 params live
+    # under `backbone_dinov2.` and DO get lr_backbone, which matters when
+    # --no-freeze-backbone is set (DINOv2 at lr_head=1e-3 would explode).
+    # Frozen params (requires_grad=False) are excluded from the optimizer
+    # entirely.
     backbone_params, head_params = [], []
+    if args.backbone == "dinov2_vits14":
+        backbone_prefix = "backbone_dinov2."
+    else:
+        backbone_prefix = "backbone."  # legacy non-match for resnet18
     for name, p in model.named_parameters():
-        if name.startswith("backbone."):
+        if not p.requires_grad:
+            continue
+        if name.startswith(backbone_prefix):
             backbone_params.append(p)
         else:
             head_params.append(p)
-    optim = torch.optim.AdamW([
-        {"params": backbone_params, "lr": args.lr_backbone},
-        {"params": head_params, "lr": args.lr_head},
-    ], weight_decay=args.weight_decay)
+    # Build only non-empty param groups — AdamW tolerates empty groups but the
+    # state dict gets confusing, and frozen-DINO + ResNet18-with-legacy-prefix
+    # both produce empty backbone groups.
+    param_groups = []
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": args.lr_backbone})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": args.lr_head})
+    if not param_groups:
+        raise RuntimeError("no trainable parameters — did everything get frozen?")
+    optim = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optim, T_max=args.epochs
     )
@@ -630,6 +671,25 @@ def main() -> int:
             "            where the pooled feature got pulled in two\n"
             "            directions by aux + cam_fuse."
         ),
+    )
+    p.add_argument(
+        "--backbone", type=str, default="resnet18",
+        choices=["resnet18", "dinov2_vits14"],
+        help=(
+            "Visual backbone. resnet18 (default) matches v6/v7/v8/v9-pathway\n"
+            "training. dinov2_vits14 swaps in DINOv2 ViT-S/14 (v9-dino):\n"
+            "stronger self-supervised priors and 16x16 patch grid (vs 7x7\n"
+            "for ResNet18). Frozen by default — see --no-freeze-backbone."
+        ),
+    )
+    p.add_argument(
+        "--freeze-backbone", action="store_true", default=True,
+        help="Freeze the backbone (default: on; only meaningful for dinov2).",
+    )
+    p.add_argument(
+        "--no-freeze-backbone", action="store_false", dest="freeze_backbone",
+        help="Fine-tune the backbone. For dinov2 this raises overfit risk on "
+             "354 episodes; only use after frozen training plateaus.",
     )
     args = p.parse_args()
     return train(args)
