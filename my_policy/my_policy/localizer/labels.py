@@ -348,13 +348,22 @@ def calibrate_port_in_board_rotations(
     out: dict[tuple[str, str], tuple[float, float, float, float]] = {}
     for key, quats in samples.items():
         arr = np.asarray(quats)
-        # Quaternion averaging: simple mean is biased but works when the spread
-        # is tiny (sub-degree). Re-normalize to unit quaternion.
-        # For more spread, would need quaternion-aware averaging (Markley method).
-        mean = arr.mean(axis=0)
+        # Hemisphere-align before averaging. q and -q represent the SAME
+        # rotation, but a recorder/Gazebo TF stream can sample either sign
+        # frame-to-frame (e.g. for SFP at Rx(π), qw≈0 is the boundary —
+        # tiny noise flips the sign). Component-wise mean of mixed +q/-q
+        # samples cancels to zero; the std then reads ~1 even though the
+        # underlying rotation is constant. Flip every sample to the
+        # reference's hemisphere first, then a plain mean works.
+        ref = arr[0]
+        sign = np.sign(arr @ ref)
+        sign[sign == 0] = 1.0
+        arr_aligned = arr * sign[:, None]
+        mean = arr_aligned.mean(axis=0)
         mean = mean / np.linalg.norm(mean)
-        # Sanity: per-frame std should be ~1e-5 if the static rotation is real.
-        spread = float(np.std(arr, axis=0).max())
+        # Sanity: per-frame std (post-alignment) should be ~1e-5 if the
+        # static rotation is real.
+        spread = float(np.std(arr_aligned, axis=0).max())
         if spread > 1e-3:
             print(
                 f"WARNING: large spread in port_in_board quat for {key}: "
