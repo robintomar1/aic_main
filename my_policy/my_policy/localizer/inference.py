@@ -149,8 +149,16 @@ class PortLocalizer:
         # checkpoint, no need to download from torchvision (and no internet
         # at submission anyway).
         config.backbone_pretrained = False
+        # Auto-detect aux head presence from the saved state_dict — pre-v8
+        # checkpoints (e.g. v7) were trained before aux_pixel_head was added,
+        # so their saved config doesn't carry the field. The dataclass default
+        # is True (v8+), which would build a model with extra aux_head modules
+        # and fail load_state_dict with "missing keys: aux_head.*". Trust the
+        # weights over the config.
+        sd = ckpt["model_state_dict"]
+        config.aux_pixel_head = any(k.startswith("aux_head.") for k in sd)
         self.model = BoardPoseRegressor(config).to(self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.model.load_state_dict(sd)
         self.model.eval()
         # Resolve port-in-board quaternions in priority order:
         # 1. explicit dict argument (test/dev override),
