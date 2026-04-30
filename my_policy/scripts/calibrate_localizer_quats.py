@@ -44,10 +44,13 @@ def main() -> int:
                    help="Override output JSON path (default: <checkpoint>.quats.json).")
     args = p.parse_args()
 
-    batch_dir = args.collection_dir / args.batch
-    dataset_root = batch_dir / f"{args.batch}_dataset"
-    batch_yaml = batch_dir / f"{args.batch}.yaml"
-    summary_json = batch_dir / "summary.json"
+    # Recorder layout (matches MultiBatchLocalizerDataset.from_collection_dir):
+    #   <collection_dir>/<batch>/                  → dataset_root
+    #   <collection_dir>/<batch>.yaml              → batch yaml
+    #   <collection_dir>/<batch>_logs/summary.json → recorder summary
+    dataset_root = args.collection_dir / args.batch
+    batch_yaml = args.collection_dir / f"{args.batch}.yaml"
+    summary_json = args.collection_dir / f"{args.batch}_logs" / "summary.json"
 
     for path, label in [
         (dataset_root, "dataset_root"),
@@ -58,7 +61,7 @@ def main() -> int:
             print(f"error: {label} not found at {path}", file=sys.stderr)
             return 1
 
-    print(f"calibrating from {batch_dir}")
+    print(f"calibrating from collection_dir={args.collection_dir} batch={args.batch}")
     quats = calibrate_port_in_board_rotations(
         dataset_root=dataset_root,
         batch_yaml=batch_yaml,
