@@ -51,8 +51,13 @@ TARGET_STD = (0.022, 0.058, 0.340, 0.050, 0.014)
 # the relative xy is close to zero with occasional ~30cm excursions during
 # APPROACH from HOME. Yaw and rail components are unchanged — they're TCP-
 # invariant properties of the board / port.
-TARGET_MEAN_RELATIVE = (-0.05, 0.000, 0.000, 0.940, 0.025)
-TARGET_STD_RELATIVE = (0.10, 0.10, 0.340, 0.050, 0.014)
+# Empirical values measured over 2000 train samples on batches a-e
+# (2026-04-30): the relative xy is biased (mean ≈ −6.7cm, −4.6cm — robot
+# trajectories don't average to zero) and tighter than the original guess
+# (std ≈ 4cm, 8cm — most frames are during ALIGN/INSERT hovering above the
+# port, only short bursts at HOME). Re-measure if the trajectory mix changes.
+TARGET_MEAN_RELATIVE = (-0.0670, -0.0462, 0.000, 0.940, 0.025)
+TARGET_STD_RELATIVE = (0.0424, 0.0773, 0.340, 0.050, 0.014)
 
 
 def _stats_tensors(
