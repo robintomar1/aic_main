@@ -22,8 +22,14 @@ Two modes:
   - `cameras=("center_camera", ...)` — also opens LeRobotDataset for image
     decoding. Slower (video decode) and pulls in pixi-only deps.
 
-Pre-computes labels in __init__ since they're per-episode constants — avoids
-repeatedly running the YAML/summary join on every frame.
+Pre-computes ABSOLUTE labels in __init__ since the absolute board pose is
+per-episode constant — avoids repeatedly running the YAML/summary join on
+every frame. NOTE: when training with `tcp_relative_target=True`, the train
+loop subtracts per-frame `tcp_pose[:2]` from `target[:2]` AFTER fetching the
+sample, so the *effective* per-frame target the model sees is no longer
+constant within an episode (it tracks the per-frame TCP). Don't pre-compute
+the loss target from sample["target"] alone in that mode — see
+`train_localizer.py` for the canonical shift point.
 """
 
 from __future__ import annotations

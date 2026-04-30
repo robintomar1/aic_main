@@ -268,6 +268,65 @@ def test_loss_fn_zero_at_match():
     assert out.item() < 1e-9, f"expected ~0, got {out.item()}"
 
 
+def test_relative_normalize_roundtrip():
+    """normalize ∘ denormalize == identity in relative-target mode (and the
+    relative-mode stats are NOT the same as absolute-mode stats — sanity that
+    the `relative` flag actually swaps the constants used)."""
+    x = torch.randn(8, 5)
+    y = normalize_target(denormalize_pred(x, relative=True), relative=True)
+    assert torch.allclose(x, y, atol=1e-6)
+    # Cross-check: the relative-mode normalized value is different from
+    # absolute-mode for the same physical input — confirms different stats.
+    phys = torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.025]])
+    abs_n = normalize_target(phys, relative=False)
+    rel_n = normalize_target(phys, relative=True)
+    assert not torch.allclose(abs_n[:, :2], rel_n[:, :2]), (
+        "relative-mode xy normalization should differ from absolute-mode "
+        "(otherwise the `relative` flag is a no-op)"
+    )
+
+
+def test_relative_loss_zero_at_match():
+    """loss_fn(relative=True) returns ~0 when pred matches the relative-
+    normalized target. Catches any drift between normalize and the loss
+    path's internal normalization."""
+    target_relative_phys = torch.tensor(
+        [[-0.05, 0.02, 0.1, 0.99, 0.025]]
+    )  # already in (board − tcp) space
+    pred_norm = normalize_target(target_relative_phys, relative=True)
+    out = loss_fn(pred_norm, target_relative_phys, relative=True)
+    assert out.item() < 1e-9, f"expected ~0, got {out.item()}"
+
+
+def test_relative_metric_errors_are_invariant_to_shift():
+    """The metric error in mm is the same whether we compute it in absolute
+    space or in relative space (the per-frame TCP shift cancels out of a
+    pred − target subtraction). Critical: this is what lets us hand the user
+    "val xy mm" numbers that mean the same thing across training modes."""
+    # Pick a target close to the absolute-mode mean so denormalize gives a
+    # numerical result with reasonable scale.
+    target_abs = torch.tensor([[0.165, 0.0, 0.0, 1.0, 0.025]])
+    tcp_xy = torch.tensor([[0.45, -0.1]])
+    target_rel = target_abs.clone()
+    target_rel[:, :2] -= tcp_xy
+
+    # Pred has a 1mm xy offset in physical units, in BOTH modes.
+    pred_abs_phys = target_abs.clone()
+    pred_abs_phys[:, 0] += 0.001
+    pred_rel_phys = target_rel.clone()
+    pred_rel_phys[:, 0] += 0.001
+
+    pred_abs_n = normalize_target(pred_abs_phys, relative=False)
+    pred_rel_n = normalize_target(pred_rel_phys, relative=True)
+
+    err_abs = reconstruct_metric_errors(pred_abs_n, target_abs, relative=False)
+    err_rel = reconstruct_metric_errors(pred_rel_n, target_rel, relative=True)
+
+    # 1mm xy delta should land at ~1mm in either reporting mode.
+    assert abs(err_abs["board_xy_mm"].item() - 1.0) < 1e-3
+    assert abs(err_rel["board_xy_mm"].item() - 1.0) < 1e-3
+
+
 def test_loss_fn_normalization_equalizes_axes():
     """An equal-relative-error perturbation on every axis should produce
     roughly equal per-axis loss components after normalization."""
@@ -358,6 +417,9 @@ if __name__ == "__main__":
         test_film_identity_at_zero_conditioning,
         test_loss_fn_zero_at_match,
         test_loss_fn_normalization_equalizes_axes,
+        test_relative_normalize_roundtrip,
+        test_relative_loss_zero_at_match,
+        test_relative_metric_errors_are_invariant_to_shift,
         test_predicted_yaw_rad_atan2,
         test_reconstruct_metric_errors_basic,
         test_normalize_denormalize_roundtrip,

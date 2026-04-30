@@ -43,25 +43,42 @@ from torchvision.models import ResNet18_Weights, resnet18
 TARGET_MEAN = (0.165, 0.000, 0.000, 0.940, 0.025)
 TARGET_STD = (0.022, 0.058, 0.340, 0.050, 0.014)
 
+# When training with `tcp_relative_target=True`, the per-frame target xy is
+# shifted by the per-frame TCP xy so the network only has to predict where
+# the board is *relative to the camera*, not in absolute base_link. Stats
+# below are empirical estimates: in trajectories where the robot hovers
+# above the port for most of the episode (the typical insertion attempt),
+# the relative xy is close to zero with occasional ~30cm excursions during
+# APPROACH from HOME. Yaw and rail components are unchanged — they're TCP-
+# invariant properties of the board / port.
+TARGET_MEAN_RELATIVE = (-0.05, 0.000, 0.000, 0.940, 0.025)
+TARGET_STD_RELATIVE = (0.10, 0.10, 0.340, 0.050, 0.014)
 
-def _stats_tensors(device: torch.device | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    mean = torch.tensor(TARGET_MEAN, dtype=torch.float32)
-    std = torch.tensor(TARGET_STD, dtype=torch.float32)
+
+def _stats_tensors(
+    device: torch.device | None = None,
+    *,
+    relative: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mean_t = TARGET_MEAN_RELATIVE if relative else TARGET_MEAN
+    std_t = TARGET_STD_RELATIVE if relative else TARGET_STD
+    mean = torch.tensor(mean_t, dtype=torch.float32)
+    std = torch.tensor(std_t, dtype=torch.float32)
     if device is not None:
         mean = mean.to(device)
         std = std.to(device)
     return mean, std
 
 
-def normalize_target(t: torch.Tensor) -> torch.Tensor:
+def normalize_target(t: torch.Tensor, *, relative: bool = False) -> torch.Tensor:
     """Convert physical-units target (5,) or (B,5) to z-scored space."""
-    mean, std = _stats_tensors(t.device)
+    mean, std = _stats_tensors(t.device, relative=relative)
     return (t - mean) / std
 
 
-def denormalize_pred(pred: torch.Tensor) -> torch.Tensor:
+def denormalize_pred(pred: torch.Tensor, *, relative: bool = False) -> torch.Tensor:
     """Convert z-scored model output back to physical units."""
-    mean, std = _stats_tensors(pred.device)
+    mean, std = _stats_tensors(pred.device, relative=relative)
     return pred * std + mean
 
 
@@ -99,6 +116,12 @@ class BoardPoseRegressorConfig:
     aux_pathway: bool = True       # v9: separate conv pathway from spatial
                                    # features, so the pose-path pooled feature
                                    # is no longer constrained to encode pixels
+    # Predict (board_x − tcp_x, board_y − tcp_y) instead of absolute board xy.
+    # Shrinks the regression range and makes the xy answer purely a function
+    # of what the camera sees (not "image + auxiliary TCP scalar"), which
+    # better matches what frozen self-supervised features can do. Yaw and
+    # rail are unchanged — they're already TCP-invariant.
+    tcp_relative_target: bool = True
 
     def __post_init__(self) -> None:
         if self.aux_pixel_head and self.aux_pathway:
@@ -414,17 +437,23 @@ def aux_pixel_loss(
 
 
 def loss_fn(
-    pred: torch.Tensor, target: torch.Tensor, *, return_components: bool = False
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    return_components: bool = False,
+    relative: bool = False,
 ) -> torch.Tensor | dict[str, torch.Tensor]:
     """Weighted MSE between model output (z-scored) and z-scored target.
 
     `target` is in physical units; we normalize it here so callers don't
-    have to remember the convention. Per-dim weights `LOSS_WEIGHTS` shape
-    the gradient — see module-level note.
+    have to remember the convention. When `relative=True`, the target xy
+    is interpreted as already-shifted (board − tcp) and the relative-mode
+    normalization stats are used. Per-dim weights `LOSS_WEIGHTS` shape the
+    gradient — see module-level note.
     """
     if pred.shape != target.shape:
         raise ValueError(f"shape mismatch: pred {pred.shape} vs target {target.shape}")
-    target_n = normalize_target(target)
+    target_n = normalize_target(target, relative=relative)
     diff = pred - target_n
     sq = diff ** 2
     w = torch.tensor(LOSS_WEIGHTS, dtype=sq.dtype, device=sq.device)
@@ -449,15 +478,16 @@ def predicted_yaw_rad(pred_physical: torch.Tensor) -> torch.Tensor:
 
 
 def reconstruct_metric_errors(
-    pred: torch.Tensor, target: torch.Tensor
+    pred: torch.Tensor, target: torch.Tensor, *, relative: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Per-axis metric errors in physical units.
 
     `pred` is the raw model output (z-scored); `target` is in physical units.
-    Both are converted to physical units for error computation so the metrics
-    stay interpretable (mm, degrees) regardless of what the loss space is.
+    When `relative=True`, both are interpreted in tcp-relative xy space; the
+    metric error is the same in either space (subtraction cancels the shift),
+    so the user sees the same mm/degree numbers either way.
     """
-    pred_p = denormalize_pred(pred)
+    pred_p = denormalize_pred(pred, relative=relative)
     diff_xy = pred_p[..., :2] - target[..., :2]
     err_xy_mm = diff_xy.norm(dim=-1) * 1000.0
     pred_yaw = predicted_yaw_rad(pred_p)

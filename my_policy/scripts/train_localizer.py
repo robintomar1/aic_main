@@ -331,6 +331,7 @@ def evaluate(
     model: BoardPoseRegressor, loader: DataLoader, device: torch.device,
 ) -> dict[str, float]:
     model.eval()
+    relative = model.config.tcp_relative_target
     losses = []
     metric_buckets: dict[str, list[torch.Tensor]] = {
         "board_xy_mm": [], "yaw_deg": [], "rail_t_mm": [],
@@ -341,9 +342,13 @@ def evaluate(
             tcp = tcp.to(device, non_blocking=True)
             oh = oh.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            if relative:
+                # In-place subtract is safe because target is fresh per-batch.
+                target = target.clone()
+                target[:, :2] -= tcp[:, :2]
             pred = model(images, tcp, oh)
-            losses.append(loss_fn(pred, target).item())
-            errs = reconstruct_metric_errors(pred, target)
+            losses.append(loss_fn(pred, target, relative=relative).item())
+            errs = reconstruct_metric_errors(pred, target, relative=relative)
             for k, v in errs.items():
                 metric_buckets[k].append(v.detach())
     out = _aggregate_metrics(metric_buckets)
@@ -420,6 +425,35 @@ def train(args: argparse.Namespace) -> int:
         drop_last=False, **_loader_kw,
     )
 
+    # --- Empirical relative-target stats. Printed once so we can sanity-check
+    # the hardcoded TARGET_MEAN_RELATIVE / TARGET_STD_RELATIVE in model.py
+    # before training. If the printed values differ from the hardcoded ones
+    # by more than ~2×, paste them in and re-run; normalization fighting the
+    # data is a slow-convergence trap that's hard to spot mid-training.
+    if args.tcp_relative_target:
+        sample_n = min(2000, len(train_ds))
+        rel_xy = []
+        for i in range(sample_n):
+            s = train_ds[i]
+            target_i = s[3].numpy() if hasattr(s[3], "numpy") else np.asarray(s[3])
+            tcp_i = s[1].numpy() if hasattr(s[1], "numpy") else np.asarray(s[1])
+            rel_xy.append([target_i[0] - tcp_i[0], target_i[1] - tcp_i[1]])
+        rel_xy = np.asarray(rel_xy)
+        from my_policy.localizer.model import (  # noqa: WPS433
+            TARGET_MEAN_RELATIVE, TARGET_STD_RELATIVE,
+        )
+        print(
+            "  empirical (board − tcp) xy over "
+            f"{sample_n} train samples:\n"
+            f"    mean=({rel_xy[:, 0].mean():+.4f}, {rel_xy[:, 1].mean():+.4f})  "
+            f"std =({rel_xy[:, 0].std():.4f}, {rel_xy[:, 1].std():.4f})\n"
+            "  hardcoded (model.py):\n"
+            f"    mean=({TARGET_MEAN_RELATIVE[0]:+.4f}, {TARGET_MEAN_RELATIVE[1]:+.4f})  "
+            f"std =({TARGET_STD_RELATIVE[0]:.4f}, {TARGET_STD_RELATIVE[1]:.4f})\n"
+            "  → if these differ by more than ~2×, paste empirical values "
+            "into TARGET_MEAN_RELATIVE / TARGET_STD_RELATIVE and re-run."
+        )
+
     # --- Model
     # Resume-path safety: when continuing from a checkpoint trained with a
     # different aux mode or backbone, the saved state_dict won't match a
@@ -456,6 +490,20 @@ def train(args: argparse.Namespace) -> int:
                 f"but --backbone={args.backbone!r}; using ckpt's backbone."
             )
             args.backbone = resume_backbone
+
+        # tcp_relative_target has no state-dict signature (it's a target/loss
+        # change, not architectural), so we have to read it from saved config
+        # if present. Pre-tcp-relative checkpoints (v7/v8/v9-pathway/early
+        # v9-dino) lack the field — those were trained with absolute targets
+        # so the right default is False.
+        resume_relative = peek_cfg.get("tcp_relative_target", False)
+        if resume_relative != args.tcp_relative_target:
+            print(
+                f"  --resume override: ckpt has tcp_relative_target="
+                f"{resume_relative!r} but CLI is {args.tcp_relative_target!r}; "
+                f"using ckpt's value."
+            )
+            args.tcp_relative_target = resume_relative
         del peek  # release the peek copy before the actual load below
 
     aux_pixel_head = (args.aux_mode == "pooled")
@@ -467,6 +515,7 @@ def train(args: argparse.Namespace) -> int:
         num_cameras=len(cameras),
         aux_pixel_head=aux_pixel_head,
         aux_pathway=aux_pathway,
+        tcp_relative_target=args.tcp_relative_target,
     )
     model = BoardPoseRegressor(config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -475,7 +524,8 @@ def train(args: argparse.Namespace) -> int:
         f"  model params: {n_params / 1e6:.2f} M total, "
         f"{n_trainable / 1e6:.2f} M trainable  "
         f"backbone={args.backbone} freeze={args.freeze_backbone} "
-        f"aux_mode={args.aux_mode}"
+        f"aux_mode={args.aux_mode} "
+        f"tcp_relative={args.tcp_relative_target}"
     )
 
     # --- Optim
@@ -562,14 +612,18 @@ def train(args: argparse.Namespace) -> int:
         model.train()
         train_losses = []
         train_aux_losses = []
+        relative = model.config.tcp_relative_target
         for step, (images, tcp, oh, target, port_pix) in enumerate(train_loader):
             images = images.to(device, non_blocking=True)
             tcp = tcp.to(device, non_blocking=True)
             oh = oh.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             port_pix = port_pix.to(device, non_blocking=True)
+            if relative:
+                target = target.clone()
+                target[:, :2] -= tcp[:, :2]
             pred, aux_pred = model(images, tcp, oh, return_aux=True)
-            pose_loss = loss_fn(pred, target)
+            pose_loss = loss_fn(pred, target, relative=relative)
             if aux_pred is not None:
                 aux_loss = aux_pixel_loss(aux_pred, port_pix)
                 loss = pose_loss + AUX_PIXEL_WEIGHT * aux_loss
@@ -690,6 +744,19 @@ def main() -> int:
         "--no-freeze-backbone", action="store_false", dest="freeze_backbone",
         help="Fine-tune the backbone. For dinov2 this raises overfit risk on "
              "354 episodes; only use after frozen training plateaus.",
+    )
+    p.add_argument(
+        "--tcp-relative-target", action="store_true", default=True,
+        help=(
+            "Predict (board_xy − tcp_xy) instead of absolute board_xy in "
+            "base_link. Default on. Pure-vision regression — yaw/rail "
+            "components are unchanged (already TCP-invariant)."
+        ),
+    )
+    p.add_argument(
+        "--no-tcp-relative-target", action="store_false",
+        dest="tcp_relative_target",
+        help="Predict absolute board_xy in base_link (legacy v6/v7/v8 form).",
     )
     args = p.parse_args()
     return train(args)

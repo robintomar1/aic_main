@@ -46,6 +46,7 @@ def evaluate_with_mask(
     zero_task: bool = False,
 ) -> dict[str, float]:
     model.eval()
+    relative = model.config.tcp_relative_target
     buckets = {"board_xy_mm": [], "yaw_deg": [], "rail_t_mm": []}
     with torch.no_grad():
         for batch in loader:
@@ -54,6 +55,9 @@ def evaluate_with_mask(
             tcp = tcp.to(device)
             oh = oh.to(device)
             target = target.to(device)
+            if relative:
+                target = target.clone()
+                target[:, :2] -= tcp[:, :2]
             if zero_image:
                 images = torch.zeros_like(images)
             if zero_tcp:
@@ -61,7 +65,7 @@ def evaluate_with_mask(
             if zero_task:
                 oh = torch.zeros_like(oh)
             pred = model(images, tcp, oh)
-            errs = reconstruct_metric_errors(pred, target)
+            errs = reconstruct_metric_errors(pred, target, relative=relative)
             for k, v in errs.items():
                 buckets[k].append(v.detach().cpu())
     out = {}
@@ -137,15 +141,22 @@ def main() -> int:
 
     # --- Distribution check: does the model emit varied predictions or cluster
     # at the marginal mean? std(pred) close to 0 => mean-predicting.
+    # In tcp_relative mode the predicted xy is (board − tcp); we shift the
+    # target the same way so both columns of the printed table are comparable.
     model.eval()
+    relative = model.config.tcp_relative_target
     preds_phys = []
     targets_phys = []
     with torch.no_grad():
         for batch in val_loader:
             images, tcp, oh, target = batch[0], batch[1], batch[2], batch[3]
-            pred = model(images.to(device), tcp.to(device), oh.to(device))
-            preds_phys.append(denormalize_pred(pred).cpu())
-            targets_phys.append(target.cpu())
+            tcp_d = tcp.to(device)
+            pred = model(images.to(device), tcp_d, oh.to(device))
+            preds_phys.append(denormalize_pred(pred, relative=relative).cpu())
+            target_print = target.clone()
+            if relative:
+                target_print[:, :2] -= tcp[:, :2]
+            targets_phys.append(target_print)
     P = torch.cat(preds_phys).numpy()
     T = torch.cat(targets_phys).numpy()
     print("\nval prediction distribution (physical units):")

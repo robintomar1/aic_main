@@ -144,7 +144,8 @@ class PortLocalizer:
         ckpt = torch.load(
             str(checkpoint_path), map_location=self.device, weights_only=False,
         )
-        config = BoardPoseRegressorConfig(**ckpt.get("config", {}))
+        saved_cfg = ckpt.get("config", {})
+        config = BoardPoseRegressorConfig(**saved_cfg)
         # backbone_pretrained=False at inference: we'll load weights from the
         # checkpoint, no need to download from torchvision (and no internet
         # at submission anyway).
@@ -171,6 +172,11 @@ class PortLocalizer:
         # the .eval() call below doesn't get overridden by backbone.eval()
         # logic in __init__.
         config.backbone_freeze = False
+        # tcp_relative_target has no state-dict signature — read it from saved
+        # config. Pre-tcp-relative checkpoints lack the field entirely; those
+        # were trained on absolute targets, so default to False (NOT the
+        # dataclass default which is True for new training).
+        config.tcp_relative_target = bool(saved_cfg.get("tcp_relative_target", False))
         self.model = BoardPoseRegressor(config).to(self.device)
         self.model.load_state_dict(sd)
         self.model.eval()
@@ -270,8 +276,16 @@ class PortLocalizer:
         oh = torch.from_numpy(task_one_hot(target_module_name)).float().unsqueeze(0).to(self.device)
 
         pred_n = self.model(img_tensor, tcp, oh)         # z-scored model output
-        pred = denormalize_pred(pred_n).squeeze(0).cpu().numpy()
+        relative = self.model.config.tcp_relative_target
+        pred = denormalize_pred(pred_n, relative=relative).squeeze(0).cpu().numpy()
         bx, by, sin_yaw, cos_yaw, rail_t = pred.tolist()
+        # When the model was trained with tcp_relative_target=True, its xy
+        # output is (board − tcp); add tcp back to recover absolute base_link
+        # coords for downstream URDF composition.
+        if relative:
+            tcp_xy = tcp.squeeze(0)[:2].cpu().numpy()
+            bx = float(bx + tcp_xy[0])
+            by = float(by + tcp_xy[1])
         yaw = float(np.arctan2(sin_yaw, cos_yaw))
 
         label = LocalizerLabel(
