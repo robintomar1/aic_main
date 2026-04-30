@@ -17,6 +17,7 @@ budget); a single ResNet18 forward at 224×224 on L4 is ~5-10 ms.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,21 @@ def _yaw_to_quat(yaw_rad: float) -> tuple[float, float, float, float]:
     return (np.cos(half), 0.0, 0.0, np.sin(half))
 
 
+def _load_quats_json(
+    path: Path,
+) -> dict[tuple[str, str], tuple[float, float, float, float]]:
+    """Load port-in-board quats produced by calibrate_localizer_quats.py.
+
+    File format: `{"<port_type>|<port_name>": [qw, qx, qy, qz], ...}`.
+    """
+    raw = json.loads(Path(path).read_text())
+    out: dict[tuple[str, str], tuple[float, float, float, float]] = {}
+    for k, v in raw.items():
+        port_type, port_name = k.split("|", 1)
+        out[(port_type, port_name)] = (float(v[0]), float(v[1]), float(v[2]), float(v[3]))
+    return out
+
+
 @dataclass
 class PortPose:
     """7-DoF port pose in base_link. Matches the TF transform shape that
@@ -117,6 +133,7 @@ class PortLocalizer:
         *,
         device: str = "cuda",
         port_in_board_quat: dict[tuple[str, str], tuple[float, float, float, float]] | None = None,
+        quats_json_path: Path | None = None,
     ):
         self.device = torch.device(device)
         ckpt = torch.load(str(checkpoint_path), map_location=self.device)
@@ -128,10 +145,21 @@ class PortLocalizer:
         self.model = BoardPoseRegressor(config).to(self.device)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.eval()
-        self._port_in_board_quat = dict(
-            port_in_board_quat if port_in_board_quat is not None
-            else DEFAULT_PORT_IN_BOARD_QUAT
-        )
+        # Resolve port-in-board quaternions in priority order:
+        # 1. explicit dict argument (test/dev override),
+        # 2. explicit JSON path,
+        # 3. <checkpoint>.quats.json next to the checkpoint (default),
+        # 4. DEFAULT_PORT_IN_BOARD_QUAT (empty unless set externally).
+        if port_in_board_quat is not None:
+            self._port_in_board_quat = dict(port_in_board_quat)
+        else:
+            ckpt_path = Path(checkpoint_path)
+            default_json = ckpt_path.with_suffix(ckpt_path.suffix + ".quats.json")
+            json_path = quats_json_path or (default_json if default_json.exists() else None)
+            if json_path is not None and Path(json_path).exists():
+                self._port_in_board_quat = _load_quats_json(Path(json_path))
+            else:
+                self._port_in_board_quat = dict(DEFAULT_PORT_IN_BOARD_QUAT)
         # Camera ordering bound to the checkpoint. The model was trained with
         # this exact order (cam_fuse Linear weights are positional); a runtime
         # caller passing a dict is safer than a list because we look up by

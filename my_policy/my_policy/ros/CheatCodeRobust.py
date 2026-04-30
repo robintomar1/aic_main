@@ -21,6 +21,7 @@ Training-oracle only. Uses ground_truth:=true TF and is NOT submission-safe.
 import hashlib
 import math
 import os
+from pathlib import Path
 
 import numpy as np
 
@@ -197,6 +198,22 @@ class CheatCodeRobust(Policy):
     NOISE_XY_M_ENV = "CHEATCODE_NOISE_XY_M"
     NOISE_YAW_RAD_ENV = "CHEATCODE_NOISE_YAW_RAD"
 
+    # Localizer-replacement bench. When CHEATCODE_LOCALIZER_CHECKPOINT is set,
+    # the port pose is computed once at trial start by running a trained
+    # PortLocalizer on (camera images, TCP pose, task one-hot) and the per-tick
+    # TF refresh is skipped (the prediction is constant for the trial — board
+    # doesn't move during insertion). This is the submission-time path; the
+    # noise-injection knob above and this knob are mutually exclusive
+    # (localizer mode short-circuits _apply_pose_noise).
+    LOCALIZER_CKPT_ENV = "CHEATCODE_LOCALIZER_CHECKPOINT"
+    LOCALIZER_QUATS_ENV = "CHEATCODE_LOCALIZER_QUATS_JSON"
+    LOCALIZER_DEVICE_ENV = "CHEATCODE_LOCALIZER_DEVICE"
+    # When "1" and the environment also has ground_truth:=true (so TF works),
+    # the policy reads the TF port pose alongside the localizer prediction at
+    # trial start and logs Δxyz / Δyaw. Catches format-conversion bugs (image
+    # channels, TCP layout, camera dict keys) before a noisy bench run.
+    LOCALIZER_VERIFY_ENV = "CHEATCODE_LOCALIZER_VERIFY"
+
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
@@ -216,6 +233,14 @@ class CheatCodeRobust(Policy):
         # from env vars. (0,0)/0.0 is a no-op (the default).
         self._noise_xy_offset: tuple[float, float] = (0.0, 0.0)
         self._noise_yaw_offset: float = 0.0
+        # PortLocalizer instance; lazily loaded on first use when
+        # CHEATCODE_LOCALIZER_CHECKPOINT is set, kept across trials.
+        self._localizer = None
+        # Cached predicted port Transform for the current trial; reset to None
+        # at the top of each insert_cable(). Populated once after the first
+        # localizer prediction; _refresh_port_transform returns it directly so
+        # the per-tick refresh becomes a no-op in localizer mode.
+        self._localizer_port_transform: Transform | None = None
         super().__init__(parent_node)
         # Match the QoS the aic_scoring node advertises
         # (reliable, volatile, keep_last, depth 10) — same profile we use
@@ -279,7 +304,13 @@ class CheatCodeRobust(Policy):
         changes (board jitter, residual orientation drift). Falls back to
         last_good on transient TF failure so the descent loop keeps running.
         Applies bench noise (no-op when env vars unset).
+
+        In localizer mode the prediction is constant for a trial (board
+        doesn't move during insertion) so we return the cached value; no
+        TF read, no per-tick neural net forward.
         """
+        if self._localizer_port_transform is not None:
+            return self._localizer_port_transform
         try:
             stamped = self._parent_node._tf_buffer.lookup_transform(
                 "base_link", port_frame, Time())
@@ -365,7 +396,13 @@ class CheatCodeRobust(Policy):
         left-multiplied by R_z(self._noise_yaw_offset) so the port "looks"
         rotated about base_link Z. Z, roll, pitch unchanged. Does not mutate
         the input. Returns the input unchanged when both offsets are zero.
+
+        Localizer mode and noise injection are mutually exclusive — the
+        localizer IS the (real-world) noise model under bench, so we don't
+        inject synthetic offsets on top of its output.
         """
+        if self._localizer_mode():
+            return transform
         xy = self._noise_xy_offset
         yaw = self._noise_yaw_offset
         if xy == (0.0, 0.0) and yaw == 0.0:
@@ -392,6 +429,143 @@ class CheatCodeRobust(Policy):
             out.rotation.y = transform.rotation.y
             out.rotation.z = transform.rotation.z
         return out
+
+    # ------------------------------------------------------------------
+    # PortLocalizer integration (replaces TF-based port pose at submission)
+    # ------------------------------------------------------------------
+    def _localizer_mode(self) -> bool:
+        """True iff the env var asks us to replace the TF port lookup with a
+        trained PortLocalizer. When True, _apply_pose_noise is also bypassed:
+        the localizer IS the noise model under bench."""
+        return bool(os.environ.get(self.LOCALIZER_CKPT_ENV, ""))
+
+    def _ensure_localizer_loaded(self) -> None:
+        """Load PortLocalizer on first use; cache on self for subsequent trials.
+        torch + checkpoint load is heavy (~300 MB peak), so we only do it when
+        the env var is actually set."""
+        if self._localizer is not None:
+            return
+        ckpt = os.environ[self.LOCALIZER_CKPT_ENV]
+        quats = os.environ.get(self.LOCALIZER_QUATS_ENV) or None
+        device = os.environ.get(self.LOCALIZER_DEVICE_ENV, "cuda")
+        # Lazy import: keeps torch off the import path when the env var is unset.
+        from my_policy.localizer.inference import PortLocalizer  # noqa: WPS433
+        self._localizer = PortLocalizer(
+            checkpoint_path=Path(ckpt),
+            device=device,
+            quats_json_path=Path(quats) if quats else None,
+        )
+        self.get_logger().info(
+            f"PortLocalizer loaded ckpt={ckpt} device={device} "
+            f"cameras={self._localizer.cameras}"
+        )
+
+    @staticmethod
+    def _ros_image_to_np(img_msg) -> np.ndarray:
+        """sensor_msgs/Image (rgb8) → (H, W, 3) uint8 numpy. Matches the
+        recorder's stored frame format that the localizer was trained on.
+
+        The encoding assert is cheap and catches a class of failure mode that
+        verify-mode would otherwise have to find (silent channel swap when
+        Gazebo publishes bgr8 — model output looks plausible but is wrong).
+        """
+        if img_msg.encoding != "rgb8":
+            raise ValueError(
+                f"expected rgb8 encoding for localizer input, got "
+                f"{img_msg.encoding!r}; channel-swapped bytes would silently "
+                f"give garbage predictions"
+            )
+        return np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
+            img_msg.height, img_msg.width, 3,
+        )
+
+    def _predict_port_transform(
+        self, get_observation, task: Task,
+    ) -> Transform:
+        """Run the localizer once on the current observation and return the
+        predicted port pose as a geometry_msgs/Transform.
+
+        Camera dict keys ("left_camera", "center_camera", "right_camera") match
+        the names the model was trained with — PortLocalizer reorders by
+        ckpt['cameras'] so we can pass an unordered dict safely.
+        TCP pose layout (x, y, z, qx, qy, qz, qw) matches training (xyzw quat).
+        """
+        obs = get_observation()
+        images = {
+            "left_camera": self._ros_image_to_np(obs.left_image),
+            "center_camera": self._ros_image_to_np(obs.center_image),
+            "right_camera": self._ros_image_to_np(obs.right_image),
+        }
+        tcp_pose = obs.controller_state.tcp_pose
+        tcp_vec = np.array(
+            [
+                tcp_pose.position.x,
+                tcp_pose.position.y,
+                tcp_pose.position.z,
+                tcp_pose.orientation.x,
+                tcp_pose.orientation.y,
+                tcp_pose.orientation.z,
+                tcp_pose.orientation.w,
+            ],
+            dtype=np.float32,
+        )
+        pose = self._localizer.predict_port_pose(
+            images=images,
+            tcp_pose=tcp_vec,
+            target_module_name=task.target_module_name,
+            port_name=task.port_name,
+            port_type=task.port_type,
+        )
+        out = Transform()
+        out.translation.x = float(pose.x)
+        out.translation.y = float(pose.y)
+        out.translation.z = float(pose.z)
+        out.rotation.x = float(pose.qx)
+        out.rotation.y = float(pose.qy)
+        out.rotation.z = float(pose.qz)
+        out.rotation.w = float(pose.qw)
+        return out
+
+    def _verify_localizer_vs_tf(
+        self, predicted: Transform, port_frame: str,
+    ) -> None:
+        """Sanity check: when the env asks us to verify and the engine is run
+        with ground_truth:=true (so TF works), log the delta between the
+        localizer prediction and the recorded TF. A delta much larger than the
+        v7 val numbers (xy ~10mm mean / ~25mm p95, yaw ~4°) usually means a
+        format-conversion bug, not the model being unfit. No-op when the
+        verify env var is unset or TF is unavailable."""
+        if os.environ.get(self.LOCALIZER_VERIFY_ENV, "") != "1":
+            return
+        try:
+            stamped = self._parent_node._tf_buffer.lookup_transform(
+                "base_link", port_frame, Time(),
+            )
+        except TransformException:
+            self.get_logger().info(
+                "LOCALIZER_VERIFY: TF lookup failed (engine not in ground_truth "
+                "mode?) — skipping sanity check"
+            )
+            return
+        tf = stamped.transform
+        dx = predicted.translation.x - tf.translation.x
+        dy = predicted.translation.y - tf.translation.y
+        dz = predicted.translation.z - tf.translation.z
+        dxyz_mm = (dx * dx + dy * dy + dz * dz) ** 0.5 * 1000.0
+        # Yaw delta: extract Z-axis rotation from each quaternion and diff.
+        # For two near-identity quats with mostly-Z rotation, atan2(qz, qw)*2
+        # gives yaw to good precision.
+        yaw_pred = 2.0 * math.atan2(predicted.rotation.z, predicted.rotation.w)
+        yaw_tf = 2.0 * math.atan2(tf.rotation.z, tf.rotation.w)
+        dyaw = (yaw_pred - yaw_tf + math.pi) % (2.0 * math.pi) - math.pi
+        self.get_logger().info(
+            f"LOCALIZER_VERIFY: Δxyz={dxyz_mm:.1f}mm "
+            f"(Δx={dx*1000:+.1f} Δy={dy*1000:+.1f} Δz={dz*1000:+.1f}) "
+            f"Δyaw={math.degrees(dyaw):+.2f}°  "
+            f"pred=({predicted.translation.x:.4f},{predicted.translation.y:.4f},"
+            f"{predicted.translation.z:.4f}) tf=({tf.translation.x:.4f},"
+            f"{tf.translation.y:.4f},{tf.translation.z:.4f})"
+        )
 
     # ------------------------------------------------------------------
     # Plug-local-frame error decomposition + axis-aware alignment gate
@@ -671,6 +845,8 @@ class CheatCodeRobust(Policy):
         self._inserted_flag = False
         self._inside_latched = False
         self._last_status_log_t = None
+        # Reset cached localizer prediction — board pose changes between trials.
+        self._localizer_port_transform = None
         # Sample per-trial port-pose noise (no-op when env vars unset).
         self._noise_xy_offset, self._noise_yaw_offset = self._sample_trial_noise(task)
         if self._noise_xy_offset != (0.0, 0.0) or self._noise_yaw_offset != 0.0:
@@ -692,17 +868,42 @@ class CheatCodeRobust(Policy):
         port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
         cable_tip_frame = f"{task.cable_name}/{task.plug_name}_link"
 
-        for frame in [port_frame, cable_tip_frame]:
+        # Plug TF is always required (we look up the cable tip pose every tick
+        # to compute XY error); port TF is only required when not in localizer
+        # mode. In localizer mode the engine may run without ground_truth, in
+        # which case the port frame won't exist on /tf.
+        required_frames = [cable_tip_frame]
+        if not self._localizer_mode():
+            required_frames.append(port_frame)
+        for frame in required_frames:
             if not self._wait_for_tf("base_link", frame):
                 return False
 
-        try:
-            port_tf_stamped = self._parent_node._tf_buffer.lookup_transform(
-                "base_link", port_frame, Time())
-        except TransformException as ex:
-            self.get_logger().error(f"Could not look up port transform: {ex}")
-            return False
-        port_transform = self._apply_pose_noise(port_tf_stamped.transform)
+        if self._localizer_mode():
+            self._ensure_localizer_loaded()
+            try:
+                port_transform = self._predict_port_transform(get_observation, task)
+            except Exception as ex:
+                self.get_logger().error(
+                    f"PortLocalizer prediction failed: {ex}")
+                return False
+            self._localizer_port_transform = port_transform
+            self.get_logger().info(
+                f"LOCALIZER: predicted port pose at "
+                f"({port_transform.translation.x:.4f}, "
+                f"{port_transform.translation.y:.4f}, "
+                f"{port_transform.translation.z:.4f}) — "
+                f"caching for trial; TF refresh disabled"
+            )
+            self._verify_localizer_vs_tf(port_transform, port_frame)
+        else:
+            try:
+                port_tf_stamped = self._parent_node._tf_buffer.lookup_transform(
+                    "base_link", port_frame, Time())
+            except TransformException as ex:
+                self.get_logger().error(f"Could not look up port transform: {ex}")
+                return False
+            port_transform = self._apply_pose_noise(port_tf_stamped.transform)
 
         # --- APPROACH: smooth interpolation to the hover pose -----------
         self.get_logger().info("Phase: APPROACH")
