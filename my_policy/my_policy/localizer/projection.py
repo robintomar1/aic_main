@@ -17,16 +17,11 @@ No torch — pure numpy. Pixel coords are in image frame [0, IMG_W) × [0, IMG_H
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import numpy as np
 
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-import gen_trial_config as gtc  # noqa: E402
+# gen_trial_config now lives inside the package; sibling import works whether
+# we're running from source or from a site-packages install.
+from my_policy import gen_trial_config as gtc
 
 
 def _quat_xyzw_to_rotmat(q: np.ndarray) -> np.ndarray:

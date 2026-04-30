@@ -30,15 +30,12 @@ from typing import Any
 
 import numpy as np
 
-# gen_trial_config lives in my_policy/scripts/, not in the package. Pulling its
-# constants and helpers in via sys.path beats duplicating the URDF math; the
-# alternative would be a separate "geometry" module that both consumers depend
-# on, which is a larger refactor than this phase needs.
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-import gen_trial_config as gtc  # noqa: E402
+# gen_trial_config now lives inside the package (my_policy/gen_trial_config.py)
+# so this import works regardless of install layout — including when the
+# package is installed under site-packages and the source-tree scripts/ dir
+# isn't on sys.path. The script entry point at scripts/gen_trial_config.py
+# is a thin shim that re-exports this module.
+from my_policy import gen_trial_config as gtc  # noqa: E402
 
 
 # Fixed task-target order — change only when the port inventory changes. NEVER
