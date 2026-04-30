@@ -353,13 +353,18 @@ class BoardPoseRegressor(nn.Module):
         if return_aux:
             if self.aux_head is not None:
                 aux_flat = self.aux_head(pooled_flat)
-                aux_pixels = aux_flat.view(B, num_cams, 2)
+                aux_pixels = aux_flat.reshape(B, num_cams, 2)
             elif self.aux_conv is not None:
                 aux_pooled = self.aux_conv(spatial_flat)        # (B*num_cams, 32)
                 aux_flat = self.aux_pathway_head(aux_pooled)    # (B*num_cams, 2)
-                aux_pixels = aux_flat.view(B, num_cams, 2)
+                aux_pixels = aux_flat.reshape(B, num_cams, 2)
 
-        pooled = pooled_flat.view(B, num_cams * self.feature_dim)
+        # `.reshape` (not `.view`) — DINOv2's `x_norm_clstoken` comes from a
+        # token-tensor slice and isn't guaranteed contiguous; `.view` would
+        # raise. ResNet18's pooled output IS contiguous, so reshape is a no-
+        # op there. Same applies to the aux_pixels reshapes above when the
+        # aux pathway is enabled.
+        pooled = pooled_flat.reshape(B, num_cams * self.feature_dim)
         feat = self.cam_fuse(pooled)                           # (B, 512)
         feat = self.film_task(feat, task_one_hot)
         tcp_emb = self.tcp_proj(tcp_pose)
