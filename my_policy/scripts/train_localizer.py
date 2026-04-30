@@ -421,13 +421,42 @@ def train(args: argparse.Namespace) -> int:
     )
 
     # --- Model
+    # Resume-path safety: when continuing from a checkpoint trained with a
+    # different aux mode, the saved state_dict won't match a freshly-built
+    # model. Detect the saved mode from the state_dict key prefixes and
+    # override the CLI flag (with a warning) so resume "just works".
+    resume_aux_mode: str | None = None
+    if args.resume is not None and args.resume.exists():
+        peek = torch.load(args.resume, map_location="cpu", weights_only=False)
+        sd = peek.get("model_state_dict", {})
+        has_pooled = any(k.startswith("aux_head.") for k in sd)
+        has_spatial = any(
+            k.startswith("aux_conv.") or k.startswith("aux_pathway_head.")
+            for k in sd
+        )
+        resume_aux_mode = (
+            "pooled" if has_pooled else "spatial" if has_spatial else "none"
+        )
+        if resume_aux_mode != args.aux_mode:
+            print(
+                f"  --resume override: ckpt has aux_mode={resume_aux_mode!r} "
+                f"but --aux-mode={args.aux_mode!r}; using ckpt's mode so the "
+                f"state_dict loads cleanly"
+            )
+            args.aux_mode = resume_aux_mode
+        del peek  # release the peek copy before the actual load below
+
+    aux_pixel_head = (args.aux_mode == "pooled")
+    aux_pathway = (args.aux_mode == "spatial")
     config = BoardPoseRegressorConfig(
         backbone_pretrained=args.pretrained,
         num_cameras=len(cameras),
+        aux_pixel_head=aux_pixel_head,
+        aux_pathway=aux_pathway,
     )
     model = BoardPoseRegressor(config).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  model params: {n_params / 1e6:.2f} M")
+    print(f"  model params: {n_params / 1e6:.2f} M  aux_mode={args.aux_mode}")
 
     # --- Optim
     # Conservative LR for the pretrained backbone, higher LR for head/film.
@@ -589,6 +618,19 @@ def main() -> int:
                    help="Add ±2mm / ±0.5° noise to the TCP pose input (default: off).")
     p.add_argument("--resume", type=Path, default=None,
                    help="Path to <output>_latest.pt to resume training from.")
+    p.add_argument(
+        "--aux-mode", type=str, default="spatial",
+        choices=["none", "pooled", "spatial"],
+        help=(
+            "Auxiliary per-camera port-pixel supervision integration point.\n"
+            "  none    - no aux loss; pose-only training (matches v7).\n"
+            "  pooled  - aux head reads the shared pooled feature (v8).\n"
+            "  spatial - aux head reads spatial features via its own conv\n"
+            "            pathway (v9-pathway, default). Avoids the v8 bug\n"
+            "            where the pooled feature got pulled in two\n"
+            "            directions by aux + cam_fuse."
+        ),
+    )
     args = p.parse_args()
     return train(args)
 

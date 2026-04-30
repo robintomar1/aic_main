@@ -64,8 +64,10 @@ def test_forward_shape_singlecam_backcompat():
 
 def test_forward_return_aux_shapes():
     """v8: return_aux=True returns (pred, aux_pixels) with aux in [0,1]."""
+    # Explicit aux_pathway=False — the dataclass default is now True (v9), and
+    # both modes are mutually exclusive.
     cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3,
-                                   aux_pixel_head=True)
+                                   aux_pixel_head=True, aux_pathway=False)
     model = BoardPoseRegressor(cfg)
     model.eval()
     B, NC = 4, 3
@@ -78,6 +80,70 @@ def test_forward_return_aux_shapes():
     assert aux.shape == (B, NC, 2)
     # Sigmoid output is bounded.
     assert (aux >= 0).all() and (aux <= 1).all()
+
+
+def test_forward_return_aux_shapes_v9_pathway():
+    """v9-pathway: return_aux=True returns (pred, aux_pixels) with aux in [0,1].
+
+    Aux is produced by a separate conv pathway from the spatial features (not
+    the pooled feature cam_fuse consumes), addressing the v8 bug where the two
+    losses competed for the 512-d bottleneck.
+    """
+    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3,
+                                   aux_pixel_head=False, aux_pathway=True)
+    model = BoardPoseRegressor(cfg)
+    model.eval()
+    B, NC = 4, 3
+    images = torch.randn(B, NC, 3, 224, 224)
+    tcp = torch.randn(B, 7)
+    oh = torch.zeros(B, 7); oh[:, 0] = 1.0
+    with torch.no_grad():
+        pred, aux = model(images, tcp, oh, return_aux=True)
+    assert pred.shape == (B, 5)
+    assert aux.shape == (B, NC, 2)
+    assert (aux >= 0).all() and (aux <= 1).all()
+    # Confirm the conv pathway modules exist and the legacy v8 head doesn't.
+    assert model.aux_conv is not None
+    assert model.aux_pathway_head is not None
+    assert model.aux_head is None
+
+
+def test_forward_pose_only_no_aux():
+    """Both aux modes off → pose-only model (matches v7 architecture).
+
+    Important contract: `return_aux=True` is *allowed* even when no aux head
+    is configured — the call returns `(pred, None)` rather than raising. This
+    keeps the call site identical between aux-enabled and aux-disabled
+    training, and is relied on by the train loop which always passes
+    `return_aux=True` and skips the aux-loss term when the second tuple
+    element is None. Don't add a guard that errors here.
+    """
+    cfg = BoardPoseRegressorConfig(backbone_pretrained=False, num_cameras=3,
+                                   aux_pixel_head=False, aux_pathway=False)
+    model = BoardPoseRegressor(cfg)
+    assert model.aux_head is None
+    assert model.aux_conv is None
+    assert model.aux_pathway_head is None
+    model.eval()
+    B, NC = 2, 3
+    images = torch.randn(B, NC, 3, 224, 224)
+    tcp = torch.randn(B, 7)
+    oh = torch.zeros(B, 7); oh[:, 0] = 1.0
+    with torch.no_grad():
+        pred, aux = model(images, tcp, oh, return_aux=True)
+    assert pred.shape == (B, 5)
+    assert aux is None
+
+
+def test_config_aux_modes_are_mutually_exclusive():
+    """Setting both aux_pixel_head and aux_pathway must raise at config time —
+    they're alternative integration points, never both."""
+    try:
+        BoardPoseRegressorConfig(aux_pixel_head=True, aux_pathway=True)
+    except ValueError as ex:
+        assert "mutually exclusive" in str(ex)
+        return
+    raise AssertionError("expected ValueError, got none")
 
 
 def test_aux_pixel_loss_masks_invalid():
@@ -197,6 +263,9 @@ if __name__ == "__main__":
         test_forward_shape_multicam,
         test_forward_shape_singlecam_backcompat,
         test_forward_return_aux_shapes,
+        test_forward_return_aux_shapes_v9_pathway,
+        test_forward_pose_only_no_aux,
+        test_config_aux_modes_are_mutually_exclusive,
         test_aux_pixel_loss_masks_invalid,
         test_film_identity_at_zero_conditioning,
         test_loss_fn_zero_at_match,

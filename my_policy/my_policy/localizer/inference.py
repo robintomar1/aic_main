@@ -149,14 +149,21 @@ class PortLocalizer:
         # checkpoint, no need to download from torchvision (and no internet
         # at submission anyway).
         config.backbone_pretrained = False
-        # Auto-detect aux head presence from the saved state_dict — pre-v8
-        # checkpoints (e.g. v7) were trained before aux_pixel_head was added,
-        # so their saved config doesn't carry the field. The dataclass default
-        # is True (v8+), which would build a model with extra aux_head modules
-        # and fail load_state_dict with "missing keys: aux_head.*". Trust the
-        # weights over the config.
+        # Auto-detect aux head presence from the saved state_dict — older
+        # checkpoints (v7 pre-aux, v8 pooled-aux) were saved before the
+        # aux_pathway field existed, so their saved config either doesn't
+        # carry the right defaults or carries values incompatible with the
+        # current dataclass defaults. Trust the weights over the saved config.
+        # Anchor checks at startswith() so v8's "aux_head.*" doesn't match
+        # any v9 prefix and vice versa.
         sd = ckpt["model_state_dict"]
-        config.aux_pixel_head = any(k.startswith("aux_head.") for k in sd)
+        has_aux_head = any(k.startswith("aux_head.") for k in sd)
+        has_aux_pathway = (
+            any(k.startswith("aux_conv.") for k in sd)
+            or any(k.startswith("aux_pathway_head.") for k in sd)
+        )
+        config.aux_pixel_head = has_aux_head
+        config.aux_pathway = has_aux_pathway
         self.model = BoardPoseRegressor(config).to(self.device)
         self.model.load_state_dict(sd)
         self.model.eval()

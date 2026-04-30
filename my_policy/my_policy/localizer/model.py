@@ -75,7 +75,25 @@ class BoardPoseRegressorConfig:
     backbone_pretrained: bool = True
     head_dropout: float = 0.1
     num_cameras: int = 3  # v7: 3-cam concat for absolute-position parallax
-    aux_pixel_head: bool = True  # v8: per-cam port-pixel regression aux loss
+    # Auxiliary supervision modes — at most one may be True. Both False = pose-only
+    # (v7). Defaults below ship the v9-pathway architecture for new training while
+    # preserving the ability to load older v7/v8 checkpoints (PortLocalizer auto-
+    # detects the saved mode from state-dict key prefixes).
+    aux_pixel_head: bool = False  # v8: per-cam pixel head reading the POOLED
+                                  # backbone feature; competed with cam_fuse
+                                  # for use of that 512-d bottleneck and
+                                  # destabilized pose val (acknowledged 2026-04-30)
+    aux_pathway: bool = True       # v9: separate conv pathway from spatial
+                                   # features, so the pose-path pooled feature
+                                   # is no longer constrained to encode pixels
+
+    def __post_init__(self) -> None:
+        if self.aux_pixel_head and self.aux_pathway:
+            raise ValueError(
+                "aux_pixel_head (v8) and aux_pathway (v9) are mutually "
+                "exclusive — they're alternative integration points for the "
+                "per-camera port-pixel auxiliary supervision."
+            )
 
 
 class FiLM(nn.Module):
@@ -174,8 +192,10 @@ class BoardPoseRegressor(nn.Module):
 
         # v8: auxiliary per-camera port-pixel regression head. Sigmoid output
         # so predictions stay in [0, 1] image-normalized space. Operates on
-        # the per-camera pooled feature (BEFORE cam_fuse), so each camera's
-        # aux output reflects only its own image.
+        # the per-camera POOLED feature (the same 512-d bottleneck cam_fuse
+        # consumes), so the two heads end up competing for that vector.
+        # Disabled by default — kept under config flag for backward compat
+        # when loading v8 checkpoints; new training defaults to aux_pathway.
         if self.config.aux_pixel_head:
             self.aux_head = nn.Sequential(
                 nn.Linear(feature_dim, 128),
@@ -185,6 +205,36 @@ class BoardPoseRegressor(nn.Module):
             )
         else:
             self.aux_head = None
+
+        # v9: aux pathway reads from SPATIAL features (pre-pool), runs them
+        # through its own small conv stack with its own channel pool, and
+        # emits the same (u_norm, v_norm) sigmoid pair v8's head did. This
+        # gives aux its own bottleneck — independent of the pooled feature
+        # cam_fuse uses — so the two losses no longer fight over a shared
+        # 512-d summary. Sized to roughly match v8's aux head (~55K params)
+        # to avoid overfitting on 354 episodes:
+        #   1×1 conv (32K params): channel reduction, no spatial mixing
+        #   3×3 conv (18K params): spatial mixing into 32 channels
+        #   global avg pool: aux gets to choose its own per-channel summary
+        #   Linear(32→2): final pixel coords; Sigmoid clamps to [0,1].
+        # If this underfits the aux loss, escalate channel widths or move to
+        # spatial soft-argmax (the documented backup option).
+        if self.config.aux_pathway:
+            self.aux_conv = nn.Sequential(
+                nn.Conv2d(feature_dim, 64, kernel_size=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 32, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+            )
+            self.aux_pathway_head = nn.Sequential(
+                nn.Linear(32, 2),
+                nn.Sigmoid(),
+            )
+        else:
+            self.aux_conv = None
+            self.aux_pathway_head = None
 
     def _extract_features(
         self, images: torch.Tensor
@@ -218,15 +268,27 @@ class BoardPoseRegressor(nn.Module):
                 f"num_cameras={self.config.num_cameras}"
             )
         flat = images.view(B * num_cams, C, H, W)
-        _, pooled_flat = self._extract_features(flat)         # (B*num_cams, 512)
+        spatial_flat, pooled_flat = self._extract_features(flat)
+        # spatial_flat: (B*num_cams, 512, 7, 7); pooled_flat: (B*num_cams, 512)
 
-        # v8 aux: per-camera pixel regression from the per-cam pooled feature.
+        # Per-camera aux pixel regression. Both v8 and v9 emit the same
+        # output shape (B, num_cams, 2) in [0, 1] image-normalized space —
+        # only the input pathway differs:
+        #   v8 (aux_pixel_head): reads the SHARED pooled feature
+        #   v9 (aux_pathway):    reads the SPATIAL feature map via its own
+        #                        conv stack, leaving the pose pooled feature
+        #                        untouched
         # Computed BEFORE cam_fuse so each cam's aux output sees only its
         # own image (matches the per-cam pixel target).
         aux_pixels = None
-        if return_aux and self.aux_head is not None:
-            aux_flat = self.aux_head(pooled_flat)              # (B*num_cams, 2)
-            aux_pixels = aux_flat.view(B, num_cams, 2)
+        if return_aux:
+            if self.aux_head is not None:
+                aux_flat = self.aux_head(pooled_flat)
+                aux_pixels = aux_flat.view(B, num_cams, 2)
+            elif self.aux_conv is not None:
+                aux_pooled = self.aux_conv(spatial_flat)        # (B*num_cams, 32)
+                aux_flat = self.aux_pathway_head(aux_pooled)    # (B*num_cams, 2)
+                aux_pixels = aux_flat.view(B, num_cams, 2)
 
         pooled = pooled_flat.view(B, num_cams * self.feature_dim)
         feat = self.cam_fuse(pooled)                           # (B, 512)
