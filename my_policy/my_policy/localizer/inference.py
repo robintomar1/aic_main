@@ -136,7 +136,14 @@ class PortLocalizer:
         quats_json_path: Path | None = None,
     ):
         self.device = torch.device(device)
-        ckpt = torch.load(str(checkpoint_path), map_location=self.device)
+        # weights_only=False: the checkpoint payload includes non-tensor
+        # objects (PosixPath in the saved args, plus the cameras list etc.)
+        # that PyTorch 2.6+'s default safe-loader rejects. We trust our own
+        # checkpoint files so this is safe; matches train_localizer.py's
+        # resume path which uses the same flag.
+        ckpt = torch.load(
+            str(checkpoint_path), map_location=self.device, weights_only=False,
+        )
         config = BoardPoseRegressorConfig(**ckpt.get("config", {}))
         # backbone_pretrained=False at inference: we'll load weights from the
         # checkpoint, no need to download from torchvision (and no internet
