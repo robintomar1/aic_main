@@ -82,13 +82,29 @@ LOOP_HZ = 20.0
 IMAGE_SCALING = 0.25  # 1152x1024 native → 288x256 (matches dataset)
 
 
-def _load_act_policy(ckpt_dir: Path, device: torch.device) -> ACTPolicy:
-    """Load the ACT model weights + config from a checkpoint directory."""
+def _load_act_policy(
+    ckpt_dir: Path,
+    device: torch.device,
+    temporal_ensemble_coeff: float | None,
+) -> ACTPolicy:
+    """Load the ACT model weights + config from a checkpoint directory.
+
+    If `temporal_ensemble_coeff` is set, overrides the saved config to enable
+    inference-time temporal ensembling (also forces n_action_steps=1, which
+    ACTConfig.__post_init__ requires when ensembling is on). The original
+    ACT paper used 0.01.
+    """
     cfg_dict = json.loads((ckpt_dir / "config.json").read_text())
     # `type` is a draccus-incompatible discriminator that lerobot adds for
     # the choice-class registry but draccus.decode rejects on the concrete
     # ACTConfig dataclass.
     cfg_dict.pop("type", None)
+    if temporal_ensemble_coeff is not None:
+        cfg_dict["temporal_ensemble_coeff"] = temporal_ensemble_coeff
+        # Required by ACTConfig.__post_init__ when ensembling is enabled —
+        # the ensembler updates one action per call rather than batches of
+        # n_action_steps.
+        cfg_dict["n_action_steps"] = 1
     config = draccus.decode(ACTConfig, cfg_dict)
 
     policy = ACTPolicy(config)
@@ -214,7 +230,15 @@ class RunACT(Policy):
             )
         self.ckpt_dir = ckpt_dir
 
-        self.policy = _load_act_policy(ckpt_dir, self.device)
+        # Inference-time temporal ensembling. Off if env var unset or empty.
+        # 0.01 is the original ACT paper's default. Smaller = stronger smoothing.
+        # Setting this forces n_action_steps=1 (re-encode every tick).
+        te_str = os.environ.get("AIC_ACT_TEMPORAL_ENSEMBLE_COEFF", "").strip()
+        temporal_ensemble_coeff = float(te_str) if te_str else None
+
+        self.policy = _load_act_policy(
+            ckpt_dir, self.device, temporal_ensemble_coeff
+        )
 
         # Saved processor pipelines: pre = rename → batch → device → normalize;
         # post = unnormalize → to-cpu. Loaded straight from the train output;
@@ -238,7 +262,8 @@ class RunACT(Policy):
 
         self.get_logger().info(
             f"RunACT loaded checkpoint={ckpt_dir} device={self.device} "
-            f"loop={LOOP_HZ}Hz timeout={self.timeout_s}s"
+            f"loop={LOOP_HZ}Hz timeout={self.timeout_s}s "
+            f"temporal_ensemble_coeff={temporal_ensemble_coeff}"
         )
 
     def _build_obs_dict(
