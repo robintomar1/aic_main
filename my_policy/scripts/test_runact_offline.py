@@ -214,6 +214,10 @@ def run_tier2(checkpoint_dir: Path, dataset_root: Path,
     from lerobot.policies.act.modeling_act import ACTPolicy
     from lerobot.policies.act.configuration_act import ACTConfig
     from lerobot.processor.pipeline import DataProcessorPipeline
+    from lerobot.processor.converters import (
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  device    : {device}")
@@ -229,7 +233,9 @@ def run_tier2(checkpoint_dir: Path, dataset_root: Path,
         str(checkpoint_dir), config_filename="policy_preprocessor.json"
     )
     post = DataProcessorPipeline.from_pretrained(
-        str(checkpoint_dir), config_filename="policy_postprocessor.json"
+        str(checkpoint_dir), config_filename="policy_postprocessor.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
     )
 
     ds = LeRobotDataset(
@@ -261,10 +267,8 @@ def run_tier2(checkpoint_dir: Path, dataset_root: Path,
         with torch.inference_mode():
             action = policy.select_action(obs)
         action = post(action)
-        # action may be a tensor [1,7] or a dict containing it; handle both.
-        if isinstance(action, dict):
-            action = action.get("action", next(iter(action.values())))
-        pred = action[0].cpu().numpy() if action.dim() == 2 else action.cpu().numpy()
+        # postprocessor wired with transition_to_policy_action returns [1,7] tensor
+        pred = action[0].cpu().numpy()
         recorded = item["action"].numpy()
         errs.append(np.abs(pred - recorded))
 
@@ -294,6 +298,10 @@ def run_tier3(checkpoint_dir: Path, n_iters: int):
     from lerobot.policies.act.modeling_act import ACTPolicy
     from lerobot.policies.act.configuration_act import ACTConfig
     from lerobot.processor.pipeline import DataProcessorPipeline
+    from lerobot.processor.converters import (
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -308,7 +316,9 @@ def run_tier3(checkpoint_dir: Path, n_iters: int):
         str(checkpoint_dir), config_filename="policy_preprocessor.json"
     )
     post = DataProcessorPipeline.from_pretrained(
-        str(checkpoint_dir), config_filename="policy_postprocessor.json"
+        str(checkpoint_dir), config_filename="policy_postprocessor.json",
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
     )
 
     obs = {

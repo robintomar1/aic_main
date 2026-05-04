@@ -66,6 +66,10 @@ from aic_task_interfaces.msg import Task
 from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.processor.pipeline import DataProcessorPipeline
+from lerobot.processor.converters import (
+    policy_action_to_transition,
+    transition_to_policy_action,
+)
 
 from my_policy.act.labels import encode_task_vector
 
@@ -218,8 +222,15 @@ class RunACT(Policy):
         self.preprocessor = DataProcessorPipeline.from_pretrained(
             str(ckpt_dir), config_filename="policy_preprocessor.json"
         )
+        # Postprocessor consumes a bare action tensor, not a dict — override
+        # the dict-oriented default converters with the action ones (same
+        # pattern used by lerobot's per-policy processor factories, e.g.
+        # lerobot/policies/xvla/processor_xvla.py).
         self.postprocessor = DataProcessorPipeline.from_pretrained(
-            str(ckpt_dir), config_filename="policy_postprocessor.json"
+            str(ckpt_dir),
+            config_filename="policy_postprocessor.json",
+            to_transition=policy_action_to_transition,
+            to_output=transition_to_policy_action,
         )
 
         self.timeout_s = float(os.environ.get("AIC_ACT_TIMEOUT_S", DEFAULT_TIMEOUT_S))
@@ -280,9 +291,9 @@ class RunACT(Policy):
                 action = self.policy.select_action(obs)
             action = self.postprocessor(action)
 
-            # Postprocessor moves to cpu; action shape [1, 7].
-            a = action[0].numpy() if isinstance(action, torch.Tensor) \
-                else action["action"][0].numpy()
+            # Postprocessor returns the action tensor directly (we wired
+            # transition_to_policy_action above) on cpu, shape [1, 7].
+            a = action[0].numpy()
             pose = _action_to_pose(a)
             self.set_pose_target(move_robot, pose, frame_id="base_link")
 
