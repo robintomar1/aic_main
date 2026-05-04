@@ -250,29 +250,33 @@ def main() -> int:
     print()
 
     if args.dry_run:
-        # Run lerobot's draccus parser + cfg.validate() against our CLI args
-        # but bail before make_dataset / make_policy / Accelerator. This catches
-        # missing-arg, type-mismatch, and validate() errors without burning the
-        # GPU, dataloader workers, or first-batch decode time.
-        from lerobot.configs.parser import wrap as parser_wrap  # noqa: F401
+        # Bypass lerobot's @parser.wrap() decorator (it reads the function's
+        # type annotation, which `from __future__ import annotations` reduces
+        # to a string — TypeError downstream in draccus.fields). Call draccus
+        # directly with the explicit dataclass.
+        import draccus
         from lerobot.configs.train import TrainPipelineConfig
 
-        @parser_wrap()
-        def _validate_only(cfg: TrainPipelineConfig):
-            cfg.validate()
-            print("=== --dry-run: cfg.validate() OK ===")
-            print(f"  dataset.root        = {cfg.dataset.root}")
-            print(f"  dataset.episodes    = list of {len(cfg.dataset.episodes or [])}")
-            print(f"  policy.type         = {cfg.policy.type}")
-            print(f"  policy.chunk_size   = {cfg.policy.chunk_size}")
-            print(f"  policy.n_action_steps = {cfg.policy.n_action_steps}")
-            print(f"  policy.use_vae      = {cfg.policy.use_vae}")
-            print(f"  output_dir          = {cfg.output_dir}")
-            print(f"  job_name            = {cfg.job_name}")
-            print(f"  batch_size          = {cfg.batch_size}")
-            print(f"  steps               = {cfg.steps}")
-            print(f"  wandb.enable        = {cfg.wandb.enable}")
-        _validate_only()
+        cfg: TrainPipelineConfig = draccus.parse(
+            config_class=TrainPipelineConfig,
+            config_path=None,
+            args=sys.argv[1:],
+        )
+        cfg.validate()
+        print("=== --dry-run: cfg.validate() OK ===")
+        print(f"  dataset.root          = {cfg.dataset.root}")
+        print(f"  dataset.episodes      = list of {len(cfg.dataset.episodes or [])}")
+        print(f"  dataset.image_transforms.enable = {cfg.dataset.image_transforms.enable}")
+        print(f"  policy.type           = {cfg.policy.type}")
+        print(f"  policy.chunk_size     = {cfg.policy.chunk_size}")
+        print(f"  policy.n_action_steps = {cfg.policy.n_action_steps}")
+        print(f"  policy.use_vae        = {cfg.policy.use_vae}")
+        print(f"  policy.push_to_hub    = {cfg.policy.push_to_hub}")
+        print(f"  output_dir            = {cfg.output_dir}")
+        print(f"  job_name              = {cfg.job_name}")
+        print(f"  batch_size            = {cfg.batch_size}")
+        print(f"  steps                 = {cfg.steps}")
+        print(f"  wandb.enable          = {cfg.wandb.enable}")
         return 0
 
     # Deferred import — the shim must be in place first.
