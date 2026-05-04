@@ -36,6 +36,7 @@ step chunks aren't free either.
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
 import json
 import sys
 import types
@@ -60,6 +61,10 @@ def _install_wandb_shim() -> None:
     import trackio  # noqa: F401 — must be installed; raises ImportError if not.
 
     shim = types.ModuleType("wandb")
+    # accelerate.utils.imports._is_package_available calls
+    # importlib.util.find_spec("wandb") which requires a real ModuleSpec —
+    # it raises `ValueError: wandb.__spec__ is None` otherwise. Provide one.
+    shim.__spec__ = importlib.machinery.ModuleSpec("wandb", loader=None)
 
     class _RunProxy:
         """Wraps trackio's run with the .id and .get_url() that lerobot
