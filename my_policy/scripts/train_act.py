@@ -151,6 +151,13 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=1000)
     p.add_argument("--resume", action="store_true",
                    help="Resume from the latest checkpoint in <output-root>/<name>/.")
+    p.add_argument("--force", action="store_true",
+                   help="Delete <output-root>/<name>/ if it exists (overrides lerobot's "
+                        "FileExistsError). Without this, an existing dir aborts unless --resume.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Validate config end-to-end (CLI parse + cfg.validate()) and exit "
+                        "before the train loop; catches missing args fast without touching "
+                        "the GPU or dataset.")
     p.add_argument("--no-image-transforms", action="store_true",
                    help="Disable lerobot's built-in brightness/contrast/hue/affine augs.")
     p.add_argument("--no-trackio", action="store_true",
@@ -171,6 +178,22 @@ def main() -> int:
     eps_arg = "[" + ",".join(str(e) for e in train_episodes) + "]"
     output_dir = args.output_root / args.name
 
+    # Pre-flight: lerobot's TrainPipelineConfig.validate() raises FileExistsError
+    # if output_dir exists and --resume is False. Surface this as a clean wrapper
+    # error so the user can choose --resume or --force, instead of seeing a
+    # mid-stack traceback.
+    if output_dir.exists() and not args.resume:
+        if args.force:
+            import shutil
+            print(f"--force: deleting existing output_dir {output_dir}")
+            shutil.rmtree(output_dir)
+        else:
+            print(f"error: output_dir {output_dir} already exists.", file=sys.stderr)
+            print("  pass --resume to continue from the latest checkpoint, OR", file=sys.stderr)
+            print("  pass --force to delete and start fresh, OR", file=sys.stderr)
+            print("  pick a different --name.", file=sys.stderr)
+            return 1
+
     cli = [
         "lerobot-train",
         # Dataset.
@@ -180,6 +203,8 @@ def main() -> int:
         "--dataset.video_backend=pyav",
         # Policy.
         "--policy.type=act",
+        f"--policy.repo_id=local/{args.name}",  # required by HubMixin even for local-only runs
+        "--policy.push_to_hub=false",
         f"--policy.chunk_size={args.chunk_size}",
         f"--policy.n_action_steps={args.n_action_steps}",
         "--policy.use_vae=true",
@@ -223,6 +248,32 @@ def main() -> int:
     print(f"tracker       : {'disabled' if args.no_trackio else f'trackio (project={args.trackio_project})'}")
     print(f"resume        : {args.resume}")
     print()
+
+    if args.dry_run:
+        # Run lerobot's draccus parser + cfg.validate() against our CLI args
+        # but bail before make_dataset / make_policy / Accelerator. This catches
+        # missing-arg, type-mismatch, and validate() errors without burning the
+        # GPU, dataloader workers, or first-batch decode time.
+        from lerobot.configs.parser import wrap as parser_wrap  # noqa: F401
+        from lerobot.configs.train import TrainPipelineConfig
+
+        @parser_wrap()
+        def _validate_only(cfg: TrainPipelineConfig):
+            cfg.validate()
+            print("=== --dry-run: cfg.validate() OK ===")
+            print(f"  dataset.root        = {cfg.dataset.root}")
+            print(f"  dataset.episodes    = list of {len(cfg.dataset.episodes or [])}")
+            print(f"  policy.type         = {cfg.policy.type}")
+            print(f"  policy.chunk_size   = {cfg.policy.chunk_size}")
+            print(f"  policy.n_action_steps = {cfg.policy.n_action_steps}")
+            print(f"  policy.use_vae      = {cfg.policy.use_vae}")
+            print(f"  output_dir          = {cfg.output_dir}")
+            print(f"  job_name            = {cfg.job_name}")
+            print(f"  batch_size          = {cfg.batch_size}")
+            print(f"  steps               = {cfg.steps}")
+            print(f"  wandb.enable        = {cfg.wandb.enable}")
+        _validate_only()
+        return 0
 
     # Deferred import — the shim must be in place first.
     from lerobot.scripts.lerobot_train import train as lerobot_train
