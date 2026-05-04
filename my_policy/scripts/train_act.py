@@ -255,6 +255,7 @@ def main() -> int:
         # to a string — TypeError downstream in draccus.fields). Call draccus
         # directly with the explicit dataclass.
         import draccus
+        import lerobot.policies  # noqa: F401 — registers act/diffusion/etc via @register_subclass
         from lerobot.configs.train import TrainPipelineConfig
 
         cfg: TrainPipelineConfig = draccus.parse(
