@@ -33,9 +33,16 @@ def main() -> int:
 
     for ep_i in range(min(args.n_episodes, ds.num_episodes)):
         ep = ds.meta.episodes[ep_i]
-        # Episode bounds in v3.0 are stored as 1-element lists of ints.
-        ep_from = int(ep["dataset_from_index"][0])
-        ep_to = int(ep["dataset_to_index"][0])
+        if ep_i == 0:
+            print(f"  (debug) episode 0 keys: {list(ep.keys())}")
+            print(f"  (debug) episode 0 dataset_from_index type: "
+                  f"{type(ep['dataset_from_index']).__name__}, "
+                  f"value: {ep['dataset_from_index']!r}")
+        raw_from = ep["dataset_from_index"]
+        raw_to = ep["dataset_to_index"]
+        # Loaded form may be int or list-of-int depending on lerobot version.
+        ep_from = int(raw_from[0] if isinstance(raw_from, (list, tuple)) else raw_from)
+        ep_to = int(raw_to[0] if isinstance(raw_to, (list, tuple)) else raw_to)
         ep_len = ep_to - ep_from
         # Pull action and tcp position at start, mid, end of episode.
         sample_idx = [ep_from, ep_from + ep_len // 4, ep_from + ep_len // 2,
