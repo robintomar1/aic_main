@@ -251,6 +251,8 @@ def run_tier2(checkpoint_dir: Path, dataset_root: Path,
 
     policy.reset()
     errs = []
+    pos_errs_m = []        # per-frame ||Δposition||_2 in meters
+    rot_errs_deg = []      # per-frame geodesic angle, sign-invariant
     for i in sample_indices:
         item = ds[i]
         # Already-processed tensors from the dataset:
@@ -272,11 +274,36 @@ def run_tier2(checkpoint_dir: Path, dataset_root: Path,
         recorded = item["action"].numpy()
         errs.append(np.abs(pred - recorded))
 
+        # Geometric position error (Euclidean in meters).
+        pos_errs_m.append(float(np.linalg.norm(pred[:3] - recorded[:3])))
+
+        # Geodesic rotation error: angle = 2·arccos(|<q_pred, q_rec>|).
+        # Sign-invariant (q and -q encode the same rotation), so this
+        # cleanly separates "wrong rotation" from "valid rotation, opposite
+        # quaternion sign convention". Quats are normalized first since
+        # the network output isn't guaranteed to be unit-norm.
+        qp = pred[3:7]
+        qr = recorded[3:7]
+        qp = qp / max(np.linalg.norm(qp), 1e-8)
+        qr = qr / max(np.linalg.norm(qr), 1e-8)
+        cos_half = min(abs(float(np.dot(qp, qr))), 1.0)
+        rot_errs_deg.append(np.degrees(2.0 * np.arccos(cos_half)))
+
     errs = np.stack(errs)               # [N, 7]
     per_dim_mae = errs.mean(axis=0)
     overall_mae = float(errs.mean())
-    print(f"  per-dim MAE: {per_dim_mae}")
-    print(f"  overall MAE: {overall_mae:.4f}  (threshold {mae_threshold})")
+    pos_arr = np.array(pos_errs_m)
+    rot_arr = np.array(rot_errs_deg)
+    print(f"  per-dim MAE   : {per_dim_mae}")
+    print(f"  overall MAE   : {overall_mae:.4f}  (threshold {mae_threshold})")
+    print(f"  pos err (m)   : mean={pos_arr.mean():.4f}  "
+          f"p50={np.percentile(pos_arr, 50):.4f}  "
+          f"p99={np.percentile(pos_arr, 99):.4f}")
+    print(f"  rot err (deg) : mean={rot_arr.mean():.2f}  "
+          f"p50={np.percentile(rot_arr, 50):.2f}  "
+          f"p99={np.percentile(rot_arr, 99):.2f}  "
+          f"(sign-invariant — separates real rotation error from "
+          f"quaternion sign flip)")
     if overall_mae > mae_threshold:
         print(f"  WARN MAE above threshold — could be (a) shim bug, "
               f"(b) immature checkpoint, or (c) ACT chunking artifact "
