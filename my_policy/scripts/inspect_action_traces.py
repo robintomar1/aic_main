@@ -32,8 +32,10 @@ def main() -> int:
     print(f"dataset: {len(ds)} frames across {ds.num_episodes} episodes")
 
     for ep_i in range(min(args.n_episodes, ds.num_episodes)):
-        ep_from = int(ds.episode_data_index["from"][ep_i])
-        ep_to = int(ds.episode_data_index["to"][ep_i])
+        ep = ds.meta.episodes[ep_i]
+        # Episode bounds in v3.0 are stored as 1-element lists of ints.
+        ep_from = int(ep["dataset_from_index"][0])
+        ep_to = int(ep["dataset_to_index"][0])
         ep_len = ep_to - ep_from
         # Pull action and tcp position at start, mid, end of episode.
         sample_idx = [ep_from, ep_from + ep_len // 4, ep_from + ep_len // 2,
