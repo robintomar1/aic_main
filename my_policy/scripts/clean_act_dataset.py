@@ -264,18 +264,33 @@ def main() -> int:
     agg["observation.state"] = aggregate_stats_from_per_ep(
         [{"observation.state": d} for d in new_state_per_ep])["observation.state"]
 
-    # Camera keys: empty placeholder so make_dataset's imagenet override has
-    # somewhere to write (same trick as aggregate_act_stats.py).
     info = json.loads((args.src / "meta" / "info.json").read_text())
-    for k, ft in info["features"].items():
-        if ft.get("dtype") == "video":
-            agg[k] = {}
-
-    stats_json = stats_to_json({k: v for k, v in agg.items() if v})
-    # Preserve the empty camera keys (no fields)
-    for k, v in agg.items():
-        if not v:
-            stats_json[k] = {}
+    stats_json = stats_to_json(agg)
+    # Camera image stats: carry from source stats.json. Empty {} placeholders
+    # don't survive lerobot's load_stats round-trip (cast_stats_to_numpy uses
+    # flatten_dict which drops empty dicts), so make_dataset would crash with
+    # KeyError when overlaying imagenet stats. We didn't modify any images,
+    # so the source camera stats are still valid.
+    src_stats_path = args.src / "meta" / "stats.json"
+    if src_stats_path.exists():
+        src_stats = json.loads(src_stats_path.read_text())
+        for k, ft in info["features"].items():
+            if ft.get("dtype") == "video" and k in src_stats:
+                stats_json[k] = src_stats[k]
+                print(f"  carried camera stats for {k} from source stats.json")
+    else:
+        # Source has no stats.json — fall back to imagenet (lerobot overrides
+        # to imagenet anyway when use_imagenet_stats=True).
+        IMAGENET = {
+            "mean": [[[0.485]], [[0.456]], [[0.406]]],
+            "std":  [[[0.229]], [[0.224]], [[0.225]]],
+            "min":  [[[0.0]], [[0.0]], [[0.0]]],
+            "max":  [[[1.0]], [[1.0]], [[1.0]]],
+        }
+        for k, ft in info["features"].items():
+            if ft.get("dtype") == "video":
+                stats_json[k] = IMAGENET
+        print(f"  source stats.json missing — using ImageNet for camera keys")
     (args.dst / "meta" / "stats.json").write_text(
         json.dumps(stats_json, indent=2))
     print(f"  wrote meta/stats.json ({len(stats_json)} feature keys)")
