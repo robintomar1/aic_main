@@ -9,7 +9,6 @@ COPY aic_example_policies /ws_aic/src/aic/aic_example_policies
 COPY aic_model /ws_aic/src/aic/aic_model
 COPY aic_interfaces /ws_aic/src/aic/aic_interfaces
 COPY aic_utils /ws_aic/src/aic/aic_utils
-COPY my_policy /ws_aic/src/aic/my_policy
 COPY pixi.toml pixi.lock /ws_aic/src/aic/
 COPY pixi_env_setup.sh /ws_aic/src/aic/
 
