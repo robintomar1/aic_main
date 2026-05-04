@@ -279,9 +279,18 @@ class RunACT(Policy):
 
         start_t = self.time_now()
         ticks = 0
+        none_obs_count = 0
+        # Per-tick action logging at LOG_EVERY_N is verbose but essential
+        # for diagnosing "robot stuck" — without it we can't tell whether
+        # the model is outputting the same action, get_observation is
+        # returning None, or the loop isn't running at all.
+        LOG_EVERY_N = 10  # 0.5 s at 20 Hz
+        last_action: np.ndarray | None = None
+        max_action_delta = 0.0
         while (self.time_now() - start_t).nanoseconds / 1e9 < self.timeout_s:
             obs_msg = get_observation()
             if obs_msg is None:
+                none_obs_count += 1
                 self.sleep_for(self.loop_period_s)
                 continue
 
@@ -291,15 +300,37 @@ class RunACT(Policy):
                 action = self.policy.select_action(obs)
             action = self.postprocessor(action)
 
-            # Postprocessor returns the action tensor directly (we wired
-            # transition_to_policy_action above) on cpu, shape [1, 7].
             a = action[0].numpy()
             pose = _action_to_pose(a)
             self.set_pose_target(move_robot, pose, frame_id="base_link")
+
+            # Track action magnitude vs current TCP — if the action == TCP
+            # the model is commanding "stay put". If action moves a lot but
+            # the arm doesn't, controller/admittance is rejecting it.
+            tcp = obs_msg.controller_state.tcp_pose.position
+            tcp_pred_dist = float(np.linalg.norm(
+                np.array([a[0], a[1], a[2]]) - np.array([tcp.x, tcp.y, tcp.z])
+            ))
+            if last_action is not None:
+                d = float(np.linalg.norm(a - last_action))
+                max_action_delta = max(max_action_delta, d)
+            last_action = a
+
+            if ticks % LOG_EVERY_N == 0:
+                self.get_logger().info(
+                    f"tick={ticks:4d} "
+                    f"tcp=({tcp.x:.3f},{tcp.y:.3f},{tcp.z:.3f}) "
+                    f"pred=({a[0]:.3f},{a[1]:.3f},{a[2]:.3f}) "
+                    f"||pred-tcp||={tcp_pred_dist*1000:.1f}mm "
+                    f"max_action_step_delta={max_action_delta:.4f}"
+                )
 
             send_feedback("running")
             ticks += 1
             self.sleep_for(self.loop_period_s)
 
-        self.get_logger().info(f"RunACT.insert_cable: exit after {ticks} ticks")
+        self.get_logger().info(
+            f"RunACT.insert_cable: exit after {ticks} ticks "
+            f"(none_obs={none_obs_count}, max_action_step_delta={max_action_delta:.4f})"
+        )
         return True
