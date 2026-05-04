@@ -147,10 +147,10 @@ def test_quaternion_normalization():
     o = pose.orientation
     norm = (o.x ** 2 + o.y ** 2 + o.z ** 2 + o.w ** 2) ** 0.5
     assert abs(norm - 1.0) < 1e-5, f"quaternion not unit: norm={norm}"
-    # position passes through untouched
-    assert pose.position.x == 0.1
-    assert pose.position.y == 0.2
-    assert pose.position.z == 0.3
+    # position passes through untouched (float32 → float roundoff: ≈, not ==)
+    assert abs(pose.position.x - 0.1) < 1e-6
+    assert abs(pose.position.y - 0.2) < 1e-6
+    assert abs(pose.position.z - 0.3) < 1e-6
     print("  PASS test_quaternion_normalization")
 
 
