@@ -27,11 +27,15 @@ Run (inside the dev container at ~/ws_aic/src/aic):
     # to resume from <output-root>/<name>/ when an existing checkpoint exists:
     pixi run python my_policy/scripts/train_act.py --name v9_act_v1 --resume
 
-If you OOM at the default batch=8, drop to 4. The 1152×1024 cams are
-fed at native resolution to ResNet18 — that's ~6 GB activations per
-batch sample × 3 cams. 48 GB VRAM should handle batch=8 comfortably,
-but the ACT transformer's attention is O(seq²) over the chunk so 100-
-step chunks aren't free either.
+Dataset (verified from meta/info.json on 2026-05-04):
+  - 426 episodes / 198,766 frames @ 20 Hz (340 train / 86 val)
+  - observation.state = float32[44], action = float32[7]
+  - 3 cameras (left/center/right), each 256H×288W×3 (already downscaled
+    by the recorder/build pipeline; NOT native sensor resolution)
+
+ResNet18 over 288×256 is light — batch=8 leaves significant VRAM
+headroom on a 48 GB card. The ACT transformer's attention is O(seq²)
+over chunk_size=100 but at this image size that's not the bottleneck.
 """
 from __future__ import annotations
 
