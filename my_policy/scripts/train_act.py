@@ -171,12 +171,18 @@ def main() -> int:
                    help="ACT lookahead horizon (frames @ 20 Hz). Default 100 = 5 s.")
     p.add_argument("--n-action-steps", type=int, default=8,
                    help="Steps to execute before re-querying the policy. Default 8 = 0.4 s.")
+    p.add_argument("--train-episodes-file", type=Path, default=None,
+                   help="Override train episode-index list. Defaults to "
+                        "<dataset-root>/train_episodes.json. Use this for "
+                        "task-filtered subsets produced by "
+                        "make_task_filtered_splits.py.")
     args = p.parse_args()
 
-    train_episodes_path = args.dataset_root / "train_episodes.json"
+    train_episodes_path = args.train_episodes_file \
+        or (args.dataset_root / "train_episodes.json")
     if not train_episodes_path.exists():
         print(f"error: missing {train_episodes_path}; run merge_act_datasets.py "
-              f"first to populate the train/val split.", file=sys.stderr)
+              f"first or pass --train-episodes-file.", file=sys.stderr)
         return 1
     train_episodes: list[int] = json.loads(train_episodes_path.read_text())
     eps_arg = "[" + ",".join(str(e) for e in train_episodes) + "]"
@@ -244,7 +250,7 @@ def main() -> int:
     print(f"=== v9-act training run: {args.name} ===")
     print(f"dataset_root  : {args.dataset_root}")
     print(f"output_dir    : {output_dir}")
-    print(f"train episodes: {len(train_episodes)} (from train_episodes.json)")
+    print(f"train episodes: {len(train_episodes)} (from {train_episodes_path.name})")
     print(f"steps         : {args.steps}")
     print(f"batch_size    : {args.batch_size}  (num_workers={args.num_workers})")
     print(f"chunk_size    : {args.chunk_size}  (n_action_steps={args.n_action_steps})")
