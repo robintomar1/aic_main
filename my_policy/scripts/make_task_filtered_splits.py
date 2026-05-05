@@ -52,6 +52,12 @@ def main() -> int:
                    help="Defaults to dataset root.")
     p.add_argument("--tag", type=str, default=None,
                    help="Prefix for output filenames (default: derived from filter).")
+    p.add_argument("--use-all", action="store_true",
+                   help="Ignore the existing train/val split — write a single "
+                        "<tag>_all_episodes.json with every matching episode. "
+                        "Useful when you want to train on the entire matching "
+                        "subset (e.g. SC-only, where the dataset is small and "
+                        "lerobot's val block isn't being used anyway).")
     args = p.parse_args()
 
     out_dir = args.out_dir or args.dataset_root
@@ -94,7 +100,17 @@ def main() -> int:
     ep_to_task = seen
     print(f"Built episode->task map for {len(ep_to_task)} episodes")
 
-    # Load original train/val splits and intersect with matching tasks.
+    if args.use_all:
+        all_filtered = sorted(
+            ei for ei, ti in ep_to_task.items() if ti in matching_ti)
+        out_all = out_dir / f"{tag}_all_episodes.json"
+        out_all.write_text(json.dumps(all_filtered))
+        print()
+        print(f"=== all-matching split ===")
+        print(f"  episodes: {len(all_filtered)} -> {out_all}")
+        return 0
+
+    # Default: preserve the existing train/val membership.
     train_path = args.dataset_root / "train_episodes.json"
     val_path = args.dataset_root / "val_episodes.json"
     if not train_path.exists() or not val_path.exists():
