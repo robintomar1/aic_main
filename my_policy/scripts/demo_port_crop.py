@@ -46,12 +46,37 @@ from my_policy.localizer.projection import (  # noqa: E402
     LEROBOT_CAM_TO_SHORT,
     compute_static_tcp_to_camera_optical,
     project_port_to_pixels,
+    _quat_xyzw_to_rotmat,
 )
 from my_policy.port_local.dataset_io import (  # noqa: E402
     SRC_PORT_POSE_SLICE,
     SRC_TCP_POSE_SLICE,
     is_port_pose_valid,
 )
+
+
+def _entrance_position_baselink(
+    port_pose_baselink_7: np.ndarray, port_type: str,
+) -> np.ndarray:
+    """Compute the port-entrance 3D position in base_link by applying the
+    URDF entrance offset to the recorded `<port>_link` pose.
+
+        T_entrance_in_baselink = T_port_in_baselink @ T_entrance_in_port
+        entrance_xyz_baselink  = port_xyz + R_port_in_baselink @ entrance_offset
+
+    The entrance is on the port's local -z axis; for the AIC port frames,
+    that direction points OUT of the board surface (toward the camera /
+    plug-approach side). Project this point — not port_pose itself — for
+    a port pixel that lands at the visible insertion mouth.
+    """
+    if port_type not in PORT_ENTRANCE_OFFSET_M:
+        raise KeyError(f"unknown port_type={port_type!r}; "
+                       f"valid: {list(PORT_ENTRANCE_OFFSET_M)}")
+    offset_local = PORT_ENTRANCE_OFFSET_M[port_type]
+    port_xyz = port_pose_baselink_7[:3].astype(np.float64)
+    port_quat = port_pose_baselink_7[3:7].astype(np.float64)
+    R = _quat_xyzw_to_rotmat(port_quat)
+    return port_xyz + R @ offset_local
 
 
 # Dataset image resolution — verified 2026-05-08 from
@@ -62,6 +87,22 @@ from my_policy.port_local.dataset_io import (  # noqa: E402
 DATASET_W, DATASET_H = 288, 256
 NATIVE_W, NATIVE_H = 1152, 1024
 PIXEL_SCALE = DATASET_W / NATIVE_W  # 0.25; Y scale is identical (square pixels)
+
+# Per-port-type offset from the recorded `<port>_link` frame (= what
+# /tf publishes for the port frame named in the trial Task) to the
+# `<port>_link_entrance` frame (= the visible insertion mouth, where
+# the model should aim). Verified against the URDF (model.sdf for SC
+# Port and NIC Card Mount) and empirically against plug_pose at
+# insertion-success last frames in batch_100_a (plug body at port
+# origin +0.0008m, entrance is offset further along port -z).
+#
+# Source: aic_assets/models/{NIC Card Mount,SC Port}/model.sdf
+#   sfp_port_X_link_entrance: pose relative_to=sfp_port_X_link  (0, 0, -0.0458)
+#   sc_port_base_link_entrance: pose relative_to=sc_port_base_link  (0, 0, -0.01564)
+PORT_ENTRANCE_OFFSET_M = {
+    "sfp": np.array([0.0, 0.0, -0.0458], dtype=np.float64),
+    "sc":  np.array([0.0, 0.0, -0.01564], dtype=np.float64),
+}
 
 CAMERA_KEYS = (
     "observation.images.left_camera",
@@ -137,21 +178,34 @@ def _crop_with_padding(
 def _draw_overlay_on_original(
     img_hwc: np.ndarray, port_xy: tuple[float, float], crop_size: int,
     cam_name: str, depth_m: float,
+    base_xy: tuple[float, float] | None = None,
 ) -> Image.Image:
-    """Render the original 288×256 image with red dot + green crop box."""
+    """Render the original 288×256 image with red dot at port entrance +
+    green crop box. If `base_xy` is provided, also draw a small faded
+    yellow dot at the recorded port-base origin (for direction-of-offset
+    confirmation).
+    """
     H, W = img_hwc.shape[:2]
     pim = Image.fromarray(img_hwc.copy()).convert("RGB")
     draw = ImageDraw.Draw(pim)
+
+    # Optional base marker (small yellow dot, drawn FIRST so the entrance
+    # red dot covers it if they end up overlapping).
+    if base_xy is not None and not (np.isnan(base_xy[0]) or np.isnan(base_xy[1])):
+        bx, by = base_xy
+        draw.ellipse(
+            [bx - 2, by - 2, bx + 2, by + 2],
+            outline=(255, 215, 0), fill=(255, 215, 0),  # gold
+        )
+    # Entrance dot (the canonical "where to insert" pixel).
     cx, cy = port_xy
-    # Port-pixel marker. Color depends on whether the projection landed
-    # inside the visible image (in front of camera + within bounds).
     in_bounds = (depth_m > 0 and 0 <= cx < W and 0 <= cy < H)
     dot_color = DOT_COLOR_OK if in_bounds else DOT_COLOR_OFF
     draw.ellipse(
         [cx - DOT_RADIUS, cy - DOT_RADIUS, cx + DOT_RADIUS, cy + DOT_RADIUS],
         outline=dot_color, fill=dot_color,
     )
-    # Crop box.
+    # Crop box around entrance.
     half = crop_size // 2
     box_x0, box_y0 = cx - half, cy - half
     box_x1, box_y1 = cx + half, cy + half
@@ -214,16 +268,53 @@ def main() -> int:
                    help="Path to a raw recorder batch dir (e.g. "
                         "/root/aic_data/batch_100_a). Must have "
                         "`groundtruth.port_pose` in observation.state.")
+    p.add_argument("--batch-yaml", type=Path, default=None,
+                   help="Trial config YAML (e.g. /root/aic_data/batch_100_a.yaml). "
+                        "Used to look up per-episode port_type so the entrance "
+                        "offset is applied correctly. Default: <raw-batch>.yaml "
+                        "in the parent directory.")
     p.add_argument("--out-dir", type=Path, required=True,
                    help="Where to write the demo PNGs.")
     p.add_argument("--n-frames", type=int, default=12)
     p.add_argument("--crop-size", type=int, default=224,
                    help="Crop side length in DATASET pixels (default 224; "
                         "max usable is min(H,W)=256 since dataset is 256×288).")
+    p.add_argument("--show-base", action="store_true",
+                   help="Also render a faded yellow dot at the recorded "
+                        "port_pose origin (the 'port base'), in addition to "
+                        "the red dot at the entrance. Useful for confirming "
+                        "the entrance offset is in the right direction.")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- 0. Load batch YAML for per-episode port_type lookup ------------
+    # The YAML location convention is <collection-dir>/<batch>.yaml; if the
+    # raw-batch path is /root/aic_data/batch_100_a, the YAML is its sibling
+    # /root/aic_data/batch_100_a.yaml.
+    import yaml as yaml_mod
+    yaml_path = args.batch_yaml or (
+        args.raw_batch.parent / f"{args.raw_batch.name}.yaml"
+    )
+    if not yaml_path.exists():
+        sys.exit(
+            f"missing trial config yaml: {yaml_path}\n"
+            f"(pass --batch-yaml to override)"
+        )
+    cfg = yaml_mod.safe_load(yaml_path.read_text())
+    # Episode index → port_type (positional convention: episode i maps to
+    # trial_(i+1) — verified in project_aic_localizer_versions.md).
+    ep_to_port_type: dict[int, str] = {}
+    for trial_key, trial in cfg["trials"].items():
+        # trial_keys are "trial_1", "trial_2", ... → episode index = N-1.
+        try:
+            ep_idx = int(trial_key.split("_")[1]) - 1
+        except (IndexError, ValueError):
+            continue
+        port_type = trial["tasks"]["task_1"]["port_type"]
+        ep_to_port_type[ep_idx] = port_type
+    print(f"loaded port_type for {len(ep_to_port_type)} trials from {yaml_path.name}")
 
     # --- 1. Load dataset (uses lerobot's video decoder) -----------------
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -289,12 +380,32 @@ def main() -> int:
         tcp = states[gi, SRC_TCP_POSE_SLICE]
         port = states[gi, SRC_PORT_POSE_SLICE]
 
+        port_type = ep_to_port_type.get(ep)
+        if port_type is None:
+            print(f"  WARN: ep {ep} has no trial in YAML; skipping")
+            continue
+
+        # The recorded `groundtruth.port_pose` is the `<port>_link` frame
+        # (where the plug body bottoms out at full insertion). The visible
+        # insertion mouth is the `<port>_link_entrance` frame, offset along
+        # port-local -z. Project the ENTRANCE for a pixel that lands at
+        # the mouth, not the base.
+        entrance_baselink = _entrance_position_baselink(port, port_type)
         pixels_native = project_port_to_pixels(
-            port_baselink=port[:3].astype(np.float64),
+            port_baselink=entrance_baselink,
             tcp_baselink_xyz=tcp[:3].astype(np.float64),
             tcp_baselink_quat_xyzw=tcp[3:7].astype(np.float64),
             static_tcp_to_camera_optical=static_extr,
         )
+        # Optional: project the port-base origin too, for visual comparison.
+        pixels_native_base = None
+        if args.show_base:
+            pixels_native_base = project_port_to_pixels(
+                port_baselink=port[:3].astype(np.float64),
+                tcp_baselink_xyz=tcp[:3].astype(np.float64),
+                tcp_baselink_quat_xyzw=tcp[3:7].astype(np.float64),
+                static_tcp_to_camera_optical=static_extr,
+            )
 
         item = ds[gi]
         rows: list[Image.Image] = []
@@ -330,8 +441,16 @@ def main() -> int:
                 n_in_frame_total += 1
             if clamped:
                 n_clamped_total += 1
+
+            base_xy = None
+            if pixels_native_base is not None:
+                bu_n, bv_n, bdepth = pixels_native_base[short]
+                if not (np.isnan(bu_n) or np.isnan(bv_n)):
+                    base_xy = (bu_n * PIXEL_SCALE, bv_n * PIXEL_SCALE)
+
             orig_panel = _draw_overlay_on_original(
                 img_uint8, (u_ds, v_ds), args.crop_size, short, depth,
+                base_xy=base_xy,
             )
             crop_panel = _draw_crosshair_on_crop(crop, clamped)
             rows.append(_stack_row(orig_panel, crop_panel))
