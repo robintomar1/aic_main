@@ -35,6 +35,7 @@ DEFAULT_BATCHES = [
 SCRIPTS_DIR = Path(__file__).resolve().parent
 BUILDER = SCRIPTS_DIR / "make_port_local_dataset.py"
 MERGER = SCRIPTS_DIR / "merge_act_datasets.py"
+CLEANER = SCRIPTS_DIR / "clean_act_dataset.py"
 
 
 def _run(cmd: list[str], step_name: str) -> None:
@@ -69,6 +70,8 @@ def main() -> int:
         sys.exit(f"missing builder: {BUILDER}")
     if not MERGER.exists():
         sys.exit(f"missing merger: {MERGER}")
+    if not CLEANER.exists():
+        sys.exit(f"missing cleaner: {CLEANER}")
 
     args.out_root.mkdir(parents=True, exist_ok=True)
 
@@ -106,6 +109,7 @@ def main() -> int:
         source_paths.append(out_dir)
 
     # Step 2: merge all 6 into one dataset.
+    merged_dir = args.out_root / args.out_name
     merge_cmd = [
         sys.executable, str(MERGER),
         "--sources", *(str(s) for s in source_paths),
@@ -116,9 +120,26 @@ def main() -> int:
         merge_cmd.append("--force")
     _run(merge_cmd, f"merge {len(source_paths)} sources")
 
+    # Step 3: run clean_act_dataset to write meta/stats.json.
+    # We already applied Fix 1 + Fix 2 per-batch in make_port_local_dataset,
+    # so the cleaner's action mods will be 0. The only useful side effect is
+    # writing the aggregate stats.json that lerobot's `make_dataset` requires.
+    # Without it, training fails with `'NoneType' object is not subscriptable`
+    # in factory.make_dataset.
+    clean_dir = args.out_root / f"{args.out_name}_clean"
+    clean_cmd = [
+        sys.executable, str(CLEANER),
+        "--src", str(merged_dir),
+        "--dst", str(clean_dir),
+    ]
+    if args.force:
+        clean_cmd.append("--force")
+    _run(clean_cmd, f"clean (write stats.json)")
+
     print(f"\n=== DONE ===")
     print(f"  per-batch outputs: {args.out_root}/<batch>_port_local_dataset/")
-    print(f"  merged output:     {args.out_root}/{args.out_name}/")
+    print(f"  merged output:     {merged_dir}/")
+    print(f"  trainable output:  {clean_dir}/  ← USE THIS FOR train_act.py --dataset-root")
     return 0
 
 
