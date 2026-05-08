@@ -155,63 +155,23 @@ def _align_raw_to_portlocal(
     return matched_raw_idx, np.arange(len(pl_eps))
 
 
-def _build_pl_to_raw_episode_map(
-    pl_table, raw_table, raw_state_names: list[str],
-) -> dict[int, int]:
-    """Each port-local episode has one task assignment + a unique
-    `task_index`. Match it back to a raw episode by pulling the raw
-    episode's task assignment from the source table and finding the
-    pairing that matches.
+def _load_source_episode_map(port_local_root: Path) -> dict[int, int]:
+    """Read the new→old episode index mapping written by the builder.
 
-    Cleaner: rely on the `index` column. The source raw table's `index`
-    is dense 0..N-1; the port-local table inherits the original `index`
-    as `index_in_source` if we keep it. But `make_port_local_dataset`
-    overwrites `index`. So we use a different tactic: match by
-    (task_index, position-in-sequence) which is fragile.
-
-    Cleanest reliable signal: the port-local table preserves the
-    original `timestamp` column. Match (timestamp, task_index) → raw
-    row, then group by raw_episode. This is what we do here.
+    LeRobot v3.0 stores per-episode-relative timestamps (each episode's
+    timestamp column starts at 0.0), so timestamp-based alignment is
+    ambiguous — every episode 0 timestamp matches every other episode's
+    start. Instead, the builder writes `source_episode_map.json` recording
+    `{new_ep_str: old_ep_int}` directly. Read it.
     """
-    raw_ts = raw_table["timestamp"].to_numpy().astype(np.float64)
-    raw_eps = raw_table["episode_index"].to_numpy().astype(np.int64)
-    pl_ts = pl_table["timestamp"].to_numpy().astype(np.float64)
-    pl_eps = pl_table["episode_index"].to_numpy().astype(np.int64)
-
-    # For each unique pl episode, take its first frame's timestamp and
-    # find a raw row with the same timestamp. There can be ties if two
-    # raw episodes happen to share a timestamp, but timestamps are
-    # monotone within an episode and reset per episode, so the first
-    # frame's timestamp + a uniqueness-by-task assumption is enough.
-    pl_to_raw: dict[int, int] = {}
-    for new_ep in sorted(np.unique(pl_eps).tolist()):
-        first_pl_idx = int(np.argmax(pl_eps == new_ep))
-        ts0 = float(pl_ts[first_pl_idx])
-        # Find raw rows with this timestamp in any episode.
-        raw_match = np.flatnonzero(np.isclose(raw_ts, ts0, atol=1e-9))
-        if len(raw_match) == 0:
-            raise AssertionError(
-                f"port-local episode {new_ep} first ts={ts0} not found in raw"
-            )
-        # Pick the raw episode that this timestamp falls in. Defensive
-        # against ties: should be exactly one because raw timestamps are
-        # rate-stamped and unique per episode start.
-        candidate_old_eps = np.unique(raw_eps[raw_match]).tolist()
-        if len(candidate_old_eps) > 1:
-            # Tie-break by checking frame_index==0 in the raw table.
-            raw_frames = raw_table["frame_index"].to_numpy().astype(np.int64)
-            tied_first = [
-                int(raw_eps[g]) for g in raw_match if raw_frames[g] == 0
-            ]
-            if len(tied_first) != 1:
-                raise AssertionError(
-                    f"could not disambiguate raw episode for pl ep {new_ep}; "
-                    f"candidates={candidate_old_eps}"
-                )
-            pl_to_raw[new_ep] = tied_first[0]
-        else:
-            pl_to_raw[new_ep] = int(candidate_old_eps[0])
-    return pl_to_raw
+    map_path = port_local_root / "source_episode_map.json"
+    if not map_path.exists():
+        raise AssertionError(
+            f"missing {map_path} — builder didn't write the sidecar. "
+            f"Rebuild the port-local dataset with the current builder."
+        )
+    raw_map = json.loads(map_path.read_text())
+    return {int(k): int(v) for k, v in raw_map.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -219,12 +179,12 @@ def _build_pl_to_raw_episode_map(
 # ---------------------------------------------------------------------------
 
 
-def test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names):
+def test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names, port_local_root):
     """Killer test — round-trip every action via recorded port_pose."""
     raw_states = _state_arr(raw_table)
     raw_actions = _action_arr(raw_table)
     pl_actions = _action_arr(pl_table)
-    pl_to_raw = _build_pl_to_raw_episode_map(pl_table, raw_table, raw_state_names)
+    pl_to_raw = _load_source_episode_map(port_local_root)
     matched_raw_idx, _ = _align_raw_to_portlocal(raw_table, pl_table, pl_to_raw)
 
     pos_errs: list[float] = []
@@ -414,7 +374,7 @@ def main() -> int:
 
     tests = [
         ("6  Oracle action consistency (killer)",
-         lambda: test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names)),
+         lambda: test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names, args.port_local)),
         ("7  Distribution collapse",
          lambda: test_7_distribution_collapse_runner(
              raw_table, pl_table, raw_state_names, pl_state_names)),

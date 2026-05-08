@@ -589,6 +589,18 @@ def main() -> int:
     print(f"  train/val split: {len(train_eps)}/{len(val_eps)} "
           f"(seed={args.split_seed})")
 
+    # --- 11. Source-episode map (sidecar for downstream validation) ----
+    # Maps new dense episode index → original raw episode index. The Tier 2
+    # validator uses this to align port-local frames back to their raw source
+    # for the killer round-trip check. Without this, alignment by timestamp
+    # fails because LeRobot v3.0 timestamps are per-episode-relative (reset
+    # to 0.0 at each episode start, so all episode-0 frames collide).
+    source_map = {str(new_ep): int(old_ep) for new_ep, old_ep in enumerate(old_eps)}
+    (out_root / "source_episode_map.json").write_text(
+        json.dumps(source_map, indent=2)
+    )
+    print(f"  wrote source_episode_map.json ({len(source_map)} entries)")
+
     print(f"\nDone: {out_root}")
     return 0
 
