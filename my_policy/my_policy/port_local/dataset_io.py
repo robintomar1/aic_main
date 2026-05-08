@@ -34,30 +34,30 @@ EXPECTED_PORT_LOCAL_STATE_DIM = 44
 
 
 def is_port_pose_valid(port_pose_7d: np.ndarray) -> bool:
-    """Sanity-check a recorded `groundtruth.port_pose` (xyz + xyzw).
+    """Sanity-check a recorded `groundtruth.port_pose` (xyz + xyzw, in
+    base_link).
 
-    Memory `project_aic_act_dataset.md` notes batch_500_a recorded corrupt
-    port poses where x≤0 and qw≈0. Valid recordings put the port in front
-    of the robot at ~(0.1..0.3, ±0.4, 1.0..1.2) in base_link with a unit
-    quaternion.
+    Verified on batch_100_a (2026-05-08): real port poses sit at roughly
+    x ∈ [-0.36, -0.23], y ∈ [0.05, 0.34], z ∈ [0.01, 0.13] in base_link.
+    The quaternion is a ~180° rotation around y (qy ≈ -1, qw ≈ 0) — the
+    port frame z-axis points INTO the board, opposite the robot's base
+    z-axis. Earlier guidance that "qw≈0 = corrupt" was wrong; qw≈0 is
+    normal here.
+
+    The actual corruption signature seen in batch_500_a (per memory
+    `project_aic_act_dataset.md`) is `_lookup_pose` returning all-zeros
+    when the TF lookup fails — `(0,0,0, 0,0,0,0)` — which has zero
+    quaternion norm. The unit-norm check below catches that without
+    imposing unverified position bounds.
 
     Returns True iff:
       * all values finite
-      * quaternion within 5% of unit norm
-      * x in (-0.1, 0.5)   — port is forward of robot base
-      * z in (0.9, 1.4)    — port is at table height
-
-    The bounds are deliberately wide so we drop only obvious garbage,
-    not legitimate edge configurations.
+      * quaternion has approximately unit norm (the only signal of a
+        successful TF lookup; failed lookups produce all-zero records)
     """
     if not np.all(np.isfinite(port_pose_7d)):
         return False
     qnorm = float(np.linalg.norm(port_pose_7d[3:7]))
     if not (0.95 < qnorm < 1.05):
-        return False
-    x, _, z = port_pose_7d[0], port_pose_7d[1], port_pose_7d[2]
-    if not (-0.1 < x < 0.5):
-        return False
-    if not (0.9 < z < 1.4):
         return False
     return True
