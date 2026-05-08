@@ -178,26 +178,28 @@ def _crop_with_padding(
 def _draw_overlay_on_original(
     img_hwc: np.ndarray, port_xy: tuple[float, float], crop_size: int,
     cam_name: str, depth_m: float,
+    task_label: str | None = None,
     base_xy: tuple[float, float] | None = None,
 ) -> Image.Image:
     """Render the original 288×256 image with red dot at port entrance +
     green crop box. If `base_xy` is provided, also draw a small faded
-    yellow dot at the recorded port-base origin (for direction-of-offset
-    confirmation).
+    yellow dot at the recorded port-base origin. If `task_label` is
+    provided, overlay it in the top-right corner so the viewer knows
+    what port type (and therefore what entrance offset) was applied.
     """
     H, W = img_hwc.shape[:2]
     pim = Image.fromarray(img_hwc.copy()).convert("RGB")
     draw = ImageDraw.Draw(pim)
 
-    # Optional base marker (small yellow dot, drawn FIRST so the entrance
-    # red dot covers it if they end up overlapping).
+    # Optional base marker (small gold dot, drawn FIRST so the entrance
+    # red dot covers it if they overlap).
     if base_xy is not None and not (np.isnan(base_xy[0]) or np.isnan(base_xy[1])):
         bx, by = base_xy
         draw.ellipse(
             [bx - 2, by - 2, bx + 2, by + 2],
             outline=(255, 215, 0), fill=(255, 215, 0),  # gold
         )
-    # Entrance dot (the canonical "where to insert" pixel).
+    # Entrance dot.
     cx, cy = port_xy
     in_bounds = (depth_m > 0 and 0 <= cx < W and 0 <= cy < H)
     dot_color = DOT_COLOR_OK if in_bounds else DOT_COLOR_OFF
@@ -216,8 +218,22 @@ def _draw_overlay_on_original(
     )
     draw.rectangle([box_x0, box_y0, box_x1, box_y1],
                    outline=box_color, width=BOX_LINE_WIDTH)
+    # Top-left: per-camera info.
     draw.text((4, 4), f"{cam_name}  z={depth_m:.2f}m  uv=({cx:.0f},{cy:.0f})",
               fill=TEXT_COLOR)
+    # Top-right: task label (port_type / port_name / target_module). Drawn
+    # without measuring text width — PIL doesn't ship a default font that
+    # supports textbbox reliably across versions; we just left-anchor at a
+    # right-side offset that fits typical labels (e.g. "sfp / sfp_port_0
+    # @ nic_card_mount_3").
+    if task_label is not None:
+        # Label background strip for legibility (most original frames are
+        # bright; without a backdrop the white text disappears on board
+        # surfaces).
+        label_x = 4
+        label_y = H - 22
+        draw.rectangle([0, label_y - 2, W, label_y + 18], fill=(0, 0, 0))
+        draw.text((label_x, label_y), task_label, fill=(255, 255, 0))
     return pim
 
 
@@ -303,18 +319,22 @@ def main() -> int:
             f"(pass --batch-yaml to override)"
         )
     cfg = yaml_mod.safe_load(yaml_path.read_text())
-    # Episode index → port_type (positional convention: episode i maps to
-    # trial_(i+1) — verified in project_aic_localizer_versions.md).
-    ep_to_port_type: dict[int, str] = {}
+    # Episode index → full task tuple (positional convention: episode i
+    # maps to trial_(i+1) — verified in project_aic_localizer_versions.md).
+    ep_to_task: dict[int, dict] = {}
     for trial_key, trial in cfg["trials"].items():
-        # trial_keys are "trial_1", "trial_2", ... → episode index = N-1.
         try:
             ep_idx = int(trial_key.split("_")[1]) - 1
         except (IndexError, ValueError):
             continue
-        port_type = trial["tasks"]["task_1"]["port_type"]
-        ep_to_port_type[ep_idx] = port_type
-    print(f"loaded port_type for {len(ep_to_port_type)} trials from {yaml_path.name}")
+        task = trial["tasks"]["task_1"]
+        ep_to_task[ep_idx] = {
+            "port_type": task["port_type"],
+            "port_name": task["port_name"],
+            "target_module_name": task["target_module_name"],
+            "trial_key": trial_key,
+        }
+    print(f"loaded task info for {len(ep_to_task)} trials from {yaml_path.name}")
 
     # --- 1. Load dataset (uses lerobot's video decoder) -----------------
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -380,10 +400,15 @@ def main() -> int:
         tcp = states[gi, SRC_TCP_POSE_SLICE]
         port = states[gi, SRC_PORT_POSE_SLICE]
 
-        port_type = ep_to_port_type.get(ep)
-        if port_type is None:
+        task = ep_to_task.get(ep)
+        if task is None:
             print(f"  WARN: ep {ep} has no trial in YAML; skipping")
             continue
+        port_type = task["port_type"]
+        task_label = (
+            f"{task['port_type'].upper()} | {task['port_name']} @ "
+            f"{task['target_module_name']} | ep{ep:03d} f{f_off:04d}"
+        )
 
         # The recorded `groundtruth.port_pose` is the `<port>_link` frame
         # (where the plug body bottoms out at full insertion). The visible
@@ -448,8 +473,12 @@ def main() -> int:
                 if not (np.isnan(bu_n) or np.isnan(bv_n)):
                     base_xy = (bu_n * PIXEL_SCALE, bv_n * PIXEL_SCALE)
 
+            # Only show the task label on the FIRST camera row to avoid
+            # duplicating identical text across left/center/right.
+            label_for_this_row = task_label if short == "left" else None
             orig_panel = _draw_overlay_on_original(
                 img_uint8, (u_ds, v_ds), args.crop_size, short, depth,
+                task_label=label_for_this_row,
                 base_xy=base_xy,
             )
             crop_panel = _draw_crosshair_on_crop(crop, clamped)
