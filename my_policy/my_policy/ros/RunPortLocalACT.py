@@ -439,8 +439,29 @@ class RunPortLocalACT(Policy):
             return self._predict_port_pose_via_localizer(task, get_observation)
         return self._lookup_port_pose_via_tf(task)
 
+    @staticmethod
+    def _compose_port_tf_frame(task: Task) -> str:
+        """Build the fully-qualified TF frame name for the trial's target
+        port, matching the convention `collect_lerobot.py` uses to record
+        `groundtruth.port_pose`:
+
+            f"task_board/{target_module_name}/{port_name}_link"
+
+        Verified against `task_board.urdf.xacro` — top-level model name is
+        "task_board" (from `<robot name="task_board">`), each port instance
+        is a nested Gazebo model with the prefix arg as its name (e.g.
+        `<xacro:nic_card_mount prefix="nic_card_mount_0" .../>` →
+        instance `nic_card_mount_0`), and the link inside that instance
+        is named `<port_name>_link` (e.g. `sfp_port_1_link`).
+
+        Examples:
+          (nic_card_mount_4, sfp_port_1) → task_board/nic_card_mount_4/sfp_port_1_link
+          (sc_port_0, sc_port_base)      → task_board/sc_port_0/sc_port_base_link
+        """
+        return f"task_board/{task.target_module_name}/{task.port_name}_link"
+
     def _lookup_port_pose_via_tf(self, task: Task) -> np.ndarray | None:
-        port_frame = task.port_name
+        port_frame = self._compose_port_tf_frame(task)
         if not self._wait_for_tf("base_link", port_frame):
             return None
         try:
