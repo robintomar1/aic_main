@@ -179,13 +179,62 @@ def _load_source_episode_map(port_local_root: Path) -> dict[int, int]:
 # ---------------------------------------------------------------------------
 
 
+def _apply_fix1_stale_leading(
+    raw_states: np.ndarray, raw_actions: np.ndarray, raw_eps: np.ndarray
+) -> np.ndarray:
+    """Mirror of `make_port_local_dataset._transform_state_and_action`'s
+    Fix 1 (stale-leading-frame patching). Returns a copy of raw_actions
+    with the same patches the builder applies. Used by Test 6 so the
+    round-trip is compared against post-Fix-1 actions (what's actually
+    in the dataset) rather than the original stale data the patch
+    overwrites.
+    """
+    STALE_POS_THRESHOLD_M = 0.05
+    fixed = raw_actions.copy()
+    for ep in sorted(np.unique(raw_eps).tolist()):
+        ep_idx = np.where(raw_eps == ep)[0]
+        if len(ep_idx) == 0:
+            continue
+        s = int(ep_idx[0])
+        e = int(ep_idx[-1]) + 1
+        first_good = None
+        for j in range(min(20, e - s)):
+            a_pos = fixed[s + j, :3]
+            st_pos = raw_states[s + j, :3]
+            if (np.linalg.norm(a_pos) > 1e-3
+                    and np.linalg.norm(a_pos - st_pos) <= STALE_POS_THRESHOLD_M):
+                first_good = j
+                break
+        if first_good is None or first_good == 0:
+            continue
+        fixed[s:s + first_good] = fixed[s + first_good].copy()
+    return fixed
+
+
 def test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names, port_local_root):
-    """Killer test — round-trip every action via recorded port_pose."""
+    """Killer test — round-trip every port-local action back to base_link
+    via the recorded port_pose and confirm it matches the action the
+    builder actually wrote.
+
+    Subtlety: the builder applies Fix 1 (stale-leading patch, ~0.1% of
+    frames) and Fix 2 (quat sign canonicalization, ~0.2% post-transform)
+    before writing. Comparing round-trip to *original* raw_actions would
+    fail on Fix-1 frames by construction (they were deliberately
+    overwritten). So we apply Fix 1 to the raw actions in this test
+    too, then compare. Fix 2 is sign-only, and our `_quat_residual_batched`
+    is sign-invariant via `|dot|`, so we don't need to explicitly mirror
+    Fix 2 here — q and -q give the same residual.
+    """
     raw_states = _state_arr(raw_table)
     raw_actions = _action_arr(raw_table)
+    raw_eps = raw_table["episode_index"].to_numpy().astype(np.int64)
     pl_actions = _action_arr(pl_table)
     pl_to_raw = _load_source_episode_map(port_local_root)
     matched_raw_idx, _ = _align_raw_to_portlocal(raw_table, pl_table, pl_to_raw)
+
+    # Apply the same Fix 1 the builder applies, so the comparison is
+    # against post-fix actions (what's actually written).
+    fix1_actions = _apply_fix1_stale_leading(raw_states, raw_actions, raw_eps)
 
     pos_errs: list[float] = []
     rot_residuals: list[float] = []
@@ -197,16 +246,15 @@ def test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names, port_
             raise AssertionError(
                 f"matched raw frame {ri} has invalid port_pose; alignment is wrong"
             )
-        # Reconstruct base-link action from port-local.
         recon = transform_pose_back_to_baselink(
             pl_actions[i].astype(np.float64),
             port_pose.astype(np.float64),
         )
-        original = raw_actions[ri].astype(np.float64)
-        pos_errs.append(float(np.linalg.norm(recon[:3] - original[:3])))
+        target = fix1_actions[ri].astype(np.float64)
+        pos_errs.append(float(np.linalg.norm(recon[:3] - target[:3])))
         rot_residuals.append(
             float(_quat_residual_batched(
-                recon[3:7][None, :], original[3:7][None, :]
+                recon[3:7][None, :], target[3:7][None, :]
             )[0])
         )
     pos_errs = np.array(pos_errs)
