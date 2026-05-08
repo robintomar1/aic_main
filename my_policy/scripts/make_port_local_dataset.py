@@ -63,6 +63,7 @@ from my_policy.port_local.dataset_io import (  # noqa: E402
     SRC_TCP_VEL_SLICE,
     SRC_WRENCH_SLICE,
     EXPECTED_RAW_STATE_DIM,
+    is_action_valid,
     is_port_pose_valid,
 )
 from my_policy.port_local.transforms import (  # noqa: E402
@@ -186,11 +187,13 @@ def _transform_state_and_action(
     Groundtruth slots [32..45] and meta [46] are left untouched
     (they get dropped at channel-selection time).
 
-    `is_valid=False` if the port pose itself is corrupt; caller should
+    `is_valid=False` if the port pose OR action is corrupt; caller should
     skip the frame.
     """
     port_pose = state_47[SRC_PORT_POSE_SLICE]
     if not is_port_pose_valid(port_pose):
+        return state_47, action_7, False
+    if not is_action_valid(action_7):
         return state_47, action_7, False
 
     inp = FrameInputs(
@@ -301,23 +304,110 @@ def main() -> int:
     )  # (n_frames, 7)
 
     n_frames = src_data.num_rows
+
+    # --- Apply Fix 1 from clean_act_dataset.py: patch stale leading action
+    # frames per episode. The recorder occasionally captures the previous
+    # trial's /aic_controller/pose_commands at the very start of a new
+    # episode, before the new policy has published. Detection: action.position
+    # disagrees with state.tcp_pose.position by >50 mm. Fix: overwrite
+    # leading bad frames with the first "good" frame's action.
+    # Per memory `project_aic_act_dataset.md`, ~0.06% of frames are affected.
+    # This fix MUST run before transform_frame, otherwise the port-local
+    # action inherits the stale-frame error.
+    STALE_POS_THRESHOLD_M = 0.05
+    n_stale_frames = 0
+    n_stale_episodes = 0
+    for ep in sorted(np.unique(eps_col).tolist()):
+        ep_global_idx = np.where(eps_col == ep)[0]
+        if len(ep_global_idx) == 0:
+            continue
+        s = int(ep_global_idx[0])
+        e = int(ep_global_idx[-1]) + 1
+        first_good = None
+        for j in range(min(20, e - s)):
+            a_pos = raw_actions[s + j, :3]
+            st_pos = raw_states[s + j, :3]
+            if (np.linalg.norm(a_pos) > 1e-3
+                    and np.linalg.norm(a_pos - st_pos) <= STALE_POS_THRESHOLD_M):
+                first_good = j
+                break
+        if first_good is None or first_good == 0:
+            continue
+        replacement = raw_actions[s + first_good].copy()
+        raw_actions[s:s + first_good] = replacement
+        n_stale_frames += first_good
+        n_stale_episodes += 1
+    if n_stale_frames:
+        print(f"  Fix 1 (stale-leading): patched {n_stale_frames} frames "
+              f"in {n_stale_episodes} episodes")
+
     transformed_states = np.zeros_like(raw_states)
     transformed_actions = np.zeros_like(raw_actions)
     transform_valid = np.zeros(n_frames, dtype=bool)
 
     n_invalid_port = 0
+    n_invalid_action = 0
     for i in range(n_frames):
+        # Inline the validity checks here too so we can attribute the failure mode.
+        port_ok = is_port_pose_valid(raw_states[i][SRC_PORT_POSE_SLICE])
+        action_ok = is_action_valid(raw_actions[i])
+        if not port_ok:
+            n_invalid_port += 1
+            transformed_states[i] = raw_states[i]
+            transformed_actions[i] = raw_actions[i]
+            transform_valid[i] = False
+            continue
+        if not action_ok:
+            n_invalid_action += 1
+            transformed_states[i] = raw_states[i]
+            transformed_actions[i] = raw_actions[i]
+            transform_valid[i] = False
+            continue
         new_state, new_action, ok = _transform_state_and_action(
             raw_states[i], raw_actions[i]
         )
         transformed_states[i] = new_state
         transformed_actions[i] = new_action
         transform_valid[i] = ok
-        if not ok:
-            n_invalid_port += 1
-    if n_invalid_port:
-        print(f"  WARNING: {n_invalid_port}/{n_frames} frames had invalid "
-              f"port_pose; those frames will be dropped.")
+    if n_invalid_port or n_invalid_action:
+        print(f"  WARNING: dropping invalid frames — "
+              f"{n_invalid_port} bad port_pose, "
+              f"{n_invalid_action} bad action (typically pre-first-command "
+              f"frames at episode 0)")
+
+    # --- Apply Fix 2 from clean_act_dataset.py: action quaternion sign
+    # canonicalization. Per-frame: if dot(action_quat_port, state_quat_port) < 0,
+    # negate the action quat. q and -q are the same rotation, so this doesn't
+    # change the rotation; it only forces a consistent hemisphere convention
+    # across the dataset. Without this, the model can't predict hemisphere from
+    # the input (no signal) — caused the v1 "wrist locked" failure.
+    #
+    # Note: my rotmat_to_quat_xyzw picks w>=0 for both state and action, which
+    # implicitly canonicalizes most frames (raw 45% mismatch → ~0.2% post-
+    # transform). But w-positive alone doesn't imply same hemisphere for
+    # *pairs* of quats (e.g. qx=+0.9,w=+0.4 vs qx=-0.9,w=+0.4 both have w>=0
+    # but dot<0). Empirically validated 2026-05-08: ~68/37178 frames in
+    # batch_100_a are still dot<0 after transform; this fix takes them to 0.
+    valid_mask_for_quat_fix = transform_valid
+    if valid_mask_for_quat_fix.any():
+        s_q = transformed_states[valid_mask_for_quat_fix, 3:7]
+        a_q = transformed_actions[valid_mask_for_quat_fix, 3:7]
+        dots = (s_q * a_q).sum(axis=1)
+        flip_mask_local = dots < 0
+        n_canonicalized = int(flip_mask_local.sum())
+        if n_canonicalized:
+            global_idx = np.where(valid_mask_for_quat_fix)[0]
+            flip_global = global_idx[flip_mask_local]
+            transformed_actions[flip_global, 3:7] = -transformed_actions[flip_global, 3:7]
+            print(f"  Fix 2 (quat-sign): canonicalized {n_canonicalized} action quats "
+                  f"({100*n_canonicalized/int(valid_mask_for_quat_fix.sum()):.2f}% of valid frames)")
+        # Sanity: post-fix, no negative dots remain.
+        new_dots = (transformed_states[valid_mask_for_quat_fix, 3:7]
+                    * transformed_actions[valid_mask_for_quat_fix, 3:7]).sum(axis=1)
+        n_still_bad = int((new_dots < -1e-9).sum())
+        assert n_still_bad == 0, (
+            f"Fix 2 sanity failed: {n_still_bad} frames still have negative dot"
+        )
 
     # --- 4. Channel selection + task-vec append ----------------------
     n_kept_channels = sum(len(g) for _, g in KEEP_CHANNEL_GROUPS)

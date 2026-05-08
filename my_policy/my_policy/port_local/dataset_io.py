@@ -37,27 +37,54 @@ def is_port_pose_valid(port_pose_7d: np.ndarray) -> bool:
     """Sanity-check a recorded `groundtruth.port_pose` (xyz + xyzw, in
     base_link).
 
-    Verified on batch_100_a (2026-05-08): real port poses sit at roughly
-    x ∈ [-0.36, -0.23], y ∈ [0.05, 0.34], z ∈ [0.01, 0.13] in base_link.
+    Verified across all 6 oracle batches (2026-05-08, 258k frames):
+      * batch_100_a..e: 100% pass (172,140 frames)
+      * batch_500_a:    99.99% pass (86,096/86,102 — 6 are all-zero
+                        TF-lookup failures, correctly rejected)
+      * x ∈ [-0.42, -0.16], y ∈ [+0.00, +0.42], z ∈ [+0.01, +0.13]
+        across ALL valid frames in all 6 batches.
+
     The quaternion is a ~180° rotation around y (qy ≈ -1, qw ≈ 0) — the
     port frame z-axis points INTO the board, opposite the robot's base
-    z-axis. Earlier guidance that "qw≈0 = corrupt" was wrong; qw≈0 is
-    normal here.
+    z-axis. **Earlier guidance from memory `project_aic_act_dataset.md`
+    that "qw≈0 = corrupt batch_500_a" was wrong — qw≈0 is the NORMAL
+    state.** That false signal led to batch_500_a being unnecessarily
+    excluded from the merged_clean dataset.
 
-    The actual corruption signature seen in batch_500_a (per memory
-    `project_aic_act_dataset.md`) is `_lookup_pose` returning all-zeros
-    when the TF lookup fails — `(0,0,0, 0,0,0,0)` — which has zero
-    quaternion norm. The unit-norm check below catches that without
+    The real corruption signature is `_lookup_pose` returning all-zeros
+    when the TF lookup fails momentarily — `(0,0,0, 0,0,0,0)` — which
+    has zero quaternion norm. The unit-norm check catches that without
     imposing unverified position bounds.
 
     Returns True iff:
       * all values finite
-      * quaternion has approximately unit norm (the only signal of a
-        successful TF lookup; failed lookups produce all-zero records)
+      * quaternion has approximately unit norm (the only reliable signal
+        of a successful TF lookup)
     """
     if not np.all(np.isfinite(port_pose_7d)):
         return False
     qnorm = float(np.linalg.norm(port_pose_7d[3:7]))
+    if not (0.95 < qnorm < 1.05):
+        return False
+    return True
+
+
+def is_action_valid(action_7d: np.ndarray) -> bool:
+    """Sanity-check a recorded action (xyz + xyzw pose target).
+
+    Verified on batch_100_a (2026-05-08): 3/37178 frames have all-zero
+    actions, all at frame_index 0..2 of episode 0 (before the policy
+    publishes its first /aic_controller/pose_commands message — the
+    recorder writes whatever it has, which is the default-zero Pose).
+    Other batches likely have the same pattern. Drop these frames.
+
+    Returns True iff:
+      * all values finite
+      * quaternion has approximately unit norm
+    """
+    if not np.all(np.isfinite(action_7d)):
+        return False
+    qnorm = float(np.linalg.norm(action_7d[3:7]))
     if not (0.95 < qnorm < 1.05):
         return False
     return True
