@@ -73,6 +73,7 @@ from my_policy.port_local.transforms import (  # noqa: E402
 from my_policy.port_local.dataset_io import (  # noqa: E402
     SRC_PORT_POSE_SLICE,
     is_port_pose_valid,
+    patch_stale_leading_actions,
 )
 
 
@@ -179,38 +180,6 @@ def _load_source_episode_map(port_local_root: Path) -> dict[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def _apply_fix1_stale_leading(
-    raw_states: np.ndarray, raw_actions: np.ndarray, raw_eps: np.ndarray
-) -> np.ndarray:
-    """Mirror of `make_port_local_dataset._transform_state_and_action`'s
-    Fix 1 (stale-leading-frame patching). Returns a copy of raw_actions
-    with the same patches the builder applies. Used by Test 6 so the
-    round-trip is compared against post-Fix-1 actions (what's actually
-    in the dataset) rather than the original stale data the patch
-    overwrites.
-    """
-    STALE_POS_THRESHOLD_M = 0.05
-    fixed = raw_actions.copy()
-    for ep in sorted(np.unique(raw_eps).tolist()):
-        ep_idx = np.where(raw_eps == ep)[0]
-        if len(ep_idx) == 0:
-            continue
-        s = int(ep_idx[0])
-        e = int(ep_idx[-1]) + 1
-        first_good = None
-        for j in range(min(20, e - s)):
-            a_pos = fixed[s + j, :3]
-            st_pos = raw_states[s + j, :3]
-            if (np.linalg.norm(a_pos) > 1e-3
-                    and np.linalg.norm(a_pos - st_pos) <= STALE_POS_THRESHOLD_M):
-                first_good = j
-                break
-        if first_good is None or first_good == 0:
-            continue
-        fixed[s:s + first_good] = fixed[s + first_good].copy()
-    return fixed
-
-
 def test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names, port_local_root):
     """Killer test — round-trip every port-local action back to base_link
     via the recorded port_pose and confirm it matches the action the
@@ -232,9 +201,13 @@ def test_6_oracle_action_consistency(raw_table, pl_table, raw_state_names, port_
     pl_to_raw = _load_source_episode_map(port_local_root)
     matched_raw_idx, _ = _align_raw_to_portlocal(raw_table, pl_table, pl_to_raw)
 
-    # Apply the same Fix 1 the builder applies, so the comparison is
-    # against post-fix actions (what's actually written).
-    fix1_actions = _apply_fix1_stale_leading(raw_states, raw_actions, raw_eps)
+    # Apply the same Fix 1 the builder applies (shared implementation in
+    # dataset_io), so the comparison is against post-fix actions (what's
+    # actually written). The shared function is the contract — if the
+    # builder's patch logic ever changes, this test stays in sync.
+    fix1_actions, _n_p, _n_e = patch_stale_leading_actions(
+        raw_states, raw_actions, raw_eps,
+    )
 
     pos_errs: list[float] = []
     rot_residuals: list[float] = []

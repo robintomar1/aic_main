@@ -65,6 +65,7 @@ from my_policy.port_local.dataset_io import (  # noqa: E402
     EXPECTED_RAW_STATE_DIM,
     is_action_valid,
     is_port_pose_valid,
+    patch_stale_leading_actions,
 )
 from my_policy.port_local.transforms import (  # noqa: E402
     FrameInputs,
@@ -306,37 +307,14 @@ def main() -> int:
     n_frames = src_data.num_rows
 
     # --- Apply Fix 1 from clean_act_dataset.py: patch stale leading action
-    # frames per episode. The recorder occasionally captures the previous
-    # trial's /aic_controller/pose_commands at the very start of a new
-    # episode, before the new policy has published. Detection: action.position
-    # disagrees with state.tcp_pose.position by >50 mm. Fix: overwrite
-    # leading bad frames with the first "good" frame's action.
-    # Per memory `project_aic_act_dataset.md`, ~0.06% of frames are affected.
-    # This fix MUST run before transform_frame, otherwise the port-local
-    # action inherits the stale-frame error.
-    STALE_POS_THRESHOLD_M = 0.05
-    n_stale_frames = 0
-    n_stale_episodes = 0
-    for ep in sorted(np.unique(eps_col).tolist()):
-        ep_global_idx = np.where(eps_col == ep)[0]
-        if len(ep_global_idx) == 0:
-            continue
-        s = int(ep_global_idx[0])
-        e = int(ep_global_idx[-1]) + 1
-        first_good = None
-        for j in range(min(20, e - s)):
-            a_pos = raw_actions[s + j, :3]
-            st_pos = raw_states[s + j, :3]
-            if (np.linalg.norm(a_pos) > 1e-3
-                    and np.linalg.norm(a_pos - st_pos) <= STALE_POS_THRESHOLD_M):
-                first_good = j
-                break
-        if first_good is None or first_good == 0:
-            continue
-        replacement = raw_actions[s + first_good].copy()
-        raw_actions[s:s + first_good] = replacement
-        n_stale_frames += first_good
-        n_stale_episodes += 1
+    # frames per episode. Implementation lives in `dataset_io.patch_stale_leading_actions`
+    # so the Tier 2 validator can apply the SAME fix to the same input — that
+    # makes the round-trip target identical to what the builder writes.
+    # MUST run before transform_frame, otherwise the port-local action
+    # inherits the stale-frame error.
+    raw_actions, n_stale_frames, n_stale_episodes = patch_stale_leading_actions(
+        raw_states, raw_actions, eps_col,
+    )
     if n_stale_frames:
         print(f"  Fix 1 (stale-leading): patched {n_stale_frames} frames "
               f"in {n_stale_episodes} episodes")
