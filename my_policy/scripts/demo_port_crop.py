@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from PIL import Image, ImageDraw
 _PACKAGE_PARENT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PACKAGE_PARENT))
 
+from my_policy.localizer.labels import match_episodes_to_trials  # noqa: E402
 from my_policy.localizer.projection import (  # noqa: E402
     LEROBOT_CAM_TO_SHORT,
     compute_static_tcp_to_camera_optical,
@@ -289,6 +291,11 @@ def main() -> int:
                         "Used to look up per-episode port_type so the entrance "
                         "offset is applied correctly. Default: <raw-batch>.yaml "
                         "in the parent directory.")
+    p.add_argument("--summary-json", type=Path, default=None,
+                   help="Recorder's summary.json (one entry per ATTEMPTED trial, "
+                        "saved or discarded). Required for correct episode→trial "
+                        "mapping when any trials were discarded. Default: "
+                        "<raw-batch>_logs/summary.json in the parent directory.")
     p.add_argument("--out-dir", type=Path, required=True,
                    help="Where to write the demo PNGs.")
     p.add_argument("--n-frames", type=int, default=12)
@@ -305,36 +312,44 @@ def main() -> int:
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 0. Load batch YAML for per-episode port_type lookup ------------
-    # The YAML location convention is <collection-dir>/<batch>.yaml; if the
-    # raw-batch path is /root/aic_data/batch_100_a, the YAML is its sibling
-    # /root/aic_data/batch_100_a.yaml.
+    # --- 0. Load batch YAML + summary.json for episode → trial mapping ---
+    # Naive `trial_(ep+1)` mapping is WRONG when the recorder discarded any
+    # trials — discards reduce the saved-episode count without removing
+    # those trial entries from the YAML, so positional alignment breaks.
+    # `match_episodes_to_trials` walks summary.json (which has one entry
+    # per ATTEMPTED trial) and assigns each saved entry to the correctly
+    # positioned yaml trial, with task_meta cross-check.
     import yaml as yaml_mod
     yaml_path = args.batch_yaml or (
         args.raw_batch.parent / f"{args.raw_batch.name}.yaml"
     )
-    if not yaml_path.exists():
-        sys.exit(
-            f"missing trial config yaml: {yaml_path}\n"
-            f"(pass --batch-yaml to override)"
-        )
+    summary_path = args.summary_json or (
+        args.raw_batch.parent / f"{args.raw_batch.name}_logs" / "summary.json"
+    )
+    for p_, label in [(yaml_path, "trial config yaml"),
+                      (summary_path, "recorder summary json")]:
+        if not p_.exists():
+            sys.exit(
+                f"missing {label}: {p_}\n"
+                f"(pass --batch-yaml or --summary-json to override)"
+            )
     cfg = yaml_mod.safe_load(yaml_path.read_text())
-    # Episode index → full task tuple (positional convention: episode i
-    # maps to trial_(i+1) — verified in project_aic_localizer_versions.md).
+    summary = json.loads(summary_path.read_text())
+    ep_to_trial_key = match_episodes_to_trials(summary, cfg["trials"])
     ep_to_task: dict[int, dict] = {}
-    for trial_key, trial in cfg["trials"].items():
-        try:
-            ep_idx = int(trial_key.split("_")[1]) - 1
-        except (IndexError, ValueError):
-            continue
-        task = trial["tasks"]["task_1"]
-        ep_to_task[ep_idx] = {
+    for ep_idx, trial_key in ep_to_trial_key.items():
+        task = cfg["trials"][trial_key]["tasks"]["task_1"]
+        ep_to_task[int(ep_idx)] = {
             "port_type": task["port_type"],
             "port_name": task["port_name"],
             "target_module_name": task["target_module_name"],
             "trial_key": trial_key,
         }
-    print(f"loaded task info for {len(ep_to_task)} trials from {yaml_path.name}")
+    n_yaml_trials = len(cfg["trials"])
+    n_saved = len(ep_to_task)
+    n_discarded = n_yaml_trials - n_saved
+    print(f"loaded task info for {n_saved} saved episodes from {yaml_path.name} "
+          f"({n_yaml_trials} attempted, {n_discarded} discarded)")
 
     # --- 1. Load dataset (uses lerobot's video decoder) -----------------
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
