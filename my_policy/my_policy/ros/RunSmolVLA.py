@@ -207,6 +207,15 @@ def _action_port_to_baselink_pose(
 ) -> Pose:
     if action_port_7d.shape != (7,):
         raise ValueError(f"expected (7,), got {action_port_7d.shape}")
+    # Flow-matching's iterative denoising can emit near-zero quats early in
+    # training or under OOD inputs; transform_pose_back_to_baselink → make_se3
+    # would raise. Sub the identity quat instead so the trial degrades to
+    # "hold orientation" rather than crashing mid-trial.
+    in_q = action_port_7d[3:7]
+    in_qnorm = float(np.linalg.norm(in_q))
+    if in_qnorm < 1e-6:
+        action_port_7d = action_port_7d.copy()
+        action_port_7d[3:7] = [0.0, 0.0, 0.0, 1.0]
     recon = transform_pose_back_to_baselink(
         action_port_7d.astype(np.float64),
         port_pose_baselink.astype(np.float64),

@@ -98,9 +98,45 @@ Inference (live):
 
 ### Phase 0: Preflight (post-compact)
 
-1. **Verify `max_state_dim=32` is sufficient with state-mode=smolvla** — drop the 12-dim task vector. If state slicing breaks anything in the rest of the pipeline (eval, diagnose, merge), discover it now via a tiny test.
-2. **Verify `load_vlm_weights=True` succeeds** — kick off a 100-step training run with smolvla just to confirm HF Hub download works and the model loads. Throwaway run, validates plumbing.
-3. **VRAM check** — SmolVLA fp16 on 48 GB GPU should be fine for batch_size=4-8 with frozen vision encoder, but verify.
+These gates must pass before Phase 2 training. **If gate 1 fails, the entire branch is wasted at submission time.**
+
+1. **🚨 Submission-time HF Hub gate**: `SmolVLAPolicy(config)` may call `AutoModel.from_pretrained(vlm_model_name)` in its constructor (via `smolvlm_with_expert.py`) even when we immediately `load_state_dict(safetensors)` over it. The eval container has no internet — if the constructor needs HF Hub, the submission will dead-on-load. Test post-smoke-train with internet disabled:
+   ```
+   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 pixi run python -c "
+   import json, draccus
+   from safetensors.torch import load_file
+   from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+   from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+   ckpt = '<path>/pretrained_model'
+   cfg = json.loads(open(f'{ckpt}/config.json').read()); cfg.pop('type', None)
+   p = SmolVLAPolicy(draccus.decode(SmolVLAConfig, cfg))
+   p.load_state_dict(load_file(f'{ckpt}/model.safetensors'))
+   print('OK')
+   "
+   ```
+   If it fails: bundle HF cache via `HF_HOME` mounted into submission docker, OR override `load_vlm_weights=False` at inference (relying on the fine-tuned safetensors alone — verify model loads cleanly without VLM weights from hub).
+
+2. **🚨 Dataset slot-equality gate**: byte-equal check that `make_smolvla_dataset.py` produced exactly the first 32 channels of the source:
+   ```
+   python3 -c "
+   import pyarrow.parquet as pq, numpy as np
+   src = pq.read_table('.../v9_port_local_merged_clean/data/chunk-000/file-000.parquet')
+   sv  = pq.read_table('.../v9_port_local_smolvla_dataset/data/chunk-000/file-000.parquet')
+   s_src = np.stack(src['observation.state'].to_pylist())
+   s_sv  = np.stack(sv['observation.state'].to_pylist())
+   assert np.array_equal(s_src[:, :32], s_sv), 'state slice mismatch'
+   print('shapes:', s_src.shape, s_sv.shape, 'byte-equal: OK')
+   "
+   ```
+
+3. **`load_vlm_weights=True` smoke**: kick off a 100-step training run to confirm HF Hub download works + the SmolVLA training loop converges (loss curve sane in the first 100 steps). Throwaway run.
+
+4. **VRAM check** — SmolVLA-500M with frozen vision encoder fits comfortably in 24 GB at batch=4. On the local 48 GB box, batch=8 should work; tune down if OOM.
+
+5. **Tier 1 offline tests on GPU box** — host can't run them (no torch). Run before kicking off the 100k:
+   ```
+   pixi run python my_policy/scripts/test_runsmolvla_offline.py --skip-tier3
+   ```
 
 ### Phase 1: Dataset (~1-2 hours)
 
@@ -138,8 +174,11 @@ Inference (live):
 
 1. Clone to `eval_offline_action_mae_smolvla.py` — swap ACT loader for SmolVLA.
 2. Run val MAE on first checkpoint (e.g. 20k or 50k). Compare to ACT @ same step count via `compare_eval_runs.py`.
-3. If MAE looks reasonable, run live bench with `ground_truth=true` on `sc_tester_5.yaml`.
-4. Compare to ACT v9_pl_v2's bench score (currently 120 with TE=0.25).
+3. **Latency check on the live machine** (not just laptop): Tier 3 of `test_runsmolvla_offline.py`. SmolVLA's chunk-boundary call does 10 flow-matching denoising steps over a 500M-param model. On L4 it may exceed the 2.5 s queue-drain time of `n_action_steps=50`.
+   - **Decision rule**: if Tier 3 p99 > 2500 ms, lower `--n-action-steps` (e.g. 25 → re-plan every 1.25 s). The chunk-boundary tick now stalls 1 tick instead of 50, but the controller doesn't starve.
+   - If even 25 is too slow, drop to 10 (re-plan every 0.5 s) — SmolVLA's whole point is quality of plans, but a starved queue is unrecoverable.
+4. If MAE + latency look reasonable, run live bench with `ground_truth=true` on `sc_tester_5.yaml`.
+5. Compare to ACT v9_pl_v2's bench score (currently 120 with TE=0.25).
 
 ### Phase 6: Decision
 
