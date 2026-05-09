@@ -45,6 +45,15 @@ Run-time configuration (env vars):
     AIC_PL_ACT_TEMPORAL_ENSEMBLE_COEFF
         If set (e.g. 0.01), enables ACT's inference-time temporal
         ensembling. Smaller = stronger smoothing. Forces n_action_steps=1.
+    AIC_PL_INJECT_VELOCITY_BIAS_Z
+        If set (e.g. 0.01), overrides the port-local TCP linear-z
+        velocity in observation.state[9] with this value at every tick.
+        Tests the velocity-OOD hypothesis: the live policy stalls when
+        TCP velocity → 0 because training data never had stationary
+        hovers (oracle was always descending). Injecting a small
+        positive value (port-local +z = INTO the port) tricks the model
+        into thinking it's still descending, potentially breaking the
+        fixed-point lock at hover height. Suggested: 0.005-0.02.
     AIC_PL_LOCALIZER_CHECKPOINT
         If set, replaces /tf port lookup with PortLocalizer prediction.
     AIC_PL_LOCALIZER_QUATS_JSON
@@ -259,6 +268,17 @@ def _build_state_44(
         dtype=np.float32,
     )
     assert state.shape == (44,), f"state must be 44-dim, got {state.shape}"
+
+    # Optional port-local Z-velocity injection. Tests the velocity-OOD
+    # hypothesis (see module header). state[9] is port-local
+    # tcp_velocity.linear.z; positive = INTO the port = descending.
+    inject_z_str = os.environ.get("AIC_PL_INJECT_VELOCITY_BIAS_Z", "").strip()
+    if inject_z_str:
+        try:
+            state[9] = float(inject_z_str)
+        except ValueError:
+            pass  # silently ignore malformed values; default behavior unchanged
+
     return torch.from_numpy(state)
 
 
@@ -353,12 +373,14 @@ class RunPortLocalACT(Policy):
         # PortLocalizer — lazily loaded on first trial when env var is set.
         self._localizer = None
 
+        inject_z_env = os.environ.get("AIC_PL_INJECT_VELOCITY_BIAS_Z", "").strip()
         self.get_logger().info(
             f"RunPortLocalACT loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
             f"timeout={self.timeout_s}s "
             f"temporal_ensemble_coeff={temporal_ensemble_coeff} "
-            f"localizer_mode={self._localizer_mode()}"
+            f"localizer_mode={self._localizer_mode()} "
+            f"inject_velocity_z={inject_z_env or 'OFF'}"
         )
 
     # ------------------------------------------------------------------
@@ -622,6 +644,23 @@ class RunPortLocalACT(Policy):
                 max_action_delta = max(max_action_delta, d)
             last_action_port = a_port
 
+            # Pull port-local velocity + wrench magnitudes from the obs we
+            # just built. obs is the post-preprocessor dict (normalized);
+            # we need the un-normalized state for human-readable log values.
+            # Cheapest: re-derive from the source observation we still have.
+            #
+            # state[7..12] = tcp_velocity port-frame (linear xyz, angular xyz)
+            # state[26..31] = wrench port-frame (force xyz, torque xyz)
+            # Since we already called _build_state_44 earlier in this loop,
+            # rebuild the un-normalized state here for logging only.
+            unnormed_state = _build_state_44(
+                obs_msg, task_vec, port_pose,
+            ).numpy()
+            vel_z_port = float(unnormed_state[9])     # linear.z (into-port descent)
+            vel_lin_mag = float(np.linalg.norm(unnormed_state[7:10]))
+            force_mag = float(np.linalg.norm(unnormed_state[26:29]))
+            torque_mag = float(np.linalg.norm(unnormed_state[29:32]))
+
             if ticks % LOG_EVERY_N == 0:
                 self.get_logger().info(
                     f"tick={ticks:4d} "
@@ -630,6 +669,9 @@ class RunPortLocalACT(Policy):
                     f"{pose.position.y:.3f},{pose.position.z:.3f}) "
                     f"||pred-tcp||={tcp_pred_dist*1000:.1f}mm "
                     f"a_port[xyz]=({a_port[0]:.3f},{a_port[1]:.3f},{a_port[2]:.3f}) "
+                    f"vel_z_port={vel_z_port:+.4f} "
+                    f"|vel_lin|={vel_lin_mag:.4f} "
+                    f"|F|={force_mag:.2f}N |τ|={torque_mag:.3f}Nm "
                     f"max_a_step_Δ={max_action_delta:.4f}"
                 )
 
