@@ -229,12 +229,11 @@ def inspect_sample_frame(root: Path, train_episodes: list[int]) -> None:
     s = item["observation.state"]
     a = item["action"]
     print(f"  state shape      = {tuple(s.shape)}, dtype={s.dtype}")
-    print(f"    [0:3] tcp_pos       = {s[0:3].numpy().round(4).tolist()}")
-    print(f"    [3:7] tcp_quat      = {s[3:7].numpy().round(4).tolist()}")
-    print(f"    [7:13] tcp_velocity = {s[7:13].numpy().round(4).tolist()}")
-    print(f"    [13:19] tcp_error   = {s[13:19].numpy().round(4).tolist()}")
-    print(f"    [19:26] joints      = {s[19:26].numpy().round(4).tolist()}")
-    print(f"    [26:32] wrench      = {s[26:32].numpy().round(4).tolist()}")
+    print(f"    [0:3]   tcp_pos     = {s[0:3].numpy().round(4).tolist()}")
+    print(f"    [3:7]   tcp_quat    = {s[3:7].numpy().round(4).tolist()}")
+    print(f"    [7:13]  tcp_velocity= {s[7:13].numpy().round(4).tolist()}")
+    print(f"    [13:20] joints      = {s[13:20].numpy().round(4).tolist()}")
+    print(f"    [20:26] wrench      = {s[20:26].numpy().round(4).tolist()}")
     print(f"  action shape     = {tuple(a.shape)}, dtype={a.dtype}")
     print(f"    [0:3] xyz   = {a[0:3].numpy().round(4).tolist()}")
     print(f"    [3:7] quat  = {a[3:7].numpy().round(4).tolist()}")

@@ -4,11 +4,14 @@ container.
 
 Architectural cousin of `RunPortLocalACT.py`. Differences:
 
-  * **State is 32-dim (not 44).** SmolVLA gets task identity from the
+  * **State is 26-dim (not 44).** SmolVLA gets task identity from the
     natural-language `task` string per call, not a one-hot in state.
-    `make_smolvla_dataset.py` strips the trailing 12-dim task vector so
-    state matches SmolVLA's default `max_state_dim=32`. The shim must
-    compose the same 32-dim layout (no task-vec append) at inference.
+    AND we drop the 6-dim `tcp_error` block — it is auto-regressive on
+    the policy's commanded targets (the controller's tracking residual)
+    and the phase-trigger probe identified state[15] = tcp_error.z as
+    the channel the previously-trained model used as a hover-vs-commit
+    shortcut. `make_smolvla_dataset.py` performs the same drop on the
+    training data; the shim composes the matching 26-dim layout here.
 
   * **Language input.** SmolVLAPolicy expects a `task` string per call.
     The DataProcessorPipeline runs the SmolVLANewLineProcessor +
@@ -88,7 +91,7 @@ IMAGE_SCALING = 0.25  # 1152x1024 → 288x256 (matches dataset).
 
 TF_LOOKUP_TIMEOUT_S = 5.0
 
-STATE_DIM = 32  # 7 + 6 + 6 + 7 + 6, no task one-hot
+STATE_DIM = 26  # 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench (no tcp_error, no task one-hot)
 
 
 # ---------------------------------------------------------------------------
@@ -137,31 +140,23 @@ def _compensated_wrench(obs_msg: Observation) -> tuple[float, float, float, floa
     )
 
 
-def _build_state_32(
+def _build_state_26(
     obs_msg: Observation,
     port_pose_baselink: np.ndarray,
-    err_z_override: float | None = None,
 ) -> torch.Tensor:
-    """Compose the 32-channel observation.state in the same layout as
-    `make_smolvla_dataset.py` produces (port-local frame, no task vec).
+    """Compose the 26-channel observation.state in the same layout as
+    `make_smolvla_dataset.py` produces (port-local frame, no tcp_error,
+    no task vec).
 
     Layout:
       [ 0..6 ] tcp_pose      — port frame
       [ 7..12] tcp_velocity  — port frame
-      [13..18] tcp_error     — TCP-relative; pass-through (or err_z override)
-      [19..25] joint_pos     — frame-invariant; pass-through
-      [26..31] wrench        — port frame (sensor frame ≈ TCP frame)
+      [13..19] joint_pos     — frame-invariant; pass-through
+      [20..25] wrench        — port frame (sensor frame ≈ TCP frame)
 
-    `err_z_override`: if not None, overrides state[15] (tcp_error.err_z) to
-    this value. Identified empirically via the phase-trigger probe as the
-    sole channel gating the model's HOVER → COMMIT regime transition.
-    Hover-regime training frames had err_z ≈ +5mm; commit-regime ≈ -3mm.
-    Live policy gets stuck because its actual err_z stays at hover-pattern
-    (target slightly above tcp), which keeps the model emitting hover-pattern
-    commands — chicken-and-egg. Forcing err_z to a commit-pattern value
-    breaks the cycle.
+    tcp_error is intentionally NOT in this layout. See module docstring.
 
-    Returns float32 [32], un-batched, un-normalized.
+    Returns float32 [26], un-batched, un-normalized.
     """
     if port_pose_baselink.shape != (7,):
         raise ValueError(f"port_pose must be shape (7,), got {port_pose_baselink.shape}")
@@ -197,37 +192,25 @@ def _build_state_32(
     )
     out = transform_frame(inp)
 
-    raw_err_z = float(cs.tcp_error[2])
-    err_z_value = raw_err_z if err_z_override is None else float(err_z_override)
     state = np.array(
         [
-            *out.tcp_pose_portframe,         # 7
-            *out.tcp_velocity_portframe,     # 6
-            cs.tcp_error[0], cs.tcp_error[1], err_z_value,
-            cs.tcp_error[3], cs.tcp_error[4], cs.tcp_error[5],  # 6
-            *js.position[:7],                # 7
-            *out.wrench_portframe,           # 6
+            *out.tcp_pose_portframe,         # 7  → [0..6]
+            *out.tcp_velocity_portframe,     # 6  → [7..12]
+            *js.position[:7],                # 7  → [13..19]
+            *out.wrench_portframe,           # 6  → [20..25]
         ],
         dtype=np.float32,
     )
     assert state.shape == (STATE_DIM,), f"state must be {STATE_DIM}-dim, got {state.shape}"
-    # Diagnostic: print on first few calls + sparingly. We want to confirm
-    # state[15] reflects the override when set, and we want to see what the
-    # live full state vector looks like compared to the dataset's hover frames
-    # the probe used. Print compactly so log isn't flooded.
-    if not getattr(_build_state_32, "_call_count", 0):
-        _build_state_32._call_count = 0  # type: ignore[attr-defined]
-    _build_state_32._call_count += 1  # type: ignore[attr-defined]
-    if _build_state_32._call_count <= 3 or _build_state_32._call_count % 50 == 0:
+    if not getattr(_build_state_26, "_call_count", 0):
+        _build_state_26._call_count = 0  # type: ignore[attr-defined]
+    _build_state_26._call_count += 1  # type: ignore[attr-defined]
+    if _build_state_26._call_count <= 3 or _build_state_26._call_count % 50 == 0:
         s = state
-        print(f"[state_dbg #{_build_state_32._call_count}] "
-              f"raw_err_z={raw_err_z*1000:+.2f}mm  "
-              f"override={err_z_override}  "
-              f"state[15]={s[15]*1000:+.2f}mm  "
+        print(f"[state_dbg #{_build_state_26._call_count}] "
               f"tcp=({s[0]:+.3f},{s[1]:+.3f},{s[2]:+.3f})  "
-              f"err=({s[13]*1000:+.1f},{s[14]*1000:+.1f},{s[15]*1000:+.1f})mm  "
               f"vel=({s[7]*1000:+.1f},{s[8]*1000:+.1f},{s[9]*1000:+.1f})mm/s  "
-              f"|F|={np.linalg.norm(s[26:29]):.2f}N",
+              f"|F|={np.linalg.norm(s[20:23]):.2f}N",
               flush=True)
     return torch.from_numpy(state)
 
@@ -271,12 +254,6 @@ class RunSmolVLA(Policy):
     CHECKPOINT_ENV = "AIC_PL_SMOLVLA_CHECKPOINT"
     TIMEOUT_ENV = "AIC_PL_SMOLVLA_TIMEOUT_S"
 
-    # Phase-trigger override (see _build_state_32 docstring). If set, replaces
-    # state[15] (tcp_error.err_z) with this value at every tick. Empirically
-    # identified as the SOLE channel gating HOVER → COMMIT regime in trained
-    # SmolVLA. Hover ≈ +0.005, commit ≈ -0.003. Default unset (use live err_z).
-    ERR_Z_OVERRIDE_ENV = "AIC_PL_SMOLVLA_ERR_Z_OVERRIDE"
-
     LOCALIZER_CKPT_ENV = "AIC_PL_LOCALIZER_CHECKPOINT"
     LOCALIZER_QUATS_ENV = "AIC_PL_LOCALIZER_QUATS_JSON"
     LOCALIZER_DEVICE_ENV = "AIC_PL_LOCALIZER_DEVICE"
@@ -315,17 +292,13 @@ class RunSmolVLA(Policy):
         )
         self.loop_period_s = LOOP_PERIOD_S
 
-        err_z_str = os.environ.get(self.ERR_Z_OVERRIDE_ENV, "").strip()
-        self.err_z_override = float(err_z_str) if err_z_str else None
-
         self._localizer = None
 
         self.get_logger().info(
             f"RunSmolVLA loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
             f"timeout={self.timeout_s}s "
-            f"localizer_mode={self._localizer_mode()} "
-            f"err_z_override={self.err_z_override}"
+            f"localizer_mode={self._localizer_mode()}"
         )
 
     # ------------------------------------------------------------------
@@ -488,8 +461,8 @@ class RunSmolVLA(Policy):
                 _ros_image_to_chw_float(obs_msg.center_image, IMAGE_SCALING),
             "observation.images.right_camera":
                 _ros_image_to_chw_float(obs_msg.right_image, IMAGE_SCALING),
-            "observation.state": _build_state_32(
-                obs_msg, port_pose_baselink, err_z_override=self.err_z_override),
+            "observation.state": _build_state_26(
+                obs_msg, port_pose_baselink),
             "task": task_str,
         }
 

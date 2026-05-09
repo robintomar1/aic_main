@@ -2,27 +2,28 @@
 """Offline tests for `my_policy.ros.RunSmolVLA` — the v9-port-local-smolvla
 inference shim.
 
-Same shape as `test_runportlocalact_offline.py` but for the 32-dim state
-+ language input convention used by SmolVLA.
+Same shape as `test_runportlocalact_offline.py` but for the 26-dim state
++ language input convention used by SmolVLA. State drops the auto-regressive
+tcp_error block; see RunSmolVLA module docstring.
 
 The high-leverage thing to verify BEFORE burning eval-container minutes:
-the shim's per-tick state composition produces the EXACT 32-dim vector
+the shim's per-tick state composition produces the EXACT 26-dim vector
 that `make_smolvla_dataset.py` wrote, AND the language string SmolVLA's
 preprocessor reads matches the dataset's stored `tasks` per-episode.
 
 Three tiers:
 
   Tier 1  Helper unit tests on synthetic observations:
-            * _build_state_32 slot ordering.
+            * _build_state_26 slot ordering.
             * Quaternion normalization in _action_port_to_baselink_pose.
 
   Tier 2  Real-data round-trip:
             For N random frames in batch_100_a:
               1. Load raw frame's TCP/wrench/joint/etc. + port_pose.
               2. Build a fake Observation.
-              3. Call _build_state_32 with that port_pose.
+              3. Call _build_state_26 with that port_pose.
               4. Load the corresponding frame from the smolvla dataset's
-                 `observation.state` (32-dim).
+                 `observation.state` (26-dim).
               5. Compare. Should be identical (modulo float32 precision).
 
   Tier 3  Latency:
@@ -33,7 +34,7 @@ Three tiers:
 
 Usage:
     pixi run python my_policy/scripts/smolvla/test_runsmolvla_offline.py \\
-        --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_pl_smolvla_v1/checkpoints/050000/pretrained_model \\
+        --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_pl_smolvla_v2/checkpoints/050000/pretrained_model \\
         --raw-batch /root/aic_data/batch_100_a \\
         --smolvla-dataset /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset
 """
@@ -133,28 +134,28 @@ def _make_fake_observation(state_47: np.ndarray, raw_action: np.ndarray):
 # ---------------------------------------------------------------------------
 
 
-def test_state_32_slot_ordering():
+def test_state_26_slot_ordering():
     """Hand-craft an Observation with distinct values per slot, port pose
-    = identity → expect _build_state_32 to copy through with TCP=I no-op."""
-    from my_policy.ros.RunSmolVLA import _build_state_32
+    = identity → expect _build_state_26 to copy through with TCP=I no-op
+    and tcp_error block dropped."""
+    from my_policy.ros.RunSmolVLA import _build_state_26
 
     state_47 = np.arange(0.0, 47.0, dtype=np.float32)
     state_47[3:7] = [0.0, 0.0, 0.0, 1.0]  # TCP quat identity
     port_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
-    out = _build_state_32(_make_fake_observation(state_47, None), port_pose).numpy()
-    assert out.shape == (32,), f"got {out.shape}"
+    out = _build_state_26(_make_fake_observation(state_47, None), port_pose).numpy()
+    assert out.shape == (26,), f"got {out.shape}"
 
-    expected = np.zeros(32, dtype=np.float32)
+    expected = np.zeros(26, dtype=np.float32)
     expected[0:7]   = state_47[0:7]    # TCP pose (port=I → no transform)
     expected[7:13]  = state_47[7:13]   # TCP velocity (port=I, tcp=I → no rot)
-    expected[13:19] = state_47[13:19]  # TCP error
-    expected[19:26] = state_47[19:26]  # joints
-    expected[26:32] = state_47[26:32]  # wrench (port=I, tcp=I → no rot)
+    expected[13:20] = state_47[19:26]  # joints (source [19:26], tcp_error skipped)
+    expected[20:26] = state_47[26:32]  # wrench (port=I, tcp=I → no rot)
 
     np.testing.assert_allclose(
         out, expected, atol=1e-6,
-        err_msg="state_32 slot ordering doesn't match expected layout",
+        err_msg="state_26 slot ordering doesn't match expected layout",
     )
 
 
@@ -182,7 +183,7 @@ def test_task_string_format():
 def run_tier1():
     print("--- Tier 1: helper unit tests ---")
     tests = [
-        ("state 32 slot ordering", test_state_32_slot_ordering),
+        ("state 26 slot ordering", test_state_26_slot_ordering),
         ("quat normalization in action", test_quaternion_normalization_in_action),
         ("task string format", test_task_string_format),
     ]
@@ -208,9 +209,9 @@ def run_tier1():
 
 def run_tier2(raw_batch: Path, smolvla_root: Path, n_frames: int):
     """For N random frames in raw_batch, reconstruct the Observation and
-    verify the shim's _build_state_32 output matches the smolvla dataset's
+    verify the shim's _build_state_26 output matches the smolvla dataset's
     observation.state at the same (episode, frame_index)."""
-    from my_policy.ros.RunSmolVLA import _build_state_32
+    from my_policy.ros.RunSmolVLA import _build_state_26
 
     print(f"--- Tier 2: real-data round-trip ({n_frames} frames) ---")
     print(f"  raw_batch     : {raw_batch}")
@@ -234,9 +235,9 @@ def run_tier2(raw_batch: Path, smolvla_root: Path, n_frames: int):
         np.asarray(r, dtype=np.float32)
         for r in sv_table["observation.state"].to_pylist()
     ])
-    if sv_states.shape[1] != 32:
+    if sv_states.shape[1] != 26:
         sys.exit(f"smolvla dataset state has {sv_states.shape[1]} channels; "
-                 "expected 32 — rebuild via make_smolvla_dataset.py")
+                 "expected 26 — rebuild via make_smolvla_dataset.py")
     sv_eps = sv_table["episode_index"].to_numpy().astype(np.int64)
     sv_frames = sv_table["frame_index"].to_numpy().astype(np.int64)
 
@@ -300,7 +301,7 @@ def run_tier2(raw_batch: Path, smolvla_root: Path, n_frames: int):
         port_pose = raw_state[SRC_PORT_POSE_SLICE].astype(np.float64)
 
         obs_msg = _make_fake_observation(raw_state, raw_actions[raw_gi])
-        shim_state = _build_state_32(obs_msg, port_pose).numpy()
+        shim_state = _build_state_26(obs_msg, port_pose).numpy()
 
         diff = shim_state - sv_state
         pos_err = float(np.linalg.norm(diff[0:3]))
@@ -372,7 +373,7 @@ def run_tier3(checkpoint_dir: Path, n_iters: int = 30):
         "observation.images.left_camera":   torch.zeros(3, 256, 288),
         "observation.images.center_camera": torch.zeros(3, 256, 288),
         "observation.images.right_camera": torch.zeros(3, 256, 288),
-        "observation.state": torch.zeros(32),
+        "observation.state": torch.zeros(26),
         "task": "insert sfp plug into sfp_port_0 on nic_card_mount_0",
     }
     # Warm up.

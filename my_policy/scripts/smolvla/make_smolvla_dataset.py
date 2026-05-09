@@ -1,19 +1,34 @@
 #!/usr/bin/env python3
 """Build a SmolVLA-friendly variant of the port-local dataset by dropping
-the 12-dim task one-hot from observation.state (44 → 32 channels).
+the 6-dim tcp_error block AND the 12-dim task one-hot from observation.state
+(44 → 26 channels).
 
-SmolVLA's default `max_state_dim=32`. Our port-local dataset is 44-dim:
-the last 12 channels are a one-hot task vector that the model already
-gets via the natural-language `tasks` string per episode. Stripping them
-makes state fit the SmolVLA default cleanly without redundancy.
+Why drop tcp_error: it is auto-regressive on the policy's own past output
+(`target_pose - current_pose` from the live controller), and the
+phase-trigger probe identified state[15] = tcp_error.z as the channel the
+trained model used as a hover-vs-commit shortcut. Removing it forces the
+model to rely on the visual / spatial / wrench channels.
+
+Why drop the task one-hot: SmolVLA gets task identity via the
+natural-language `tasks` string per episode.
+
+Source 44-dim port-local layout (from make_port_local_dataset.py):
+  [ 0..6 ] tcp_pose       — port frame                 (kept)
+  [ 7..12] tcp_velocity   — port frame                 (kept)
+  [13..18] tcp_error      — base_link frame            (DROPPED)
+  [19..25] joint_positions                             (kept)
+  [26..31] wrench         — port frame                 (kept)
+  [32..43] task one-hot                                (DROPPED)
+
+Resulting 26-dim layout: tcp_pose ++ tcp_velocity ++ joints ++ wrench.
 
 What this script does:
   * Read v9_port_local_merged_clean (or any 44-dim port-local dataset).
-  * Slice observation.state[:, :32] — drops channels 32..43 (task vec).
+  * Slice observation.state down to the 26 retained channels.
   * Recompute per-episode stats and aggregate stats.json for state
     (action / videos unchanged).
-  * Update info.json: observation.state.shape = [32], names truncated
-    to the first 32, frame_transform = "port_local_smolvla".
+  * Update info.json: observation.state.shape = [26], names filtered,
+    frame_transform = "port_local_smolvla_no_err".
   * Copy meta/tasks.parquet, train/val splits, source_episode_map.json
     (if present) verbatim. Symlink videos/.
 
@@ -37,7 +52,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-KEPT_CHANNELS = 32  # drop trailing 12-dim task one-hot
+SRC_DIM = 44                # 44-dim port-local source
+KEPT_CHANNELS = 26          # 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench
+KEEP_SRC_INDICES = list(range(0, 13)) + list(range(19, 32))  # drop [13:19]+[32:44]
+assert len(KEEP_SRC_INDICES) == KEPT_CHANNELS
 
 
 def per_episode_stats(arr: np.ndarray) -> dict[str, np.ndarray]:
@@ -114,7 +132,7 @@ def main() -> int:
                   f"(pass --force to overwrite)", file=sys.stderr)
             return 1
 
-    print(f"=== {args.src} -> {args.dst} (drop task one-hot, 44 → 32) ===")
+    print(f"=== {args.src} -> {args.dst} (drop tcp_error + task one-hot, 44 → {KEPT_CHANNELS}) ===")
     args.dst.mkdir(parents=True)
     (args.dst / "data" / "chunk-000").mkdir(parents=True)
     (args.dst / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
@@ -126,16 +144,14 @@ def main() -> int:
     print(f"  rows: {n_rows}, cols: {len(src_table.column_names)}")
 
     state = np.stack(src_table.column("observation.state").to_pylist()).astype(np.float32)
-    if state.shape[1] < KEPT_CHANNELS:
+    if state.shape[1] != SRC_DIM:
         print(f"error: source state has {state.shape[1]} channels, "
-              f"expected at least {KEPT_CHANNELS}", file=sys.stderr)
+              f"expected {SRC_DIM} (port-local with task one-hot). "
+              f"Run make_port_local_dataset.py first.", file=sys.stderr)
         return 1
-    if state.shape[1] == KEPT_CHANNELS:
-        print(f"  source already {KEPT_CHANNELS}-dim — nothing to slice; "
-              f"will still rewrite info/stats with smolvla marker.")
-    else:
-        print(f"  slicing state[:, :{KEPT_CHANNELS}] (was {state.shape[1]})")
-    new_state = state[:, :KEPT_CHANNELS].copy()
+    print(f"  selecting {KEPT_CHANNELS} of {SRC_DIM} channels — "
+          f"drops [13:19] tcp_error and [32:44] task one-hot")
+    new_state = state[:, KEEP_SRC_INDICES].copy()
 
     ep_idx = np.array(src_table.column("episode_index").to_pylist(), dtype=np.int64)
     ep_starts = np.r_[0, np.where(np.diff(ep_idx) != 0)[0] + 1]
@@ -204,13 +220,18 @@ def main() -> int:
     feats = dict(new_info["features"])
     state_feat = dict(feats["observation.state"])
     state_feat["shape"] = [KEPT_CHANNELS]
-    state_feat["names"] = state_feat["names"][:KEPT_CHANNELS]
+    src_names = state_feat["names"]
+    if len(src_names) != SRC_DIM:
+        print(f"warning: info.json names list has {len(src_names)} entries, "
+              f"expected {SRC_DIM}", file=sys.stderr)
+    state_feat["names"] = [src_names[i] for i in KEEP_SRC_INDICES
+                           if i < len(src_names)]
     feats["observation.state"] = state_feat
     new_info["features"] = feats
-    new_info["frame_transform"] = "port_local_smolvla"
+    new_info["frame_transform"] = "port_local_smolvla_no_err"
     (args.dst / "meta" / "info.json").write_text(json.dumps(new_info, indent=2))
     print(f"  wrote meta/info.json (state shape=[{KEPT_CHANNELS}], "
-          f"frame_transform=port_local_smolvla)")
+          f"frame_transform=port_local_smolvla_no_err)")
 
     # --- Copy small files; symlink videos ---------------------------------
     shutil.copy(args.src / "meta" / "tasks.parquet",
@@ -229,7 +250,7 @@ def main() -> int:
 
     print()
     print(f"=== done: {args.dst} ===")
-    print(f"  state shape: 44 -> {KEPT_CHANNELS}")
+    print(f"  state shape: {SRC_DIM} -> {KEPT_CHANNELS}")
     print(f"  next: train_smolvla.py --dataset-root {args.dst}")
     return 0
 
