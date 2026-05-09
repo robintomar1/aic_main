@@ -140,6 +140,7 @@ def _compensated_wrench(obs_msg: Observation) -> tuple[float, float, float, floa
 def _build_state_32(
     obs_msg: Observation,
     port_pose_baselink: np.ndarray,
+    err_z_override: float | None = None,
 ) -> torch.Tensor:
     """Compose the 32-channel observation.state in the same layout as
     `make_smolvla_dataset.py` produces (port-local frame, no task vec).
@@ -147,9 +148,18 @@ def _build_state_32(
     Layout:
       [ 0..6 ] tcp_pose      — port frame
       [ 7..12] tcp_velocity  — port frame
-      [13..18] tcp_error     — TCP-relative; pass-through
+      [13..18] tcp_error     — TCP-relative; pass-through (or err_z override)
       [19..25] joint_pos     — frame-invariant; pass-through
       [26..31] wrench        — port frame (sensor frame ≈ TCP frame)
+
+    `err_z_override`: if not None, overrides state[15] (tcp_error.err_z) to
+    this value. Identified empirically via the phase-trigger probe as the
+    sole channel gating the model's HOVER → COMMIT regime transition.
+    Hover-regime training frames had err_z ≈ +5mm; commit-regime ≈ -3mm.
+    Live policy gets stuck because its actual err_z stays at hover-pattern
+    (target slightly above tcp), which keeps the model emitting hover-pattern
+    commands — chicken-and-egg. Forcing err_z to a commit-pattern value
+    breaks the cycle.
 
     Returns float32 [32], un-batched, un-normalized.
     """
@@ -187,11 +197,12 @@ def _build_state_32(
     )
     out = transform_frame(inp)
 
+    err_z_value = float(cs.tcp_error[2]) if err_z_override is None else float(err_z_override)
     state = np.array(
         [
             *out.tcp_pose_portframe,         # 7
             *out.tcp_velocity_portframe,     # 6
-            cs.tcp_error[0], cs.tcp_error[1], cs.tcp_error[2],
+            cs.tcp_error[0], cs.tcp_error[1], err_z_value,
             cs.tcp_error[3], cs.tcp_error[4], cs.tcp_error[5],  # 6
             *js.position[:7],                # 7
             *out.wrench_portframe,           # 6
@@ -241,6 +252,12 @@ class RunSmolVLA(Policy):
     CHECKPOINT_ENV = "AIC_PL_SMOLVLA_CHECKPOINT"
     TIMEOUT_ENV = "AIC_PL_SMOLVLA_TIMEOUT_S"
 
+    # Phase-trigger override (see _build_state_32 docstring). If set, replaces
+    # state[15] (tcp_error.err_z) with this value at every tick. Empirically
+    # identified as the SOLE channel gating HOVER → COMMIT regime in trained
+    # SmolVLA. Hover ≈ +0.005, commit ≈ -0.003. Default unset (use live err_z).
+    ERR_Z_OVERRIDE_ENV = "AIC_PL_SMOLVLA_ERR_Z_OVERRIDE"
+
     LOCALIZER_CKPT_ENV = "AIC_PL_LOCALIZER_CHECKPOINT"
     LOCALIZER_QUATS_ENV = "AIC_PL_LOCALIZER_QUATS_JSON"
     LOCALIZER_DEVICE_ENV = "AIC_PL_LOCALIZER_DEVICE"
@@ -279,13 +296,17 @@ class RunSmolVLA(Policy):
         )
         self.loop_period_s = LOOP_PERIOD_S
 
+        err_z_str = os.environ.get(self.ERR_Z_OVERRIDE_ENV, "").strip()
+        self.err_z_override = float(err_z_str) if err_z_str else None
+
         self._localizer = None
 
         self.get_logger().info(
             f"RunSmolVLA loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
             f"timeout={self.timeout_s}s "
-            f"localizer_mode={self._localizer_mode()}"
+            f"localizer_mode={self._localizer_mode()} "
+            f"err_z_override={self.err_z_override}"
         )
 
     # ------------------------------------------------------------------
@@ -448,7 +469,8 @@ class RunSmolVLA(Policy):
                 _ros_image_to_chw_float(obs_msg.center_image, IMAGE_SCALING),
             "observation.images.right_camera":
                 _ros_image_to_chw_float(obs_msg.right_image, IMAGE_SCALING),
-            "observation.state": _build_state_32(obs_msg, port_pose_baselink),
+            "observation.state": _build_state_32(
+                obs_msg, port_pose_baselink, err_z_override=self.err_z_override),
             "task": task_str,
         }
 
