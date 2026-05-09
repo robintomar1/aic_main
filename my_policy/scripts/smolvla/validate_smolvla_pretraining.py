@@ -327,14 +327,22 @@ def run_preprocessor_and_loss(root: Path, skip_loss: bool) -> None:
     out = pre(dict(batch))
     print()
     print(f"  preprocessed batch keys: {sorted(out.keys())}")
-    if "observation.language_tokens" in out:
-        lt = out["observation.language_tokens"]
-        lm = out["observation.language_attention_mask"]
-        print(f"  language_tokens shape: {tuple(lt.shape)} dtype={lt.dtype}")
-        print(f"  language_mask shape:   {tuple(lm.shape)} dtype={lm.dtype}")
+    # The actual emitted keys are dot-separated: `observation.language.tokens`
+    # / `observation.language.attention_mask` (verified empirically against
+    # the preprocessor pipeline output 2026-05-09).
+    lt_key = "observation.language.tokens"
+    lm_key = "observation.language.attention_mask"
+    if lt_key in out and lm_key in out:
+        lt = out[lt_key]
+        lm = out[lm_key]
+        print(f"  {lt_key} shape: {tuple(lt.shape)} dtype={lt.dtype}")
+        print(f"  {lm_key} shape: {tuple(lm.shape)} dtype={lm.dtype}")
+        # Show the first row of token ids — confirms tokenization actually ran.
+        print(f"  first row token-id sample: {lt[0][:12].tolist()} ...")
         _ok("language tokens populated by tokenizer")
     else:
-        _fail("missing observation.language_tokens after preprocessor")
+        _fail(f"missing {lt_key} or {lm_key} after preprocessor")
+        _fail(f"available keys: {sorted(out.keys())}")
         sys.exit(1)
     print(f"  state after norm: shape={tuple(out['observation.state'].shape)} "
           f"mean={float(out['observation.state'].float().mean()):+.3f} "
