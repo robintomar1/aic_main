@@ -107,10 +107,13 @@ def check_tasks_parquet(root: Path) -> list[str]:
     _section("2. tasks.parquet — must be string-indexed")
     import pandas as pd
     tasks_df = pd.read_parquet(root / "meta" / "tasks.parquet")
-    if tasks_df.index.dtype == np.dtype("O") and isinstance(tasks_df.index[0], str):
-        _ok(f"index dtype object, sample = {tasks_df.index[0]!r}")
+    # pandas may report dtype as 'object' (legacy) or 'str' / 'string[pyarrow]'
+    # depending on version — what matters is the actual VALUES are strings.
+    if isinstance(tasks_df.index[0], str):
+        _ok(f"index value is str, sample = {tasks_df.index[0]!r}")
     else:
-        _fail(f"index dtype = {tasks_df.index.dtype}, sample = {tasks_df.index[0]!r}")
+        _fail(f"index dtype = {tasks_df.index.dtype}, sample type "
+              f"{type(tasks_df.index[0]).__name__}, value = {tasks_df.index[0]!r}")
         _fail("Run fix_tasks_parquet_index.py before training.")
         sys.exit(1)
     print(f"  rows = {len(tasks_df)}, cols = {tasks_df.columns.tolist()}")
