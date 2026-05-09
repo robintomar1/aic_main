@@ -135,18 +135,18 @@ These gates must pass before Phase 2 training. **If gate 1 fails, the entire bra
 
 5. **Tier 1 offline tests on GPU box** — host can't run them (no torch). Run before kicking off the 100k:
    ```
-   pixi run python my_policy/scripts/test_runsmolvla_offline.py --skip-tier3
+   pixi run python my_policy/scripts/smolvla/test_runsmolvla_offline.py --skip-tier3
    ```
 
 ### Phase 1: Dataset (~1-2 hours)
 
-1. Write `my_policy/scripts/make_smolvla_dataset.py` — copies `v9_port_local_merged_clean` and rewrites `observation.state` to 32-dim (drops task vec). Keeps `tasks` strings per episode.
+1. Write `my_policy/scripts/smolvla/make_smolvla_dataset.py` — copies `v9_port_local_merged_clean` and rewrites `observation.state` to 32-dim (drops task vec). Keeps `tasks` strings per episode.
 2. Verify with a tiny test: load both ACT and SmolVLA versions of one frame, confirm first 32 channels match exactly + new state has correct shape + episode `tasks` strings are present.
 3. Output: `/root/aic_data/v9_act_build/v9_port_local_smolvla_dataset/`.
 
 ### Phase 2: Training (~1 day)
 
-1. Write `my_policy/scripts/train_smolvla.py` modeled on `train_act.py`. Key flags:
+1. Write `my_policy/scripts/smolvla/train_smolvla.py` modeled on `train_act.py`. Key flags:
    - `--name v9_pl_smolvla_v1`
    - `--dataset-root <smolvla_dataset>`
    - `--steps 100000` (matching ACT's run for fair comparison; can extend)
@@ -216,12 +216,12 @@ If SmolVLA is worse → fall back to the chunk=20 ACT result.
 
 | New file | From | Purpose |
 |---|---|---|
-| `my_policy/scripts/make_smolvla_dataset.py` | new | Strip 12-dim task vec from port-local dataset → 32-dim state. |
-| `my_policy/scripts/train_smolvla.py` | clone of `train_act.py` | Training driver for SmolVLAPolicy. |
+| `my_policy/scripts/smolvla/make_smolvla_dataset.py` | new | Strip 12-dim task vec from port-local dataset → 32-dim state. |
+| `my_policy/scripts/smolvla/train_smolvla.py` | clone of `train_act.py` | Training driver for SmolVLAPolicy. |
 | `my_policy/my_policy/ros/RunSmolVLA.py` | clone of `RunPortLocalACT.py` | Inference shim. |
-| `my_policy/scripts/test_runsmolvla_offline.py` | clone of `test_runportlocalact_offline.py` | Offline test (3 tiers). |
-| `my_policy/scripts/eval_offline_action_mae_smolvla.py` | clone of `eval_offline_action_mae.py` | Val-set MAE evaluator. |
-| `my_policy/scripts/diagnose_smolvla_predictions.py` | clone of `diagnose_episode_predictions.py` | Per-frame trajectory diff. |
+| `my_policy/scripts/smolvla/test_runsmolvla_offline.py` | clone of `test_runportlocalact_offline.py` | Offline test (3 tiers). |
+| `my_policy/scripts/smolvla/eval_offline_action_mae_smolvla.py` | clone of `eval_offline_action_mae.py` | Val-set MAE evaluator. |
+| `my_policy/scripts/smolvla/diagnose_smolvla_predictions.py` | clone of `diagnose_episode_predictions.py` | Per-frame trajectory diff. |
 
 ## How to apply this plan
 

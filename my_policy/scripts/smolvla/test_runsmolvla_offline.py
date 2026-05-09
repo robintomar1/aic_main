@@ -32,7 +32,7 @@ Three tiers:
             ACT — expect higher latency; the test will surface it.
 
 Usage:
-    pixi run python my_policy/scripts/test_runsmolvla_offline.py \\
+    pixi run python my_policy/scripts/smolvla/test_runsmolvla_offline.py \\
         --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_pl_smolvla_v1/checkpoints/050000/pretrained_model \\
         --raw-batch /root/aic_data/batch_100_a \\
         --smolvla-dataset /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset
@@ -50,7 +50,9 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 
-_PACKAGE_PARENT = Path(__file__).resolve().parent.parent
+# Scripts now live at my_policy/scripts/smolvla/<this>.py — go up THREE
+# parents to reach the directory containing `my_policy/`.
+_PACKAGE_PARENT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PACKAGE_PARENT))
 
 from my_policy.act.labels import task_string_for  # noqa: E402

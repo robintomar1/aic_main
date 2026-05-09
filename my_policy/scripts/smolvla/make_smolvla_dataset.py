@@ -20,7 +20,7 @@ What this script does:
 Pure pyarrow + numpy. No torch / lerobot dependency.
 
 Usage:
-    python3 my_policy/scripts/make_smolvla_dataset.py \\
+    python3 my_policy/scripts/smolvla/make_smolvla_dataset.py \\
         --src /root/aic_data/v9_act_build/v9_port_local_merged_clean \\
         --dst /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset
 """

@@ -7,7 +7,7 @@ Same metrics, same JSON output schema → drops into `compare_eval_runs.py`
 unchanged for SmolVLA-vs-ACT comparison.
 
 Usage:
-    pixi run python my_policy/scripts/eval_offline_action_mae_smolvla.py \\
+    pixi run python my_policy/scripts/smolvla/eval_offline_action_mae_smolvla.py \\
         --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_pl_smolvla_v1/checkpoints/050000/pretrained_model \\
         --dataset-root /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset \\
         --val-episodes-file /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset/val_episodes.json \\

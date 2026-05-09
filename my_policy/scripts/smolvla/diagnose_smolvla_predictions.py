@@ -12,7 +12,7 @@ recorded vs predicted action_z, quat residual, etc. Phases (early/mid/
 late) split the episode into thirds for descent-commit signal.
 
 Usage:
-    pixi run python my_policy/scripts/diagnose_smolvla_predictions.py \\
+    pixi run python my_policy/scripts/smolvla/diagnose_smolvla_predictions.py \\
         --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_pl_smolvla_v1/checkpoints/050000/pretrained_model \\
         --dataset-root /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset \\
         --val-episodes-file /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset/val_episodes.json \\

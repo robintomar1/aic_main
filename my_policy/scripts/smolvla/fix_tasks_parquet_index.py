@@ -9,7 +9,7 @@ Datasets built with `pa.Table.from_pylist([{...}])` have a default
 RangeIndex and break this contract.
 
 Usage:
-    pixi run python my_policy/scripts/fix_tasks_parquet_index.py \\
+    pixi run python my_policy/scripts/smolvla/fix_tasks_parquet_index.py \\
         /root/aic_data/v9_act_build/v9_port_local_merged_clean/meta/tasks.parquet \\
         /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset/meta/tasks.parquet
 

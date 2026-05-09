@@ -17,8 +17,8 @@ Inputs:
     the ACT run).
 
 Run (inside the dev container at ~/ws_aic/src/aic):
-    pixi run python my_policy/scripts/train_smolvla.py --name v9_pl_smolvla_v1
-    pixi run python my_policy/scripts/train_smolvla.py --name v9_pl_smolvla_v1 --resume
+    pixi run python my_policy/scripts/smolvla/train_smolvla.py --name v9_pl_smolvla_v1
+    pixi run python my_policy/scripts/smolvla/train_smolvla.py --name v9_pl_smolvla_v1 --resume
 
 VRAM: SmolVLA-500M with frozen vision encoder + 7-dim action (padded to 32)
 fits comfortably in 24 GB at batch_size=4. On the 48 GB local box, batch=8
