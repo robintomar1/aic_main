@@ -92,11 +92,21 @@ def main() -> int:
     p.add_argument("--checkpoint-dir", type=Path, required=True)
     p.add_argument("--dataset-root", type=Path, required=True)
     p.add_argument("--port-type", choices=["sfp", "sc", "any"], default="sfp",
-                   help="Filter to episodes of this plug type. SFP hovers ~20cm "
-                        "above port (port-local z ~ -0.15), SC ~10cm (~ -0.10). "
-                        "The live failure was SFP, so default to that.")
+                   help="Filter to episodes of this plug type. Default sfp "
+                        "(matches the live failure case).")
+    p.add_argument("--tcp-z-lo", type=float, default=-0.125,
+                   help="Lower bound (inclusive) of port-local tcp_z bucket. "
+                        "Default -0.125 — matches live stuck position.")
+    p.add_argument("--tcp-z-hi", type=float, default=-0.115,
+                   help="Upper bound (exclusive) of port-local tcp_z bucket.")
+    p.add_argument("--hover-lag-max", type=float, default=-0.008,
+                   help="A frame is 'hover-regime' if (action_z - tcp_z) <= this. "
+                        "Default -8mm.")
+    p.add_argument("--commit-lag-min", type=float, default=-0.003,
+                   help="A frame is 'commit-regime' if (action_z - tcp_z) >= this. "
+                        "Default -3mm.")
     p.add_argument("--n-trials", type=int, default=3,
-                   help="Repeat probe over N different episodes; report each.")
+                   help="Number of (hover, commit) frame pairs to probe.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,8 +126,8 @@ def main() -> int:
     # Use the parquet directly to find frames by tcp_z without iterating ds (slow).
     t = pq.read_table(
         str(args.dataset_root / "data" / "chunk-000" / "file-000.parquet"))
-    states = np.stack(t["observation.state"].to_pylist())
-    actions = np.stack(t["action"].to_pylist())
+    state = np.stack(t["observation.state"].to_pylist())
+    action = np.stack(t["action"].to_pylist())
     eps = np.array(t["episode_index"].to_pylist())
 
     # Per episode: find frames closest to hover-z and commit-z. Require both in
@@ -137,60 +147,51 @@ def main() -> int:
         )
         task_strs[e] = (r.get("tasks") or [""])[0]
 
-    # Filter episodes by port type (SFP vs SC) — each has different hover/commit
-    # heights, so we should not mix them in a single probe.
+    # Filter episodes by port type (SFP vs SC).
     def _ep_matches_port_type(task_str: str, port_type: str) -> bool:
         if port_type == "any":
             return True
-        # task_string_for: "insert {port_type} plug into {port_name} on {mount}"
         return task_str.startswith(f"insert {port_type} plug")
 
-    matching_eps = [e for e, ts in task_strs.items()
-                    if _ep_matches_port_type(ts, args.port_type)]
-    print(f"port-type filter: {args.port_type!r}  "
-          f"matching episodes: {len(matching_eps)} / {len(task_strs)}")
+    matching_eps = set(e for e, ts in task_strs.items()
+                       if _ep_matches_port_type(ts, args.port_type))
+    print(f"port-type filter: {args.port_type!r}  matching episodes: {len(matching_eps)}")
 
-    # Per-episode hover/commit frame selection by ACTION TRAJECTORY SHAPE,
-    # not a fixed tcp_z. Robust across SFP vs SC because each episode is
-    # bucketed by its own progress.
-    #   1. Compute the per-episode action_z range and pick "approach end" =
-    #      where action_z is at 30% of episode-internal progress (after the
-    #      initial fast descent has settled into hover).
-    #   2. "Commit frame" = where action_z is at 80% of progress (well into
-    #      the descent into port).
-    # Progress fraction = (action_z[t] - action_z_min) / (action_z_max - action_z_min)
-    # Since action_z increases monotonically toward port over an episode
-    # (less negative = closer to port), progress 0 = start, 1 = end.
+    # IN-DISTRIBUTION frame selection: pick pairs at the same tcp_z bucket
+    # (where live policy gets stuck) but with different lag regimes.
+    # We narrow to a thin tcp_z slice so any two frames from this slice are
+    # at "the same" position physically. Then we split into hover-lag and
+    # commit-lag clusters by their action lag.
+    z_lo, z_hi = args.tcp_z_lo, args.tcp_z_hi
+    lag_z = action[:, 2] - state[:, 2]
+    in_bucket = (state[:, 2] >= z_lo) & (state[:, 2] < z_hi)
+    in_bucket &= np.array([int(e) in matching_eps for e in eps])
+    bucket_idx = np.where(in_bucket)[0]
+    if len(bucket_idx) == 0:
+        sys.exit(f"no frames in tcp_z=[{z_lo},{z_hi}) for port_type={args.port_type}")
+    bucket_lag = lag_z[bucket_idx]
+    print(f"frames in bucket: {len(bucket_idx)}  "
+          f"lag p10={np.percentile(bucket_lag,10)*1000:+.2f}mm  "
+          f"p50={np.percentile(bucket_lag,50)*1000:+.2f}mm  "
+          f"p90={np.percentile(bucket_lag,90)*1000:+.2f}mm")
+
+    hover_pool = bucket_idx[bucket_lag <= args.hover_lag_max]
+    commit_pool = bucket_idx[bucket_lag >= args.commit_lag_min]
+    print(f"hover-lag pool (lag<={args.hover_lag_max*1000:.1f}mm): {len(hover_pool)}")
+    print(f"commit-lag pool (lag>={args.commit_lag_min*1000:.1f}mm): {len(commit_pool)}")
+    if len(hover_pool) < args.n_trials or len(commit_pool) < args.n_trials:
+        sys.exit("not enough frames in pools — relax --hover-lag-max/--commit-lag-min "
+                 "or widen --tcp-z-lo/-hi")
+
+    rng = np.random.default_rng(0)
     candidates = []
-    for e in sorted(matching_eps):
-        lo, hi = bounds[e]
-        ep_az = actions[lo:hi, 2]
-        ep_tz = states[lo:hi, 2]
-        if (hi - lo) < 50:
-            continue
-        az_min = ep_az.min()
-        az_max = ep_az.max()
-        if az_max - az_min < 0.05:
-            continue  # not enough range — skip ill-formed episode
-        progress = (ep_az - az_min) / (az_max - az_min)
-        # Find earliest frame where progress >= 0.3 → end of approach / start hover
-        try:
-            i_h = int(np.argmax(progress >= 0.30))
-            i_c = int(np.argmax(progress >= 0.80))
-            if i_c <= i_h or i_c >= (hi - lo) - 2:
-                continue
-        except ValueError:
-            continue
-        candidates.append((e, lo + i_h, lo + i_c))
-        if len(candidates) >= args.n_trials:
-            break
-    if not candidates:
-        sys.exit("could not find matching episodes with both hover and commit "
-                 "phases — try --port-type any")
-    print(f"using {len(candidates)} episode(s): {[c[0] for c in candidates]}")
-    for e, h_gi, c_gi in candidates:
-        print(f"  ep {e}  hover@{h_gi} (tcp_z={states[h_gi,2]:+.4f}, action_z={actions[h_gi,2]:+.4f})  "
-              f"commit@{c_gi} (tcp_z={states[c_gi,2]:+.4f}, action_z={actions[c_gi,2]:+.4f})")
+    for k in range(args.n_trials):
+        h_gi = int(rng.choice(hover_pool))
+        c_gi = int(rng.choice(commit_pool))
+        e_h = int(eps[h_gi]); e_c = int(eps[c_gi])
+        candidates.append((e_h, e_c, h_gi, c_gi))
+        print(f"  pair {k}: hover ep={e_h}@{h_gi} (tcp_z={state[h_gi,2]:+.4f}, action_z={action[h_gi,2]:+.4f}, lag={(action[h_gi,2]-state[h_gi,2])*1000:+.2f}mm)  "
+              f"|  commit ep={e_c}@{c_gi} (tcp_z={state[c_gi,2]:+.4f}, action_z={action[c_gi,2]:+.4f}, lag={(action[c_gi,2]-state[c_gi,2])*1000:+.2f}mm)")
     print()
 
     # ------------------------------------------------------------------
@@ -204,11 +205,16 @@ def main() -> int:
         return (f"{label:>8s}: a_xyz=({action[0]:+.4f},{action[1]:+.4f},{action[2]:+.4f}) "
                 f"|  delta_xyz=({d[0]*1000:+6.2f},{d[1]*1000:+6.2f},{d[2]*1000:+6.2f})mm")
 
-    for ep_idx, hover_gi, commit_gi in candidates:
-        task_str = task_strs[ep_idx]
-        print(f"=== episode {ep_idx}  task={task_str!r} ===")
-        print(f"   hover global idx: {hover_gi}  tcp_z={states[hover_gi,2]:+.4f}")
-        print(f"  commit global idx: {commit_gi}  tcp_z={states[commit_gi,2]:+.4f}")
+    for e_h, e_c, hover_gi, commit_gi in candidates:
+        task_h = task_strs[e_h]
+        task_c = task_strs[e_c]
+        print(f"=== hover ep={e_h} ({task_h!r})  |  commit ep={e_c} ({task_c!r}) ===")
+        print(f"   hover global idx: {hover_gi}  tcp_z={state[hover_gi,2]:+.4f}")
+        print(f"  commit global idx: {commit_gi}  tcp_z={state[commit_gi,2]:+.4f}")
+        # Use hover episode's task string for inference (the model sees it).
+        # The intent: ask "if model sees hover state + hover task, but commit's
+        # aux channels — does prediction flip toward commit-regime?"
+        task_str = task_h
 
         # Grab full obs items from LeRobotDataset (gets decoded images).
         item_h = ds[hover_gi]
@@ -241,8 +247,8 @@ def main() -> int:
                            make_obs(st_h, imgs_h, task_str))
         a_commit = _run_one(policy, pre, post,
                             make_obs(st_c, imgs_c, task_str))
-        rec_h = actions[hover_gi]
-        rec_c = actions[commit_gi]
+        rec_h = action[hover_gi]
+        rec_c = action[commit_gi]
 
         print()
         print("  REFERENCE predictions (raw frames):")
@@ -281,10 +287,27 @@ def main() -> int:
         a = _run_one(policy, pre, post, make_obs(st_swap_j, imgs_h, task_str))
         print(f"  {lag_str('+JOINTS', a, st_swap_j.numpy())}")
 
-        # Wrench swap.
+        # Wrench swap (full 6-dim).
         st_swap_w = swap_state(slice(26, 32))
         a = _run_one(policy, pre, post, make_obs(st_swap_w, imgs_h, task_str))
         print(f"  {lag_str('+WRENCH', a, st_swap_w.numpy())}")
+
+        # Wrench Fy alone (statistical analysis showed strongest single-channel signal).
+        st_swap_fy = st_h.clone()
+        st_swap_fy[27] = st_c[27]
+        a = _run_one(policy, pre, post, make_obs(st_swap_fy, imgs_h, task_str))
+        print(f"  {lag_str('+Fy', a, st_swap_fy.numpy())}")
+
+        # tcp_error.err_z alone (also showed sign-flip across regimes).
+        st_swap_errz = st_h.clone()
+        st_swap_errz[15] = st_c[15]
+        a = _run_one(policy, pre, post, make_obs(st_swap_errz, imgs_h, task_str))
+        print(f"  {lag_str('+err_z', a, st_swap_errz.numpy())}")
+
+        # tcp_error full.
+        st_swap_err = swap_state(slice(13, 19))
+        a = _run_one(policy, pre, post, make_obs(st_swap_err, imgs_h, task_str))
+        print(f"  {lag_str('+TCP_ERR', a, st_swap_err.numpy())}")
 
         # Image swap (most likely candidate — vision encoder is the heavy lift).
         a = _run_one(policy, pre, post, make_obs(st_h, imgs_c, task_str))
