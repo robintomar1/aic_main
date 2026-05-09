@@ -162,14 +162,23 @@ def build_tasks_parquet(out_meta_dir: Path) -> dict[tuple[str, str], int]:
     `ACT_VALID_TARGETS` is a tuple of `(mount, port_name)` pairs (verified
     2026-05-08 in act/labels.py — 12 entries, no port_type in the tuple).
     """
-    rows: list[dict] = []
+    # lerobot's load_tasks expects the parquet to be INDEXED by task string
+    # (col=task_index only), not a default RangeIndex with task as a column.
+    # `dataset_reader.py:281` does `meta.tasks.iloc[task_idx].name` to retrieve
+    # the task string — `.name` returns the index value, so the index must BE
+    # the task string. Building via pandas to control the index.
+    import pandas as pd
     out: dict[tuple[str, str], int] = {}
+    task_strs: list[str] = []
     for i, (mod, port) in enumerate(ACT_VALID_TARGETS):
         ptype = _port_type_for(port)
-        rows.append({"task_index": i, "task": task_string_for(mod, port, ptype)})
+        task_strs.append(task_string_for(mod, port, ptype))
         out[(mod, port)] = i
-    table = pa.Table.from_pylist(rows)
-    pq.write_table(table, str(out_meta_dir / "tasks.parquet"))
+    df = pd.DataFrame(
+        {"task_index": list(range(len(task_strs)))},
+        index=pd.Index(task_strs, name="task"),
+    )
+    df.to_parquet(out_meta_dir / "tasks.parquet")
     return out
 
 
