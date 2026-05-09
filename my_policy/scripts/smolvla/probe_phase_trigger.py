@@ -91,11 +91,10 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint-dir", type=Path, required=True)
     p.add_argument("--dataset-root", type=Path, required=True)
-    p.add_argument("--target-tcp-z-hover", type=float, default=-0.119,
-                   help="Port-local tcp_z to match for the HOVER probe. "
-                        "Default -0.119 ≈ where live policy gets stuck.")
-    p.add_argument("--target-tcp-z-commit", type=float, default=-0.085,
-                   help="Port-local tcp_z for the COMMIT probe (model fully descending).")
+    p.add_argument("--port-type", choices=["sfp", "sc", "any"], default="sfp",
+                   help="Filter to episodes of this plug type. SFP hovers ~20cm "
+                        "above port (port-local z ~ -0.15), SC ~10cm (~ -0.10). "
+                        "The live failure was SFP, so default to that.")
     p.add_argument("--n-trials", type=int, default=3,
                    help="Repeat probe over N different episodes; report each.")
     args = p.parse_args()
@@ -138,23 +137,60 @@ def main() -> int:
         )
         task_strs[e] = (r.get("tasks") or [""])[0]
 
+    # Filter episodes by port type (SFP vs SC) — each has different hover/commit
+    # heights, so we should not mix them in a single probe.
+    def _ep_matches_port_type(task_str: str, port_type: str) -> bool:
+        if port_type == "any":
+            return True
+        # task_string_for: "insert {port_type} plug into {port_name} on {mount}"
+        return task_str.startswith(f"insert {port_type} plug")
+
+    matching_eps = [e for e, ts in task_strs.items()
+                    if _ep_matches_port_type(ts, args.port_type)]
+    print(f"port-type filter: {args.port_type!r}  "
+          f"matching episodes: {len(matching_eps)} / {len(task_strs)}")
+
+    # Per-episode hover/commit frame selection by ACTION TRAJECTORY SHAPE,
+    # not a fixed tcp_z. Robust across SFP vs SC because each episode is
+    # bucketed by its own progress.
+    #   1. Compute the per-episode action_z range and pick "approach end" =
+    #      where action_z is at 30% of episode-internal progress (after the
+    #      initial fast descent has settled into hover).
+    #   2. "Commit frame" = where action_z is at 80% of progress (well into
+    #      the descent into port).
+    # Progress fraction = (action_z[t] - action_z_min) / (action_z_max - action_z_min)
+    # Since action_z increases monotonically toward port over an episode
+    # (less negative = closer to port), progress 0 = start, 1 = end.
     candidates = []
-    for e, (lo, hi) in sorted(bounds.items()):
-        ep_z = states[lo:hi, 2]
-        # Closest-z indices (relative to ep start).
-        i_h = int(np.argmin(np.abs(ep_z - args.target_tcp_z_hover)))
-        i_c = int(np.argmin(np.abs(ep_z - args.target_tcp_z_commit)))
-        # Require closeness within tolerance.
-        if abs(ep_z[i_h] - args.target_tcp_z_hover) < 0.005 and \
-           abs(ep_z[i_c] - args.target_tcp_z_commit) < 0.005 and \
-           i_c > i_h:  # commit comes after hover in time
-            candidates.append((e, lo + i_h, lo + i_c))
+    for e in sorted(matching_eps):
+        lo, hi = bounds[e]
+        ep_az = actions[lo:hi, 2]
+        ep_tz = states[lo:hi, 2]
+        if (hi - lo) < 50:
+            continue
+        az_min = ep_az.min()
+        az_max = ep_az.max()
+        if az_max - az_min < 0.05:
+            continue  # not enough range — skip ill-formed episode
+        progress = (ep_az - az_min) / (az_max - az_min)
+        # Find earliest frame where progress >= 0.3 → end of approach / start hover
+        try:
+            i_h = int(np.argmax(progress >= 0.30))
+            i_c = int(np.argmax(progress >= 0.80))
+            if i_c <= i_h or i_c >= (hi - lo) - 2:
+                continue
+        except ValueError:
+            continue
+        candidates.append((e, lo + i_h, lo + i_c))
         if len(candidates) >= args.n_trials:
             break
     if not candidates:
-        sys.exit("could not find episodes with both target tcp_z values "
-                 "within tolerance")
+        sys.exit("could not find matching episodes with both hover and commit "
+                 "phases — try --port-type any")
     print(f"using {len(candidates)} episode(s): {[c[0] for c in candidates]}")
+    for e, h_gi, c_gi in candidates:
+        print(f"  ep {e}  hover@{h_gi} (tcp_z={states[h_gi,2]:+.4f}, action_z={actions[h_gi,2]:+.4f})  "
+              f"commit@{c_gi} (tcp_z={states[c_gi,2]:+.4f}, action_z={actions[c_gi,2]:+.4f})")
     print()
 
     # ------------------------------------------------------------------
