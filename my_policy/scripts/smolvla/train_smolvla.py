@@ -197,7 +197,27 @@ def main() -> int:
         "--save_checkpoint=true",
     ]
     if args.resume:
-        cli.append("--resume=true")
+        # lerobot's resume needs --config_path pointing to the saved
+        # train_config.json (TRAIN_CONFIG_NAME) from the previous run.
+        # Convention: it lives at <output_dir>/checkpoints/last/pretrained_model/
+        # (symlinked to the latest step's dir).
+        candidate = output_dir / "checkpoints" / "last" / "pretrained_model" / "train_config.json"
+        if not candidate.exists():
+            # Fall back: search for the highest-numbered checkpoint.
+            ck_root = output_dir / "checkpoints"
+            if ck_root.exists():
+                steps = sorted(
+                    [d for d in ck_root.iterdir() if d.is_dir() and d.name.isdigit()],
+                    key=lambda d: int(d.name),
+                )
+                if steps:
+                    candidate = steps[-1] / "pretrained_model" / "train_config.json"
+        if not candidate.exists():
+            print(f"error: --resume requested but train_config.json not found "
+                  f"under {output_dir}/checkpoints/", file=sys.stderr)
+            return 1
+        print(f"resume config_path  : {candidate}")
+        cli.extend(["--resume=true", f"--config_path={candidate}"])
     if not args.no_image_transforms:
         cli.append("--dataset.image_transforms.enable=true")
 
