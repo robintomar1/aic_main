@@ -197,7 +197,8 @@ def _build_state_32(
     )
     out = transform_frame(inp)
 
-    err_z_value = float(cs.tcp_error[2]) if err_z_override is None else float(err_z_override)
+    raw_err_z = float(cs.tcp_error[2])
+    err_z_value = raw_err_z if err_z_override is None else float(err_z_override)
     state = np.array(
         [
             *out.tcp_pose_portframe,         # 7
@@ -210,6 +211,24 @@ def _build_state_32(
         dtype=np.float32,
     )
     assert state.shape == (STATE_DIM,), f"state must be {STATE_DIM}-dim, got {state.shape}"
+    # Diagnostic: print on first few calls + sparingly. We want to confirm
+    # state[15] reflects the override when set, and we want to see what the
+    # live full state vector looks like compared to the dataset's hover frames
+    # the probe used. Print compactly so log isn't flooded.
+    if not getattr(_build_state_32, "_call_count", 0):
+        _build_state_32._call_count = 0  # type: ignore[attr-defined]
+    _build_state_32._call_count += 1  # type: ignore[attr-defined]
+    if _build_state_32._call_count <= 3 or _build_state_32._call_count % 50 == 0:
+        s = state
+        print(f"[state_dbg #{_build_state_32._call_count}] "
+              f"raw_err_z={raw_err_z*1000:+.2f}mm  "
+              f"override={err_z_override}  "
+              f"state[15]={s[15]*1000:+.2f}mm  "
+              f"tcp=({s[0]:+.3f},{s[1]:+.3f},{s[2]:+.3f})  "
+              f"err=({s[13]*1000:+.1f},{s[14]*1000:+.1f},{s[15]*1000:+.1f})mm  "
+              f"vel=({s[7]*1000:+.1f},{s[8]*1000:+.1f},{s[9]*1000:+.1f})mm/s  "
+              f"|F|={np.linalg.norm(s[26:29]):.2f}N",
+              flush=True)
     return torch.from_numpy(state)
 
 
