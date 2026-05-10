@@ -32,6 +32,12 @@ dispatch.
 Run-time configuration (env vars):
     AIC_PL_SMOLVLA_CHECKPOINT   Path to .../checkpoints/<step>/pretrained_model/. Required.
     AIC_PL_SMOLVLA_TIMEOUT_S    Per-trial inference budget. Default 30 s.
+    AIC_PL_SMOLVLA_N_ACTION_STEPS  If set, overrides cfg.n_action_steps at
+                                inference (default = chunk_size = 50). Smaller
+                                values force the model to re-run on fresh
+                                observations more often. Set to 1 for fully
+                                closed-loop control IF SmolVLA inference
+                                latency stays under the 50 ms / tick budget.
     AIC_PL_LOCALIZER_CHECKPOINT If set, replaces /tf port lookup.
     AIC_PL_LOCALIZER_QUATS_JSON Optional sidecar quats for localizer.
     AIC_PL_LOCALIZER_DEVICE     cuda or cpu (default cuda).
@@ -99,10 +105,28 @@ STATE_DIM = 26  # 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench (no tcp_erro
 # ---------------------------------------------------------------------------
 
 
-def _load_smolvla_policy(ckpt_dir: Path, device: torch.device) -> SmolVLAPolicy:
-    """Load SmolVLA model + config from a checkpoint dir."""
+def _load_smolvla_policy(
+    ckpt_dir: Path,
+    device: torch.device,
+    n_action_steps_override: int | None = None,
+) -> SmolVLAPolicy:
+    """Load SmolVLA model + config from a checkpoint dir.
+
+    `n_action_steps_override`: if set, overrides cfg.n_action_steps before
+    instantiating the policy. SmolVLA's default n_action_steps == chunk_size
+    (50 at training time) means the policy runs open-loop on its predicted
+    chunk between forward passes — at 20 Hz that's 2.5 s of stale plan.
+    Setting this to a smaller value (e.g. 1) forces SmolVLA to re-run its
+    flow-matching denoiser on fresh observations more often, at proportional
+    cost in inference latency. 1 is fully closed-loop; useful for fine
+    alignment where the plan needs to react to small motions. Be aware
+    SmolVLA-500M forward passes are not free — verify p99 < 50 ms before
+    setting to 1, or stay at 5-10 for a middle ground.
+    """
     cfg_dict = json.loads((ckpt_dir / "config.json").read_text())
     cfg_dict.pop("type", None)
+    if n_action_steps_override is not None:
+        cfg_dict["n_action_steps"] = int(n_action_steps_override)
     config = draccus.decode(SmolVLAConfig, cfg_dict)
     policy = SmolVLAPolicy(config)
     policy.load_state_dict(load_file(str(ckpt_dir / "model.safetensors")))
@@ -254,6 +278,10 @@ class RunSmolVLA(Policy):
     CHECKPOINT_ENV = "AIC_PL_SMOLVLA_CHECKPOINT"
     TIMEOUT_ENV = "AIC_PL_SMOLVLA_TIMEOUT_S"
 
+    # If set, overrides cfg.n_action_steps at inference. See
+    # `_load_smolvla_policy` docstring for tradeoffs.
+    N_ACTION_STEPS_ENV = "AIC_PL_SMOLVLA_N_ACTION_STEPS"
+
     LOCALIZER_CKPT_ENV = "AIC_PL_LOCALIZER_CHECKPOINT"
     LOCALIZER_QUATS_ENV = "AIC_PL_LOCALIZER_QUATS_JSON"
     LOCALIZER_DEVICE_ENV = "AIC_PL_LOCALIZER_DEVICE"
@@ -275,7 +303,11 @@ class RunSmolVLA(Policy):
             raise FileNotFoundError(f"checkpoint dir does not exist: {ckpt_path}")
         self.ckpt_dir = ckpt_path
 
-        self.policy = _load_smolvla_policy(ckpt_path, self.device)
+        n_steps_str = os.environ.get(self.N_ACTION_STEPS_ENV, "").strip()
+        n_action_steps_override = int(n_steps_str) if n_steps_str else None
+        self.policy = _load_smolvla_policy(
+            ckpt_path, self.device, n_action_steps_override,
+        )
 
         self.preprocessor = DataProcessorPipeline.from_pretrained(
             str(ckpt_path), config_filename="policy_preprocessor.json"
@@ -298,6 +330,8 @@ class RunSmolVLA(Policy):
             f"RunSmolVLA loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
             f"timeout={self.timeout_s}s "
+            f"n_action_steps={self.policy.config.n_action_steps} "
+            f"chunk_size={self.policy.config.chunk_size} "
             f"localizer_mode={self._localizer_mode()}"
         )
 
