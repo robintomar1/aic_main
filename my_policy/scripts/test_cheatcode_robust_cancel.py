@@ -223,6 +223,11 @@ def _mock_ros_imports() -> None:
 
 _mock_ros_imports()
 
+# Outer my_policy/ on path so `from my_policy.probe import ...` (used by
+# CheatCodeRobust to wire the Stage 1 tilt-probe feature flag) resolves.
+sys.path.insert(
+    0, "/home/robin/ssd/aic_workspace/aic_code_robin/aic_main/my_policy"
+)
 sys.path.insert(
     0, "/home/robin/ssd/aic_workspace/aic_code_robin/aic_main/my_policy/my_policy/ros"
 )
@@ -740,6 +745,98 @@ def test_insert_cable_aborts_when_node_deactivates_mid_run():
 
 
 # ============================================================================
+# Probe feature flag (Stage 1 of CheatCodeContinuous rewrite)
+# ============================================================================
+
+def test_probe_disabled_by_default():
+    """Without CHEATCODE_USE_PROBE env var, probe must be inactive — existing
+    spiral logic runs and behavior is unchanged from prior CheatCodeRobust."""
+    os.environ.pop(CheatCodeRobust.USE_PROBE_ENV, None)
+    parent = FakeParentNode()
+    policy = CheatCodeRobust(parent)
+    assert policy._use_probe is False
+    assert policy._probe is None
+
+
+def test_probe_enabled_when_env_set():
+    """CHEATCODE_USE_PROBE=1 → policy creates a TiltProbeStateMachine instance."""
+    os.environ[CheatCodeRobust.USE_PROBE_ENV] = "1"
+    try:
+        parent = FakeParentNode()
+        policy = CheatCodeRobust(parent)
+        assert policy._use_probe is True
+        assert policy._probe is not None
+        assert policy._probe.state == policy._probe.STATE_IDLE
+    finally:
+        os.environ.pop(CheatCodeRobust.USE_PROBE_ENV)
+
+
+def test_probe_config_respects_env_vars():
+    """Probe parameters are read from env vars; defaults apply when unset."""
+    os.environ[CheatCodeRobust.USE_PROBE_ENV] = "1"
+    os.environ[CheatCodeRobust.PROBE_TILT_DEG_ENV] = "7.5"
+    os.environ[CheatCodeRobust.PROBE_DIRECTIONS_ENV] = "12"
+    os.environ[CheatCodeRobust.PROBE_TRANSLATE_M_ENV] = "0.0025"
+    os.environ[CheatCodeRobust.PROBE_RETRY_DEG_ENV] = "5,10,15,20"
+    try:
+        parent = FakeParentNode()
+        policy = CheatCodeRobust(parent)
+        assert policy._probe.cfg.tilt_deg == 7.5
+        assert policy._probe.cfg.n_directions == 12
+        assert policy._probe.cfg.translate_m == 0.0025
+        assert policy._probe.cfg.retry_tilt_deg == [5.0, 10.0, 15.0, 20.0]
+    finally:
+        for k in (
+            CheatCodeRobust.USE_PROBE_ENV,
+            CheatCodeRobust.PROBE_TILT_DEG_ENV,
+            CheatCodeRobust.PROBE_DIRECTIONS_ENV,
+            CheatCodeRobust.PROBE_TRANSLATE_M_ENV,
+            CheatCodeRobust.PROBE_RETRY_DEG_ENV,
+        ):
+            os.environ.pop(k, None)
+
+
+def test_probe_config_invalid_values_fall_back_to_defaults():
+    """Garbled env vars don't crash __init__; defaults apply."""
+    os.environ[CheatCodeRobust.USE_PROBE_ENV] = "1"
+    os.environ[CheatCodeRobust.PROBE_TILT_DEG_ENV] = "not-a-number"
+    os.environ[CheatCodeRobust.PROBE_RETRY_DEG_ENV] = "garbage,more-garbage"
+    try:
+        parent = FakeParentNode()
+        policy = CheatCodeRobust(parent)
+        # Defaults from ProbeConfig().
+        assert policy._probe.cfg.tilt_deg == 5.0
+        assert policy._probe.cfg.retry_tilt_deg == [5.0, 8.0, 12.0]
+    finally:
+        for k in (
+            CheatCodeRobust.USE_PROBE_ENV,
+            CheatCodeRobust.PROBE_TILT_DEG_ENV,
+            CheatCodeRobust.PROBE_RETRY_DEG_ENV,
+        ):
+            os.environ.pop(k, None)
+
+
+def test_probe_log_path_creates_parent_dir(tmp_path=None):
+    """When CHEATCODE_PROBE_LOG points at a nested path, parent directory
+    is created so the log can be appended later."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        log_path = os.path.join(td, "subdir", "probe.jsonl")
+        os.environ[CheatCodeRobust.USE_PROBE_ENV] = "1"
+        os.environ[CheatCodeRobust.PROBE_LOG_ENV] = log_path
+        try:
+            parent = FakeParentNode()
+            policy = CheatCodeRobust(parent)
+            assert policy._probe_log_path is not None
+            assert policy._probe_log_path.parent.exists(), (
+                f"parent dir {policy._probe_log_path.parent} not created"
+            )
+        finally:
+            os.environ.pop(CheatCodeRobust.USE_PROBE_ENV, None)
+            os.environ.pop(CheatCodeRobust.PROBE_LOG_ENV, None)
+
+
+# ============================================================================
 # Runner
 # ============================================================================
 
@@ -766,6 +863,11 @@ if __name__ == "__main__":
         test_sample_trial_noise_xy_magnitude_matches_env,
         test_sample_trial_noise_deterministic_per_task,
         test_sample_trial_noise_different_tasks_different_offsets,
+        test_probe_disabled_by_default,
+        test_probe_enabled_when_env_set,
+        test_probe_config_respects_env_vars,
+        test_probe_config_invalid_values_fall_back_to_defaults,
+        test_probe_log_path_creates_parent_dir,
     ]
     failures = 0
     for t in tests:
