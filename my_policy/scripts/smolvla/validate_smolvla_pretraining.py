@@ -8,7 +8,7 @@ kicking off a 100k overnight run.
 What it checks (each prints a section, errors are loud):
 
   1. Dataset shape + schema
-       state shape = (N, 32), action = (N, 7), 3 cameras
+       state shape = (N, 26), action = (N, 7), 3 cameras
        tasks.parquet indexed by string (the SmolVLA tokenizer requirement)
        train/val split sizes + episode counts
   2. Per-episode `tasks` strings populated and consistent
@@ -24,7 +24,7 @@ What it checks (each prints a section, errors are loud):
        observation.language_tokens shape
        observation.language_attention_mask shape + dtype
   5. Stats.json sanity
-       state mean/std are 32-dim, finite, plausible magnitudes
+       state mean/std are 26-dim, finite, plausible magnitudes
        action mean/std 7-dim, finite
        camera stats present for all 3 cameras
   6. End-to-end loss step
@@ -72,22 +72,22 @@ def check_dataset_schema(root: Path) -> dict:
     state_feat = info["features"]["observation.state"]
     action_feat = info["features"]["action"]
 
-    assert state_feat["shape"] == [32], \
-        f"state shape {state_feat['shape']} != [32]"
+    assert state_feat["shape"] == [26], \
+        f"state shape {state_feat['shape']} != [26]"
     _ok(f"observation.state shape = {state_feat['shape']}")
 
     assert action_feat["shape"] == [7], \
         f"action shape {action_feat['shape']} != [7]"
     _ok(f"action shape = {action_feat['shape']}")
 
-    assert len(state_feat["names"]) == 32
+    assert len(state_feat["names"]) == 26
     expected_first = "tcp_pose.position.x"
     expected_last_groups = ["wrench.fx", "wrench.tz"]
     assert state_feat["names"][0] == expected_first, \
         f"first state channel = {state_feat['names'][0]!r}, expected {expected_first!r}"
     assert state_feat["names"][-1] == expected_last_groups[-1], \
         f"last state channel = {state_feat['names'][-1]!r}, expected wrench.tz"
-    _ok(f"state channels: [0]={state_feat['names'][0]!r} … [31]={state_feat['names'][-1]!r}")
+    _ok(f"state channels: [0]={state_feat['names'][0]!r} … [25]={state_feat['names'][-1]!r}")
 
     cam_keys = [k for k, v in info["features"].items()
                 if v.get("dtype") == "video"]
@@ -171,8 +171,8 @@ def check_stats_json(root: Path) -> None:
     action_mean = np.array(action_stats["mean"])
     action_std = np.array(action_stats["std"])
 
-    assert state_mean.shape == (32,), f"state mean shape = {state_mean.shape}"
-    assert state_std.shape == (32,), f"state std shape = {state_std.shape}"
+    assert state_mean.shape == (26,), f"state mean shape = {state_mean.shape}"
+    assert state_std.shape == (26,), f"state std shape = {state_std.shape}"
     assert action_mean.shape == (7,), f"action mean shape = {action_mean.shape}"
     assert action_std.shape == (7,), f"action std shape = {action_std.shape}"
     _ok(f"shapes: state {state_mean.shape}, action {action_mean.shape}")
@@ -307,7 +307,7 @@ def run_preprocessor_and_loss(root: Path, skip_loss: bool) -> None:
     )
     # Set up features so the processor knows which keys to normalize.
     config.input_features = {
-        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(32,)),
+        "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(26,)),
         "observation.images.left_camera": PolicyFeature(
             type=FeatureType.VISUAL, shape=(3, 256, 288)),
         "observation.images.center_camera": PolicyFeature(

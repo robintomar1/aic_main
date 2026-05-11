@@ -61,6 +61,17 @@ def main() -> int:
                    help="Subdir name for the merged dataset (default v9_port_local_merged).")
     p.add_argument("--batches", nargs="+", default=DEFAULT_BATCHES,
                    help=f"Batches to include. Default: {DEFAULT_BATCHES}")
+    p.add_argument("--episode-list-suffix", type=str, default="act_clean",
+                   help="Suffix of the per-batch episode-list JSON to use. "
+                        "Default 'act_clean' -> '<batch>_act_clean_episodes.json'. "
+                        "Pass 'act_all' to use the union of clean+messy "
+                        "(see write_all_episodes_lists.py).")
+    p.add_argument("--per-batch-suffix", type=str, default="",
+                   help="Optional suffix on each per-batch output dir; "
+                        "e.g. '_corr' -> '<batch>_port_local_dataset_corr'. "
+                        "Use this when running parallel pipelines so the "
+                        "clean and corrections rebuilds do not clobber each "
+                        "other.")
     p.add_argument("--force", action="store_true",
                    help="Re-build batches whose output already exists, "
                         "and overwrite the merged dataset if it exists.")
@@ -78,12 +89,13 @@ def main() -> int:
     # Step 1: build per-batch port-local datasets.
     source_paths: list[Path] = []
     for batch in args.batches:
-        out_dir = args.out_root / f"{batch}_port_local_dataset"
-        clean_json = args.out_root / f"{batch}_act_clean_episodes.json"
+        out_dir = args.out_root / f"{batch}_port_local_dataset{args.per_batch_suffix}"
+        clean_json = args.out_root / f"{batch}_{args.episode_list_suffix}_episodes.json"
         if not clean_json.exists():
             sys.exit(
-                f"missing clean-episodes filter: {clean_json}\n"
-                f"(produced by inspect_act_demos.py — re-run if needed)"
+                f"missing episode-list filter: {clean_json}\n"
+                f"(produced by inspect_act_demos.py for *_act_clean / *_act_messy, "
+                f"or by write_all_episodes_lists.py for *_act_all)"
             )
 
         if out_dir.exists() and not args.force:
@@ -96,16 +108,16 @@ def main() -> int:
             import shutil
             shutil.rmtree(out_dir)
 
-        _run(
-            [
-                sys.executable, str(BUILDER),
-                "--collection-dir", str(args.collection_dir),
-                "--batch", batch,
-                "--out-root", str(args.out_root),
-                "--clean-episodes-json", str(clean_json),
-            ],
-            f"build {batch}",
-        )
+        builder_cmd = [
+            sys.executable, str(BUILDER),
+            "--collection-dir", str(args.collection_dir),
+            "--batch", batch,
+            "--out-root", str(args.out_root),
+            "--clean-episodes-json", str(clean_json),
+        ]
+        if args.per_batch_suffix:
+            builder_cmd.extend(["--out-dir-suffix", args.per_batch_suffix])
+        _run(builder_cmd, f"build {batch}")
         source_paths.append(out_dir)
 
     # Step 2: merge all 6 into one dataset.

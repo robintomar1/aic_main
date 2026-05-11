@@ -246,6 +246,9 @@ def main() -> int:
     p.add_argument("--clean-episodes-json", type=Path, default=None)
     p.add_argument("--val-fraction", type=float, default=0.2)
     p.add_argument("--split-seed", type=int, default=42)
+    p.add_argument("--out-dir-suffix", type=str, default="",
+                   help="Optional suffix on the output dir name, e.g. '_corr' -> "
+                        "<out-root>/<batch>_port_local_dataset_corr/.")
     args = p.parse_args()
 
     src_root = args.collection_dir / args.batch
@@ -260,7 +263,7 @@ def main() -> int:
             print(f"error: {label} not found at {p_}", file=sys.stderr)
             return 1
 
-    out_root = args.out_root / f"{args.batch}_port_local_dataset"
+    out_root = args.out_root / f"{args.batch}_port_local_dataset{args.out_dir_suffix}"
     out_data_dir = out_root / "data" / "chunk-000"
     out_meta_dir = out_root / "meta"
     out_meta_eps_dir = out_meta_dir / "episodes" / "chunk-000"
