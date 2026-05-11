@@ -19,7 +19,6 @@ Training-oracle only. Uses ground_truth:=true TF and is NOT submission-safe.
 """
 
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
@@ -40,12 +39,6 @@ from rclpy.time import Time
 from std_msgs.msg import String
 from tf2_ros import TransformException
 from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
-
-from my_policy.probe import (
-    PoseSnapshot,
-    ProbeConfig,
-    TiltProbeStateMachine,
-)
 
 
 class CheatCodeRobust(Policy):
@@ -221,31 +214,6 @@ class CheatCodeRobust(Policy):
     # channels, TCP layout, camera dict keys) before a noisy bench run.
     LOCALIZER_VERIFY_ENV = "CHEATCODE_LOCALIZER_VERIFY"
 
-    # Tilt-probe feature flag (Stage 1 of CheatCodeContinuous rewrite).
-    # When set (any truthy value), the spiral search in INSERT is replaced by
-    # a force-feedback tilt-probe: gripper rotates ±tilt_deg through 8
-    # directions in plug-local XY plane at constant gripper z, samples mean
-    # |F| per direction, translates 1.5mm toward the lowest-force direction.
-    # Reproducible by an IL model at inference (no /tf in the recovery loop).
-    # Default off — existing CheatCodeRobust behavior is unchanged when env
-    # var is unset.
-    USE_PROBE_ENV = "CHEATCODE_USE_PROBE"
-    PROBE_TILT_DEG_ENV = "CHEATCODE_PROBE_TILT_DEG"
-    PROBE_DIRECTIONS_ENV = "CHEATCODE_PROBE_DIRECTIONS"
-    PROBE_SAMPLE_S_ENV = "CHEATCODE_PROBE_SAMPLE_S"
-    PROBE_TRANSLATE_M_ENV = "CHEATCODE_PROBE_TRANSLATE_M"
-    PROBE_TRIGGER_F_N_ENV = "CHEATCODE_PROBE_TRIGGER_F_N"
-    PROBE_AMBIGUOUS_DF_N_ENV = "CHEATCODE_PROBE_AMBIGUOUS_DF_N"
-    PROBE_RETRY_DEG_ENV = "CHEATCODE_PROBE_RETRY_DEG"
-    PROBE_SETTLE_S_ENV = "CHEATCODE_PROBE_SETTLE_S"
-    PROBE_TRANSLATE_DURATION_S_ENV = "CHEATCODE_PROBE_TRANSLATE_DURATION_S"
-    # Optional JSONL log path for offline probe-physics analysis. One line per
-    # probe completion: samples, chosen direction, GT-TF delta direction,
-    # retry count, outcome. Used by Stage 1 smoke to verify probe physics
-    # works in this sim before committing to the full CheatCodeContinuous
-    # rewrite.
-    PROBE_LOG_ENV = "CHEATCODE_PROBE_LOG"
-
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
@@ -273,20 +241,6 @@ class CheatCodeRobust(Policy):
         # localizer prediction; _refresh_port_transform returns it directly so
         # the per-tick refresh becomes a no-op in localizer mode.
         self._localizer_port_transform: Transform | None = None
-        # Tilt-probe state (Stage 1 feature flag). Built from env vars so a
-        # rebuild isn't needed to sweep parameters. None when CHEATCODE_USE_PROBE
-        # is unset, in which case the existing spiral search runs unchanged.
-        self._use_probe: bool = bool(os.environ.get(self.USE_PROBE_ENV, ""))
-        self._probe: TiltProbeStateMachine | None = None
-        self._probe_engagements: int = 0
-        self._probe_log_path: Path | None = None
-        self._probe_pending_log: dict | None = None
-        if self._use_probe:
-            self._probe = TiltProbeStateMachine(self._build_probe_config())
-            log_str = os.environ.get(self.PROBE_LOG_ENV, "")
-            if log_str:
-                self._probe_log_path = Path(log_str)
-                self._probe_log_path.parent.mkdir(parents=True, exist_ok=True)
         super().__init__(parent_node)
         # Match the QoS the aic_scoring node advertises
         # (reliable, volatile, keep_last, depth 10) — same profile we use
@@ -309,151 +263,6 @@ class CheatCodeRobust(Policy):
         # has detected insertion. Log the exact string so we can confirm.
         self.get_logger().info(f"/scoring/insertion_event: {msg.data!r}")
         self._inserted_flag = True
-
-    # ------------------------------------------------------------------
-    # Tilt-probe (Stage 1 feature flag) — config + entry + offline log
-    # ------------------------------------------------------------------
-    def _build_probe_config(self) -> ProbeConfig:
-        """Construct ProbeConfig from env vars; missing/invalid values fall
-        back to ProbeConfig defaults. Called once in __init__ when probe
-        feature flag is set."""
-        defaults = ProbeConfig()
-
-        def _f(name: str, default: float) -> float:
-            try:
-                return float(os.environ.get(name, "").strip() or default)
-            except ValueError:
-                return default
-
-        def _i(name: str, default: int) -> int:
-            try:
-                return int(float(os.environ.get(name, "").strip() or default))
-            except ValueError:
-                return default
-
-        def _list_f(name: str, default: list[float]) -> list[float]:
-            raw = os.environ.get(name, "").strip()
-            if not raw:
-                return list(default)
-            try:
-                return [float(x) for x in raw.split(",") if x.strip()]
-            except ValueError:
-                return list(default)
-
-        return ProbeConfig(
-            tilt_deg=_f(self.PROBE_TILT_DEG_ENV, defaults.tilt_deg),
-            n_directions=_i(self.PROBE_DIRECTIONS_ENV, defaults.n_directions),
-            sample_s=_f(self.PROBE_SAMPLE_S_ENV, defaults.sample_s),
-            settle_s=_f(self.PROBE_SETTLE_S_ENV, defaults.settle_s),
-            translate_m=_f(self.PROBE_TRANSLATE_M_ENV, defaults.translate_m),
-            translate_duration_s=_f(
-                self.PROBE_TRANSLATE_DURATION_S_ENV, defaults.translate_duration_s),
-            trigger_f_n=_f(self.PROBE_TRIGGER_F_N_ENV, defaults.trigger_f_n),
-            ambiguous_df_n=_f(
-                self.PROBE_AMBIGUOUS_DF_N_ENV, defaults.ambiguous_df_n),
-            retry_tilt_deg=_list_f(
-                self.PROBE_RETRY_DEG_ENV, defaults.retry_tilt_deg),
-        )
-
-    def _try_enter_probe(
-        self,
-        now: Time,
-        force_mag: float,
-        port_transform: Transform,
-        cable_tip_frame: str,
-        z_offset: float,
-    ) -> None:
-        """Capture the entry pose / plug pose and call probe.enter().
-        Stores a pending-log dict that gets flushed when the probe completes
-        (either via translate or exhausted retries).
-        """
-        if self._probe is None:
-            return
-        try:
-            gripper_tf = self._parent_node._tf_buffer.lookup_transform(
-                "base_link", "gripper/tcp", Time())
-            plug_tf = self._parent_node._tf_buffer.lookup_transform(
-                "base_link", cable_tip_frame, Time())
-        except TransformException as ex:
-            self.get_logger().warn(
-                f"probe entry TF lookup failed, skipping engagement: {ex}")
-            return
-        entry_pose = PoseSnapshot.from_ros_transform(gripper_tf.transform)
-        plug_pos = np.array([
-            plug_tf.transform.translation.x,
-            plug_tf.transform.translation.y,
-            plug_tf.transform.translation.z,
-        ])
-        plug_q = (
-            plug_tf.transform.rotation.w,
-            plug_tf.transform.rotation.x,
-            plug_tf.transform.rotation.y,
-            plug_tf.transform.rotation.z,
-        )
-        # Capture GT delta for offline accuracy analysis. The chosen probe
-        # direction (in plug-local frame) should approximately match this.
-        ex_l, ey_l, _ = self._local_axis_err(port_transform, plug_tf)
-        gt_angle_local = math.atan2(ey_l, ex_l)
-        self._probe.enter(now.nanoseconds, entry_pose, plug_pos, plug_q)
-        self._probe_engagements += 1
-        self._probe_pending_log = {
-            "trial_id": getattr(self._task, "id", "") or "",
-            "task_module": getattr(self._task, "target_module_name", "") or "",
-            "task_port": getattr(self._task, "port_name", "") or "",
-            "plug_type": getattr(self._task, "plug_type", "") or "",
-            "engagement_idx": self._probe_engagements,
-            "z_offset_m": float(z_offset),
-            "force_mag_at_entry_n": float(force_mag),
-            "gt_local_xy_m": [float(ex_l), float(ey_l)],
-            "gt_angle_local_rad": float(gt_angle_local),
-            "tilt_deg_initial": float(
-                self._probe.cfg.retry_tilt_deg[0]
-                if self._probe.cfg.retry_tilt_deg
-                else self._probe.cfg.tilt_deg
-            ),
-        }
-        self.get_logger().info(
-            f"INSERT: tilt-probe engaged at |F|={force_mag:.1f}N, "
-            f"z_offset={z_offset * 1000:.1f}mm, "
-            f"GT plug-local err=({ex_l * 1000:+.2f}, {ey_l * 1000:+.2f})mm, "
-            f"GT angle={math.degrees(gt_angle_local):+.1f}°"
-        )
-
-    def _flush_probe_log(self) -> None:
-        """Append a JSON line describing the just-completed probe to the log
-        file (if path env var is set). Closes _probe_pending_log so the next
-        engagement starts fresh."""
-        if self._probe is None or self._probe_pending_log is None:
-            return
-        rec = dict(self._probe_pending_log)
-        rec.update({
-            "samples_angle_force": [
-                [float(a), float(f)] for a, f in self._probe.last_run_samples
-            ],
-            "chosen_angle_local_rad": (
-                float(self._probe.last_run_chosen_angle)
-                if self._probe.last_run_chosen_angle is not None else None
-            ),
-            "force_range_n": float(self._probe.last_run_force_range),
-            "retry_count": int(self._probe.last_run_retry_count),
-            "outcome": self._probe.last_run_outcome,
-        })
-        chosen_log = "n/a"
-        if rec["chosen_angle_local_rad"] is not None:
-            chosen_log = f"{math.degrees(rec['chosen_angle_local_rad']):+.1f}°"
-        self.get_logger().info(
-            f"INSERT: probe outcome={rec['outcome']} "
-            f"chosen={chosen_log} ΔF={rec['force_range_n']:.2f}N "
-            f"retries={rec['retry_count']} "
-            f"GT={math.degrees(rec['gt_angle_local_rad']):+.1f}°"
-        )
-        if self._probe_log_path is not None:
-            try:
-                with self._probe_log_path.open("a") as f:
-                    f.write(json.dumps(rec) + "\n")
-            except Exception as ex:
-                self.get_logger().warn(f"probe log write failed: {ex}")
-        self._probe_pending_log = None
 
     # ------------------------------------------------------------------
     # Cancellation / lifecycle abort check
@@ -1038,9 +847,6 @@ class CheatCodeRobust(Policy):
         self._last_status_log_t = None
         # Reset cached localizer prediction — board pose changes between trials.
         self._localizer_port_transform = None
-        # Reset per-trial probe accounting (engagement counter, pending log).
-        self._probe_engagements = 0
-        self._probe_pending_log = None
         # Sample per-trial port-pose noise (no-op when env vars unset).
         self._noise_xy_offset, self._noise_yaw_offset = self._sample_trial_noise(task)
         if self._noise_xy_offset != (0.0, 0.0) or self._noise_yaw_offset != 0.0:
@@ -1283,48 +1089,8 @@ class CheatCodeRobust(Policy):
                     hold_z_offset = None
                     hold_entry_z_offset = None
 
-            # Refresh port transform up here so probe entry can use the
-            # fresh value for its GT-delta diagnostic (port pose is stationary
-            # during a trial; the moved refresh is functionally equivalent).
-            port_transform = self._refresh_port_transform(
-                port_frame, port_transform)
-
-            # Tilt-probe (Stage 1 feature flag). When enabled, replaces the
-            # spiral search below with a force-feedback haptic search that
-            # is reproducible by an IL model at inference (no /tf in the
-            # recovery loop). Probe takes precedence over spiral.
-            #
-            # Engagement gate matches spiral: force in chamfer-contact band
-            # AND not in force-hold AND not latched. Probe freezes descent
-            # for the duration of its sub-trajectory.
-            probe_pose_override: PoseSnapshot | None = None
-            if self._use_probe and self._probe is not None:
-                in_chamfer_band = (
-                    self._probe.cfg.trigger_f_n <= force_mag < self.FORCE_STOP_N
-                    and hold_start is None
-                    and not self._inside_latched
-                )
-                if in_chamfer_band and not self._probe.is_active():
-                    self._try_enter_probe(
-                        now, force_mag, port_transform,
-                        cable_tip_frame, z_offset,
-                    )
-                if self._probe.is_active():
-                    probe_pose_override = self._probe.step(
-                        now.nanoseconds, force_mag)
-                    if not self._probe.is_active():
-                        # Probe just completed (translated or exhausted retries)
-                        self._flush_probe_log()
-
-            # Advance z_offset when not holding AND not in active probe.
-            # Probe owns the pose stream during its sub-trajectory; descent
-            # resumes when probe completes.
-            probe_active = (
-                self._use_probe
-                and self._probe is not None
-                and probe_pose_override is not None
-            )
-            if hold_start is None and not probe_active:
+            # Advance z_offset when not holding.
+            if hold_start is None:
                 z_offset -= self.DESCENT_STEP
 
             # Command the gripper. Pre-latch: recompute via _calc_gripper_pose
@@ -1333,6 +1099,8 @@ class CheatCodeRobust(Policy):
             # the locked pose; gripper Z tracks effective_z 1:1 from the latch
             # point so descent and force-hold retreat both work transparently.
             effective_z = hold_z_offset if hold_start is not None else z_offset
+            port_transform = self._refresh_port_transform(
+                port_frame, port_transform)
 
             # Inside-port latch check (only while not yet latched). Uses the
             # same axis-aware criterion as ALIGN: SC requires |e_tight| AND
@@ -1376,12 +1144,8 @@ class CheatCodeRobust(Policy):
             # the plug. Engage on entry to the band; disengage when force
             # leaves it (either dropped below LO = slipped past, or above
             # FORCE_STOP_N = force gate takes over the next tick).
-            #
-            # Suppressed when CHEATCODE_USE_PROBE is set — probe replaces
-            # spiral as the chamfer-band recovery primitive.
             in_spiral_band = (
-                not self._use_probe
-                and self.SPIRAL_FORCE_LO_N <= force_mag < self.FORCE_STOP_N
+                self.SPIRAL_FORCE_LO_N <= force_mag < self.FORCE_STOP_N
                 and hold_start is None
                 and not self._inside_latched
             )
@@ -1435,24 +1199,7 @@ class CheatCodeRobust(Policy):
                     spiral_dy = local_dy
 
             try:
-                if probe_pose_override is not None:
-                    # Probe owns the pose stream during its sub-trajectory —
-                    # bypasses latch (probe state machine respects all the
-                    # invariants that latch protects against) and PI control.
-                    pose = Pose(
-                        position=Point(
-                            x=probe_pose_override.px,
-                            y=probe_pose_override.py,
-                            z=probe_pose_override.pz,
-                        ),
-                        orientation=Quaternion(
-                            w=probe_pose_override.qw,
-                            x=probe_pose_override.qx,
-                            y=probe_pose_override.qy,
-                            z=probe_pose_override.qz,
-                        ),
-                    )
-                elif self._inside_latched and locked_pose is not None:
+                if self._inside_latched and locked_pose is not None:
                     target_z = (locked_pose.position.z
                                 + (effective_z - locked_z_offset))
                     pose = Pose(
@@ -1485,7 +1232,6 @@ class CheatCodeRobust(Policy):
         self.get_logger().info(
             f"INSERT done — force gate engaged {force_stopped_count} times, "
             f"spiral engaged {spiral_engagements} times, "
-            f"probe engaged {self._probe_engagements} times, "
             f"final z_offset={z_offset * 1000:.1f}mm")
 
         # No STABILIZE dwell — once /scoring/insertion_event has fired the
