@@ -629,10 +629,22 @@ class RunSmolVLA(Policy):
             obs = self._build_obs_dict(obs_msg, task_str, port_pose)
             obs = self.preprocessor(obs)
             t_pre_end = _time.perf_counter()
+            # GPU-side timing via CUDA events — measures actual SM/kernel
+            # time independently of host-thread wall clock. If gpu_ms ≪ inf_ms
+            # the slowdown is host-side (GIL, scheduling), not the model.
+            use_cuda_evt = torch.cuda.is_available()
+            if use_cuda_evt:
+                ev_start = torch.cuda.Event(enable_timing=True)
+                ev_end = torch.cuda.Event(enable_timing=True)
+                ev_start.record()
             with torch.inference_mode():
                 action = self.policy.select_action(obs)
-            if torch.cuda.is_available():
+            if use_cuda_evt:
+                ev_end.record()
                 torch.cuda.synchronize()
+                gpu_ms = ev_start.elapsed_time(ev_end)
+            else:
+                gpu_ms = float("nan")
             t_inf_end = _time.perf_counter()
             action = self.postprocessor(action)
             a_port = action[0].cpu().numpy()[:7]  # SmolVLA pads to max_action_dim=32
@@ -666,8 +678,8 @@ class RunSmolVLA(Policy):
             if ticks % LOG_EVERY_N == 0 or inf_ms > 60.0:
                 self.get_logger().info(
                     f"tick={ticks:4d} {timing_tag} "
-                    f"t[pre={pre_ms:5.1f} inf={inf_ms:6.1f} post={post_ms:4.1f} "
-                    f"disp={disp_ms:4.1f} tot={total_ms:6.1f}]ms "
+                    f"t[pre={pre_ms:5.1f} inf={inf_ms:6.1f}(gpu={gpu_ms:5.1f}) "
+                    f"post={post_ms:4.1f} disp={disp_ms:4.1f} tot={total_ms:6.1f}]ms "
                     f"tcp=({tcp.x:.3f},{tcp.y:.3f},{tcp.z:.3f}) "
                     f"pred_bl=({pose.position.x:.3f},"
                     f"{pose.position.y:.3f},{pose.position.z:.3f}) "
