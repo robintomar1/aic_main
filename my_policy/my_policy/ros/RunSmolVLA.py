@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,16 @@ TF_LOOKUP_TIMEOUT_S = 5.0
 
 STATE_DIM = 26  # 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench (no tcp_error, no task one-hot)
 
+# RTC (Real-Time Chunking) defaults — see lerobot/policies/rtc.
+# RTC overlaps chunk generation with dispatch and inpaints the leading
+# steps of each new chunk against the executed tail of the previous chunk.
+# Eliminates the ~700 ms dispatch gap that select_action produces every
+# n_action_steps ticks.
+RTC_DEFAULT_INFERENCE_DELAY = 14         # ≈ 700 ms / 50 ms per tick
+RTC_DEFAULT_EXECUTION_HORIZON = 10
+RTC_DEFAULT_GUIDANCE_WEIGHT = 10.0
+RTC_DEFAULT_ATTENTION_SCHEDULE = "EXP"   # one of LINEAR / EXP / ONES / ZEROS
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -109,6 +120,7 @@ def _load_smolvla_policy(
     ckpt_dir: Path,
     device: torch.device,
     n_action_steps_override: int | None = None,
+    rtc_config: Any | None = None,
 ) -> SmolVLAPolicy:
     """Load SmolVLA model + config from a checkpoint dir.
 
@@ -116,18 +128,25 @@ def _load_smolvla_policy(
     instantiating the policy. SmolVLA's default n_action_steps == chunk_size
     (50 at training time) means the policy runs open-loop on its predicted
     chunk between forward passes — at 20 Hz that's 2.5 s of stale plan.
-    Setting this to a smaller value (e.g. 1) forces SmolVLA to re-run its
-    flow-matching denoiser on fresh observations more often, at proportional
-    cost in inference latency. 1 is fully closed-loop; useful for fine
-    alignment where the plan needs to react to small motions. Be aware
-    SmolVLA-500M forward passes are not free — verify p99 < 50 ms before
-    setting to 1, or stay at 5-10 for a middle ground.
+
+    `rtc_config`: optional `lerobot.policies.rtc.configuration_rtc.RTCConfig`
+    instance. When provided, attached to the SmolVLAConfig before instantiating
+    the policy so its `_rtc_enabled()` predicate sees the flag and the
+    flow-matching head pulls in the RTCProcessor. Inference must then go
+    through `predict_action_chunk` (not `select_action`, which hard-asserts
+    RTC off).
     """
     cfg_dict = json.loads((ckpt_dir / "config.json").read_text())
     cfg_dict.pop("type", None)
     if n_action_steps_override is not None:
         cfg_dict["n_action_steps"] = int(n_action_steps_override)
+    # rtc_config can't be round-tripped through draccus.decode (it expects
+    # a dict, and we have a fully-built instance), so strip any pre-existing
+    # entry and attach the live instance after decode.
+    cfg_dict.pop("rtc_config", None)
     config = draccus.decode(SmolVLAConfig, cfg_dict)
+    if rtc_config is not None:
+        config.rtc_config = rtc_config
     policy = SmolVLAPolicy(config)
     policy.load_state_dict(load_file(str(ckpt_dir / "model.safetensors")))
     policy.eval()
@@ -286,6 +305,15 @@ class RunSmolVLA(Policy):
     LOCALIZER_QUATS_ENV = "AIC_PL_LOCALIZER_QUATS_JSON"
     LOCALIZER_DEVICE_ENV = "AIC_PL_LOCALIZER_DEVICE"
 
+    # RTC opt-in. Setting "1" routes inference through predict_action_chunk +
+    # ActionQueue + a producer thread, with prefix-attention guidance against
+    # the previous chunk's executed tail.
+    RTC_ENABLED_ENV = "AIC_PL_SMOLVLA_RTC"
+    RTC_INFERENCE_DELAY_ENV = "AIC_PL_SMOLVLA_RTC_INFERENCE_DELAY"
+    RTC_EXECUTION_HORIZON_ENV = "AIC_PL_SMOLVLA_RTC_EXECUTION_HORIZON"
+    RTC_GUIDANCE_WEIGHT_ENV = "AIC_PL_SMOLVLA_RTC_GUIDANCE_WEIGHT"
+    RTC_ATTENTION_SCHEDULE_ENV = "AIC_PL_SMOLVLA_RTC_ATTENTION_SCHEDULE"
+
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device(
@@ -305,8 +333,33 @@ class RunSmolVLA(Policy):
 
         n_steps_str = os.environ.get(self.N_ACTION_STEPS_ENV, "").strip()
         n_action_steps_override = int(n_steps_str) if n_steps_str else None
+
+        # ---- RTC config (opt-in) --------------------------------------
+        self.rtc_enabled = os.environ.get(self.RTC_ENABLED_ENV, "").strip() == "1"
+        rtc_config = None
+        self.rtc_inference_delay = RTC_DEFAULT_INFERENCE_DELAY
+        if self.rtc_enabled:
+            from lerobot.configs.types import RTCAttentionSchedule
+            from lerobot.policies.rtc.configuration_rtc import RTCConfig
+            schedule_name = os.environ.get(
+                self.RTC_ATTENTION_SCHEDULE_ENV, RTC_DEFAULT_ATTENTION_SCHEDULE,
+            ).upper()
+            rtc_config = RTCConfig(
+                enabled=True,
+                execution_horizon=int(os.environ.get(
+                    self.RTC_EXECUTION_HORIZON_ENV, RTC_DEFAULT_EXECUTION_HORIZON,
+                )),
+                max_guidance_weight=float(os.environ.get(
+                    self.RTC_GUIDANCE_WEIGHT_ENV, RTC_DEFAULT_GUIDANCE_WEIGHT,
+                )),
+                prefix_attention_schedule=RTCAttentionSchedule[schedule_name],
+            )
+            self.rtc_inference_delay = int(os.environ.get(
+                self.RTC_INFERENCE_DELAY_ENV, RTC_DEFAULT_INFERENCE_DELAY,
+            ))
+
         self.policy = _load_smolvla_policy(
-            ckpt_path, self.device, n_action_steps_override,
+            ckpt_path, self.device, n_action_steps_override, rtc_config=rtc_config,
         )
 
         self.preprocessor = DataProcessorPipeline.from_pretrained(
@@ -332,7 +385,15 @@ class RunSmolVLA(Policy):
             f"timeout={self.timeout_s}s "
             f"n_action_steps={self.policy.config.n_action_steps} "
             f"chunk_size={self.policy.config.chunk_size} "
-            f"localizer_mode={self._localizer_mode()}"
+            f"localizer_mode={self._localizer_mode()} "
+            f"rtc_enabled={self.rtc_enabled}"
+            + (
+                f" rtc_inference_delay={self.rtc_inference_delay}"
+                f" rtc_execution_horizon={self.policy.config.rtc_config.execution_horizon}"
+                f" rtc_guidance_weight={self.policy.config.rtc_config.max_guidance_weight}"
+                f" rtc_schedule={self.policy.config.rtc_config.prefix_attention_schedule}"
+                if self.rtc_enabled else ""
+            )
         )
 
     # ------------------------------------------------------------------
@@ -513,25 +574,42 @@ class RunSmolVLA(Policy):
             f"port={task.port_name} port_type={task.port_type} "
             f"cable={task.cable_name}"
         )
+        if self.rtc_enabled:
+            return self._insert_cable_rtc(
+                task, get_observation, move_robot, send_feedback,
+            )
+        return self._insert_cable_sync(
+            task, get_observation, move_robot, send_feedback,
+        )
 
-        # Build the language instruction once per trial — same convention as
-        # the dataset's per-episode `tasks` field (task_string_for).
+    # ------------------------------------------------------------------
+    # Synchronous loop (no RTC). Inference runs on the main thread; every
+    # n_action_steps ticks the policy blocks ~700 ms producing a fresh chunk.
+    # Compensated sleep keeps the cheap-tick cadence at true 20 Hz.
+    # ------------------------------------------------------------------
+
+    def _insert_cable_sync(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
         task_str = task_string_for(
             task.target_module_name, task.port_name, task.port_type,
         )
         self.get_logger().info(f"task_str: {task_str!r}")
 
-        # Step 1: port pose (cached for the whole trial).
         port_pose = self._acquire_port_pose_baselink(task, get_observation)
         if port_pose is None:
             send_feedback("aborted: port pose unavailable")
             return False
 
-        # Step 2: per-trial reset of the action queue.
         self.policy.reset()
 
-        # Step 3: 20 Hz loop.
         start_t = self.time_now()
+        period_ns = int(self.loop_period_s * 1e9)
+        next_deadline = start_t + Duration(nanoseconds=period_ns)
         ticks = 0
         none_obs_count = 0
         LOG_EVERY_N = 10
@@ -543,6 +621,7 @@ class RunSmolVLA(Policy):
             if obs_msg is None:
                 none_obs_count += 1
                 self.sleep_for(self.loop_period_s)
+                next_deadline = self.time_now() + Duration(nanoseconds=period_ns)
                 continue
 
             obs = self._build_obs_dict(obs_msg, task_str, port_pose)
@@ -580,10 +659,163 @@ class RunSmolVLA(Policy):
 
             send_feedback("running")
             ticks += 1
-            self.sleep_for(self.loop_period_s)
+
+            # Compensated sleep — schedule next tick at fixed period offset
+            # from start, not period offset from "now after work." Without
+            # this the cheap ticks drift to ~70 ms each (50 ms sleep + 20 ms
+            # of image/preproc/dispatch work), turning 50 ticks into 3.5 s
+            # instead of 2.5 s.
+            now = self.time_now()
+            remaining_ns = (next_deadline - now).nanoseconds
+            if remaining_ns > 0:
+                self.sleep_for(remaining_ns / 1e9)
+            next_deadline = next_deadline + Duration(nanoseconds=period_ns)
 
         self.get_logger().info(
-            f"RunSmolVLA.insert_cable: exit after {ticks} ticks "
+            f"RunSmolVLA.insert_cable[sync]: exit after {ticks} ticks "
             f"(none_obs={none_obs_count}, max_a_step_Δ={max_action_delta:.4f})"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # RTC loop. Producer thread runs predict_action_chunk in a tight loop,
+    # feeding an ActionQueue; the main 20 Hz consumer just pops + dispatches.
+    # RTCProcessor inpaints the leading `inference_delay` steps of each new
+    # chunk against the executed tail of the previous chunk so the seam is
+    # smooth — no command gap, no plan discontinuity.
+    # ------------------------------------------------------------------
+
+    def _insert_cable_rtc(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        from lerobot.policies.rtc.action_queue import ActionQueue  # noqa: WPS433
+
+        task_str = task_string_for(
+            task.target_module_name, task.port_name, task.port_type,
+        )
+        self.get_logger().info(f"task_str: {task_str!r}  [RTC mode]")
+
+        port_pose = self._acquire_port_pose_baselink(task, get_observation)
+        if port_pose is None:
+            send_feedback("aborted: port pose unavailable")
+            return False
+
+        self.policy.reset()
+        action_queue = ActionQueue(self.policy.config.rtc_config)
+        inference_delay = self.rtc_inference_delay
+
+        stop_evt = threading.Event()
+        err_box: list[BaseException] = []
+        stats = {"chunks": 0, "producer_iters": 0}
+
+        def _postproc_chunk(actions_btd: torch.Tensor) -> torch.Tensor:
+            """Apply the per-action postprocessor (un-normalize) across an
+            entire chunk. Input (1, T, A); output (T, A) on CPU."""
+            out = []
+            for t in range(actions_btd.shape[1]):
+                out.append(self.postprocessor(actions_btd[:, t, :]))
+            return torch.stack(out, dim=1).squeeze(0).detach().cpu()
+
+        def producer():
+            try:
+                while not stop_evt.is_set():
+                    obs_msg = get_observation()
+                    if obs_msg is None:
+                        if stop_evt.wait(0.005):
+                            return
+                        continue
+                    prev_left = action_queue.get_left_over()  # (T_left, A) or None
+                    obs = self._build_obs_dict(obs_msg, task_str, port_pose)
+                    obs = self.preprocessor(obs)
+                    prev_left_arg = None
+                    if prev_left is not None and prev_left.numel() > 0:
+                        prev_left_arg = prev_left.unsqueeze(0).to(self.device)
+                    with torch.inference_mode():
+                        actions = self.policy.predict_action_chunk(
+                            obs,
+                            inference_delay=inference_delay,
+                            prev_chunk_left_over=prev_left_arg,
+                        )
+                    # actions: (1, T, A_padded). Original kept for RTC merge
+                    # math, processed is what the consumer will dispatch.
+                    original = actions.squeeze(0).detach().cpu()  # (T, A)
+                    processed = _postproc_chunk(actions)         # (T, A)
+                    action_queue.merge(original, processed, inference_delay)
+                    stats["chunks"] += 1
+                    stats["producer_iters"] += 1
+            except BaseException as exc:  # noqa: BLE001
+                err_box.append(exc)
+
+        producer_thread = threading.Thread(
+            target=producer, name="RunSmolVLA-RTC-Producer", daemon=True,
+        )
+        producer_thread.start()
+
+        start_t = self.time_now()
+        period_ns = int(self.loop_period_s * 1e9)
+        next_deadline = start_t + Duration(nanoseconds=period_ns)
+        ticks = 0
+        no_action_ticks = 0
+        LOG_EVERY_N = 20
+        last_a_port: np.ndarray | None = None
+        max_a_step_delta = 0.0
+
+        try:
+            while (self.time_now() - start_t).nanoseconds / 1e9 < self.timeout_s:
+                if err_box:
+                    raise err_box[0]
+
+                action = action_queue.get()  # (A_padded,) or None
+                if action is not None:
+                    a_port = action.numpy()[:7]
+                    pose = _action_port_to_baselink_pose(
+                        a_port.astype(np.float64), port_pose,
+                    )
+                    self.set_pose_target(move_robot, pose, frame_id="base_link")
+                    if last_a_port is not None:
+                        d = float(np.linalg.norm(a_port - last_a_port))
+                        max_a_step_delta = max(max_a_step_delta, d)
+                    last_a_port = a_port
+                    if ticks % LOG_EVERY_N == 0:
+                        self.get_logger().info(
+                            f"[RTC] tick={ticks:4d} qsize={action_queue.qsize()} "
+                            f"chunks={stats['chunks']} no_action={no_action_ticks} "
+                            f"a_port[xyz]=({a_port[0]:+.3f},{a_port[1]:+.3f},{a_port[2]:+.3f}) "
+                            f"max_a_step_Δ={max_a_step_delta:.4f}"
+                        )
+                else:
+                    no_action_ticks += 1
+                    if no_action_ticks % 20 == 1:
+                        self.get_logger().info(
+                            f"[RTC] tick={ticks:4d} queue empty "
+                            f"(chunks_produced={stats['chunks']})"
+                        )
+
+                send_feedback("running")
+                ticks += 1
+
+                now = self.time_now()
+                remaining_ns = (next_deadline - now).nanoseconds
+                if remaining_ns > 0:
+                    self.sleep_for(remaining_ns / 1e9)
+                next_deadline = next_deadline + Duration(nanoseconds=period_ns)
+        finally:
+            stop_evt.set()
+            producer_thread.join(timeout=2.0)
+            if producer_thread.is_alive():
+                self.get_logger().warn(
+                    "RTC producer thread did not exit within 2s; "
+                    "continuing trial cleanup anyway"
+                )
+            action_queue.clear()
+
+        self.get_logger().info(
+            f"RunSmolVLA.insert_cable[RTC]: exit after {ticks} ticks "
+            f"(chunks={stats['chunks']}, no_action={no_action_ticks}, "
+            f"max_a_step_Δ={max_a_step_delta:.4f})"
         )
         return True
