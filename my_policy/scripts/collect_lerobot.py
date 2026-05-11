@@ -360,10 +360,29 @@ def make_or_resume_dataset(
     """Create a new on-disk dataset, or resume an existing one for append.
 
     `root` is the local directory; nothing is pushed to HF Hub.
+
+    Robust to partial state: `info.json` is written at `LeRobotDataset.create`
+    time, but `tasks.parquet` is only written when the first episode saves.
+    If a previous run aborted before saving any episode, the directory is left
+    with info.json but no tasks.parquet. `LeRobotDataset.resume` then falls
+    back to HF Hub which 401s for the `local/...` repo_id. Detect this state
+    and recreate (the partial scaffold has no episode data to lose).
     """
-    if root.exists() and (root / "meta" / "info.json").exists():
-        # Existing dataset: append.
+    import shutil
+    meta_info = root / "meta" / "info.json"
+    meta_tasks = root / "meta" / "tasks.parquet"
+    if root.exists() and meta_info.exists() and meta_tasks.exists():
+        # Complete dataset on disk: append.
         return LeRobotDataset.resume(repo_id=repo_id, root=str(root))
+    if root.exists() and meta_info.exists() and not meta_tasks.exists():
+        # Partial scaffold from a previous failed run. tasks.parquet is only
+        # written after the first save_episode, so its absence means no
+        # episode data is at risk. Recreate cleanly.
+        logging.getLogger("collect_lerobot").warning(
+            f"detected partial dataset at {root} (info.json present, "
+            f"tasks.parquet missing). Recreating from scratch."
+        )
+        shutil.rmtree(root)
 
     # Build the grouped features schema from the robot's flat dicts. The
     # adapter exposes scalars as `float` and camera images as 3-tuple shapes;
