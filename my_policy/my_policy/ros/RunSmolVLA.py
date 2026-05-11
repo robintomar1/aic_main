@@ -629,6 +629,26 @@ class RunSmolVLA(Policy):
             obs = self._build_obs_dict(obs_msg, task_str, port_pose)
             obs = self.preprocessor(obs)
             t_pre_end = _time.perf_counter()
+            # One-shot dump of post-preprocess obs shapes/dtypes/devices
+            # to compare against the offline probe. If image shapes are
+            # bigger here than in the probe, SmolVLM2 tiling is producing
+            # extra sub-crops and that's the source of the 4× slowdown.
+            if ticks == 0:
+                shape_lines = []
+                for k in sorted(obs.keys()):
+                    v = obs[k]
+                    if isinstance(v, torch.Tensor):
+                        shape_lines.append(
+                            f"    {k}: shape={tuple(v.shape)} "
+                            f"dtype={v.dtype} device={v.device} "
+                            f"min={float(v.float().min()):+.3f} "
+                            f"max={float(v.float().max()):+.3f}"
+                        )
+                    else:
+                        shape_lines.append(f"    {k}: type={type(v).__name__} val={v!r}")
+                self.get_logger().info(
+                    "obs after preprocessor (one-shot dump):\n" + "\n".join(shape_lines)
+                )
             # GPU-side timing via CUDA events — measures actual SM/kernel
             # time independently of host-thread wall clock. If gpu_ms ≪ inf_ms
             # the slowdown is host-side (GIL, scheduling), not the model.
@@ -765,12 +785,18 @@ class RunSmolVLA(Policy):
                     prev_left_arg = None
                     if prev_left is not None and prev_left.numel() > 0:
                         prev_left_arg = prev_left.unsqueeze(0).to(self.device)
-                    with torch.inference_mode():
-                        actions = self.policy.predict_action_chunk(
-                            obs,
-                            inference_delay=inference_delay,
-                            prev_chunk_left_over=prev_left_arg,
-                        )
+                    # NB: do NOT wrap in torch.inference_mode() here. RTC's
+                    # denoise_step uses torch.enable_grad() to compute its
+                    # inpainting correction via torch.autograd.grad; inference_mode
+                    # is stricter than no_grad and cannot be overridden by
+                    # enable_grad, so wrapping here breaks RTC. predict_action_chunk
+                    # itself is @torch.no_grad() decorated (which enable_grad
+                    # CAN override), so memory/perf is still bounded.
+                    actions = self.policy.predict_action_chunk(
+                        obs,
+                        inference_delay=inference_delay,
+                        prev_chunk_left_over=prev_left_arg,
+                    )
                     # actions: (1, T, A_padded). Original kept for RTC merge
                     # math, processed is what the consumer will dispatch.
                     original = actions.squeeze(0).detach().cpu()  # (T, A)
