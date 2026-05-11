@@ -68,11 +68,16 @@ from my_policy.trajectory import (
 class ContinuousParams:
     """All env-overridable knobs in one place. Built once in __init__ from
     the policy's class constants + os.environ."""
-    # Phase durations
-    phase1_duration_s: float = 3.0
-    phase2_duration_s: float = 2.0
-    # Descent kinematics
-    descent_rate_m_s: float = 0.004
+    # Phase 1 / Phase 2 durations are COMPUTED dynamically per-trial based on
+    # the actual displacement / angular distance, so the peak min-jerk velocity
+    # stays bounded for smoothness regardless of where the port is. Longer
+    # distance → longer phase. Caps below set the peak velocity ceiling.
+    max_linear_velocity_m_s: float = 0.025     # 25 mm/s peak Phase 1
+    max_angular_velocity_rad_s: float = 0.5    # ~28°/s peak Phase 2
+    min_phase_duration_s: float = 1.0          # floor — even tiny moves take this long
+    # Descent kinematics — constant rate, with a min-jerk ramp-in at Phase 3 start.
+    descent_rate_m_s: float = 0.010    # 10 mm/s steady-state descent
+    descent_ramp_s: float = 1.0        # ramp descent rate 0 → full over 1 s using min-jerk
     tick_period_s: float = 0.05
     insert_z_offset: float = -0.015
     hover_z_by_plug: dict = None
@@ -215,6 +220,38 @@ class TrajectoryGenerator:
             qy=q_gripper_target[2], qz=q_gripper_target[3],
         )
 
+        # Compute Phase 1 / Phase 2 durations dynamically based on actual
+        # displacement so the peak min-jerk velocity stays bounded.
+        # min-jerk peak velocity = 1.875 × distance / duration
+        # → duration = 1.875 × distance / max_velocity
+        disp_xyz = (
+            self._phase1_target.px - self._initial_gripper_pose.px,
+            self._phase1_target.py - self._initial_gripper_pose.py,
+            self._phase1_target.pz - self._initial_gripper_pose.pz,
+        )
+        disp_norm = math.sqrt(sum(d * d for d in disp_xyz))
+        self._phase1_duration_s = max(
+            self.params.min_phase_duration_s,
+            1.875 * disp_norm / max(1e-6, self.params.max_linear_velocity_m_s),
+        )
+        # Angular distance between initial gripper quat and port-matching quat
+        # = 2·arccos(|dot|).
+        q_a = (
+            self._initial_gripper_pose.qw, self._initial_gripper_pose.qx,
+            self._initial_gripper_pose.qy, self._initial_gripper_pose.qz,
+        )
+        q_b = (
+            self._phase2_target.qw, self._phase2_target.qx,
+            self._phase2_target.qy, self._phase2_target.qz,
+        )
+        dot = abs(q_a[0] * q_b[0] + q_a[1] * q_b[1]
+                  + q_a[2] * q_b[2] + q_a[3] * q_b[3])
+        ang_dist = 2.0 * math.acos(min(1.0, dot))
+        self._phase2_duration_s = max(
+            self.params.min_phase_duration_s,
+            1.875 * ang_dist / max(1e-6, self.params.max_angular_velocity_rad_s),
+        )
+
         # Phase 3 state.
         self._z_offset = hover_z  # decreases monotonically
         self._integrator = (0.0, 0.0)
@@ -316,9 +353,9 @@ class TrajectoryGenerator:
 
     def _step_phase1(self, now_ns: int) -> PoseSnapshot:
         elapsed_s = (now_ns - self._t_phase_start_ns) / 1e9
-        s = minjerk_s(elapsed_s / max(1e-6, self.params.phase1_duration_s))
+        s = minjerk_s(elapsed_s / max(1e-6, self._phase1_duration_s))
         out = lerp_pose(self._initial_gripper_pose, self._phase1_target, s)
-        if elapsed_s >= self.params.phase1_duration_s:
+        if elapsed_s >= self._phase1_duration_s:
             # Continuity: final tick of Phase 1 returns the exact target pose.
             self._phase = self.PHASE_2_ORIENT
             self._t_phase_start_ns = now_ns
@@ -329,7 +366,7 @@ class TrajectoryGenerator:
 
     def _step_phase2(self, now_ns: int) -> PoseSnapshot:
         elapsed_s = (now_ns - self._t_phase_start_ns) / 1e9
-        s = minjerk_s(elapsed_s / max(1e-6, self.params.phase2_duration_s))
+        s = minjerk_s(elapsed_s / max(1e-6, self._phase2_duration_s))
         # Position frozen at phase1_target; orientation slerps.
         q = tj_quat_slerp(
             self._phase1_target.quat(), self._phase2_target.quat(), s)
@@ -339,7 +376,7 @@ class TrajectoryGenerator:
             pz=self._phase1_target.pz,
             qw=q[0], qx=q[1], qy=q[2], qz=q[3],
         )
-        if elapsed_s >= self.params.phase2_duration_s:
+        if elapsed_s >= self._phase2_duration_s:
             self._phase = self.PHASE_3_DESCEND
             self._t_phase_start_ns = now_ns
             self._phase3_handoff_t = 0
@@ -382,10 +419,19 @@ class TrajectoryGenerator:
         self._update_spiral_state(now_ns, engagement_ok)
 
         # Advance z_offset (descent step) only if not holding AND not latched-with-z-frozen.
+        # Ramp descent rate from 0 to full over `descent_ramp_s` at start of Phase 3
+        # using min-jerk shape, so Z velocity has zero derivative at the Phase 2 → 3
+        # boundary (matches Phase 2's zero rotation velocity at its own boundary).
         if not in_hold:
+            elapsed_p3_s = (now_ns - self._t_phase_start_ns) / 1e9
+            if self.params.descent_ramp_s > 0.0:
+                ramp = minjerk_s(elapsed_p3_s / self.params.descent_ramp_s)
+            else:
+                ramp = 1.0
+            effective_rate = self.params.descent_rate_m_s * ramp
             self._z_offset = max(
                 self.params.insert_z_offset,
-                self._z_offset - self.params.descent_rate_m_s * self.params.tick_period_s,
+                self._z_offset - effective_rate * self.params.tick_period_s,
             )
 
         # Effective z offset for pose computation.
@@ -671,9 +717,13 @@ class CheatCodeContinuous(Policy):
     """3-phase smooth oracle for IL-friendly data collection."""
 
     # Env-var names (defaults live in ContinuousParams; env vars override).
-    PHASE1_DURATION_S_ENV = "CHEATCODE_PHASE1_DURATION_S"
-    PHASE2_DURATION_S_ENV = "CHEATCODE_PHASE2_DURATION_S"
+    # Phase 1 / Phase 2 durations are dynamic — these velocity caps determine
+    # the duration relative to the actual displacement / angular distance.
+    MAX_LINEAR_VEL_M_S_ENV = "CHEATCODE_MAX_LINEAR_VEL_M_S"
+    MAX_ANGULAR_VEL_RAD_S_ENV = "CHEATCODE_MAX_ANGULAR_VEL_RAD_S"
+    MIN_PHASE_DURATION_S_ENV = "CHEATCODE_MIN_PHASE_DURATION_S"
     DESCENT_RATE_M_S_ENV = "CHEATCODE_DESCENT_RATE_M_S"
+    DESCENT_RAMP_S_ENV = "CHEATCODE_DESCENT_RAMP_S"
     HOVER_Z_SC_M_ENV = "CHEATCODE_HOVER_Z_SC_M"
     HOVER_Z_SFP_M_ENV = "CHEATCODE_HOVER_Z_SFP_M"
     FORCE_STOP_N_ENV = "CHEATCODE_FORCE_STOP_N"
@@ -725,9 +775,14 @@ class CheatCodeContinuous(Policy):
             except ValueError:
                 return default
 
-        p.phase1_duration_s = _f(self.PHASE1_DURATION_S_ENV, p.phase1_duration_s)
-        p.phase2_duration_s = _f(self.PHASE2_DURATION_S_ENV, p.phase2_duration_s)
+        p.max_linear_velocity_m_s = _f(
+            self.MAX_LINEAR_VEL_M_S_ENV, p.max_linear_velocity_m_s)
+        p.max_angular_velocity_rad_s = _f(
+            self.MAX_ANGULAR_VEL_RAD_S_ENV, p.max_angular_velocity_rad_s)
+        p.min_phase_duration_s = _f(
+            self.MIN_PHASE_DURATION_S_ENV, p.min_phase_duration_s)
         p.descent_rate_m_s = _f(self.DESCENT_RATE_M_S_ENV, p.descent_rate_m_s)
+        p.descent_ramp_s = _f(self.DESCENT_RAMP_S_ENV, p.descent_ramp_s)
         p.hover_z_by_plug["sc"] = _f(self.HOVER_Z_SC_M_ENV, p.hover_z_by_plug["sc"])
         p.hover_z_by_plug["sfp"] = _f(self.HOVER_Z_SFP_M_ENV, p.hover_z_by_plug["sfp"])
         p.force_stop_n = _f(self.FORCE_STOP_N_ENV, p.force_stop_n)

@@ -696,6 +696,82 @@ def test_injection_deterministic_per_task():
     )
 
 
+def test_phase1_duration_scales_with_distance():
+    """Phase 1 duration must be proportional to TCP→target displacement so
+    peak velocity stays ≤ max_linear_velocity_m_s regardless of how far
+    the port is from spawn."""
+    # Near initial position: small displacement.
+    near = _build_traj(
+        gripper_xyz=(0.405, 0.001, 0.15),  # ~5cm above target hover
+        plug_xyz=(0.405, 0.001, 0.10),
+    )
+    # Far initial position: large displacement (~30cm path).
+    far = _build_traj(
+        gripper_xyz=(0.10, 0.20, 0.60),
+        plug_xyz=(0.10, 0.20, 0.55),
+    )
+    assert far._phase1_duration_s > near._phase1_duration_s, (
+        f"far ({far._phase1_duration_s:.2f}s) must take longer than "
+        f"near ({near._phase1_duration_s:.2f}s)"
+    )
+    # Verify peak velocity ≤ max_linear_velocity_m_s + small slack.
+    cap = far.params.max_linear_velocity_m_s
+    for traj in [near, far]:
+        disp = math.sqrt(
+            (traj._phase1_target.px - traj._initial_gripper_pose.px) ** 2
+            + (traj._phase1_target.py - traj._initial_gripper_pose.py) ** 2
+            + (traj._phase1_target.pz - traj._initial_gripper_pose.pz) ** 2
+        )
+        # min-jerk peak velocity = 1.875 × disp / duration
+        peak_vel = 1.875 * disp / traj._phase1_duration_s
+        assert peak_vel <= cap + 1e-6, (
+            f"peak Phase 1 velocity {peak_vel * 1000:.1f}mm/s exceeds "
+            f"cap {cap * 1000:.1f}mm/s for disp {disp * 1000:.1f}mm"
+        )
+
+
+def test_phase1_duration_floor_for_tiny_movements():
+    """Even for ~zero displacement, Phase 1 duration must be at least
+    min_phase_duration_s (avoids absurdly short min-jerk profiles)."""
+    # Initial == target (gripper already over port at hover height).
+    traj = _build_traj(
+        port_xyz=(0.40, 0.0, 0.10),
+        gripper_xyz=(0.40, 0.0, 0.30),
+        plug_xyz=(0.40, 0.0, 0.25),  # gp_offset_z = 0.05, target z = 0.10+0.20+0.05 = 0.35
+    )
+    assert traj._phase1_duration_s >= traj.params.min_phase_duration_s - 1e-9
+
+
+def test_phase2_duration_scales_with_angular_distance():
+    """Phase 2 duration must scale with angular distance so peak angular
+    velocity stays bounded."""
+    # Small rotation: 10° about Z.
+    small_rot_q = (math.cos(math.radians(5)), 0.0, 0.0, math.sin(math.radians(5)))
+    small = _build_traj(plug_quat=small_rot_q, port_quat=(1.0, 0.0, 0.0, 0.0))
+    # Large rotation: 90° about Z.
+    large_rot_q = (math.cos(math.radians(45)), 0.0, 0.0, math.sin(math.radians(45)))
+    large = _build_traj(plug_quat=large_rot_q, port_quat=(1.0, 0.0, 0.0, 0.0))
+    # Larger rotation must take longer (or hit min floor).
+    assert large._phase2_duration_s >= small._phase2_duration_s
+    # Verify peak angular velocity ≤ cap + slack.
+    cap = large.params.max_angular_velocity_rad_s
+    for traj in [small, large]:
+        q_a = (traj._initial_gripper_pose.qw, traj._initial_gripper_pose.qx,
+               traj._initial_gripper_pose.qy, traj._initial_gripper_pose.qz)
+        q_b = traj._phase2_target.quat()
+        dot = abs(q_a[0] * q_b[0] + q_a[1] * q_b[1]
+                  + q_a[2] * q_b[2] + q_a[3] * q_b[3])
+        ang_dist = 2.0 * math.acos(min(1.0, dot))
+        peak_ang_vel = 1.875 * ang_dist / traj._phase2_duration_s
+        # If duration was capped by min_phase_duration_s, peak velocity may
+        # be lower than the cap (which is fine — the floor only ever slows us).
+        assert peak_ang_vel <= cap + 1e-6, (
+            f"peak Phase 2 angular velocity {math.degrees(peak_ang_vel):.1f}°/s "
+            f"exceeds cap {math.degrees(cap):.1f}°/s for angular dist "
+            f"{math.degrees(ang_dist):.1f}°"
+        )
+
+
 def test_should_abort_propagation_via_policy():
     """Cancel during the policy's insert_cable loop must surface as a False
     return promptly. Tested at the policy level (insert_cable) not the
@@ -797,6 +873,9 @@ if __name__ == "__main__":
         test_latch_blends_smoothly,
         test_injection_capped_on_tight_axis_for_sc,
         test_injection_deterministic_per_task,
+        test_phase1_duration_scales_with_distance,
+        test_phase1_duration_floor_for_tiny_movements,
+        test_phase2_duration_scales_with_angular_distance,
         test_should_abort_propagation_via_policy,
     ]
     failures = 0
