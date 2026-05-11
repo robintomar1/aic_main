@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time as _time
 from pathlib import Path
 from typing import Any
 
@@ -624,17 +625,30 @@ class RunSmolVLA(Policy):
                 next_deadline = self.time_now() + Duration(nanoseconds=period_ns)
                 continue
 
+            t_obs_built_start = _time.perf_counter()
             obs = self._build_obs_dict(obs_msg, task_str, port_pose)
             obs = self.preprocessor(obs)
+            t_pre_end = _time.perf_counter()
             with torch.inference_mode():
                 action = self.policy.select_action(obs)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_inf_end = _time.perf_counter()
             action = self.postprocessor(action)
             a_port = action[0].cpu().numpy()[:7]  # SmolVLA pads to max_action_dim=32
+            t_post_end = _time.perf_counter()
 
             pose = _action_port_to_baselink_pose(
                 a_port.astype(np.float64), port_pose,
             )
             self.set_pose_target(move_robot, pose, frame_id="base_link")
+            t_dispatch_end = _time.perf_counter()
+
+            pre_ms = (t_pre_end - t_obs_built_start) * 1000.0
+            inf_ms = (t_inf_end - t_pre_end) * 1000.0
+            post_ms = (t_post_end - t_inf_end) * 1000.0
+            disp_ms = (t_dispatch_end - t_post_end) * 1000.0
+            total_ms = (t_dispatch_end - t_obs_built_start) * 1000.0
 
             tcp = obs_msg.controller_state.tcp_pose.position
             tcp_pred_dist = float(np.linalg.norm(
@@ -646,9 +660,14 @@ class RunSmolVLA(Policy):
                 max_action_delta = max(max_action_delta, d)
             last_action_port = a_port
 
-            if ticks % LOG_EVERY_N == 0:
+            # Log timing on every tick where inference exceeded a tick budget
+            # so the inference ticks always show up; otherwise log periodically.
+            timing_tag = "INF" if inf_ms > 60.0 else "   "
+            if ticks % LOG_EVERY_N == 0 or inf_ms > 60.0:
                 self.get_logger().info(
-                    f"tick={ticks:4d} "
+                    f"tick={ticks:4d} {timing_tag} "
+                    f"t[pre={pre_ms:5.1f} inf={inf_ms:6.1f} post={post_ms:4.1f} "
+                    f"disp={disp_ms:4.1f} tot={total_ms:6.1f}]ms "
                     f"tcp=({tcp.x:.3f},{tcp.y:.3f},{tcp.z:.3f}) "
                     f"pred_bl=({pose.position.x:.3f},"
                     f"{pose.position.y:.3f},{pose.position.z:.3f}) "
