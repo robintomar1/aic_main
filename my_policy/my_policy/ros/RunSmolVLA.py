@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time as _time
 from pathlib import Path
 from typing import Any
@@ -619,10 +620,13 @@ class RunSmolVLA(Policy):
         return True
 
     # ------------------------------------------------------------------
-    # SKIP_CHUNK loop. Synchronous (no producer thread). Calls
-    # predict_action_chunk to get the full chunk, discards the first
-    # `skip_n_chunks` actions, dispatches the remaining tail one per tick.
-    # When the local buffer drains, fires fresh inference on the latest obs.
+    # SKIP_CHUNK loop. Async: a producer thread runs predict_action_chunk
+    # in the background and fills a buffer with the post-processed tail
+    # (after dropping the first `skip_n_chunks` actions of each chunk).
+    # The main 20 Hz consumer pops one per tick; when the buffer is empty
+    # (i.e. producer is currently running inference), it RE-DISPATCHES the
+    # last commanded action so the robot keeps receiving pose commands at
+    # 20 Hz instead of seeing a gap.
     # ------------------------------------------------------------------
 
     def _insert_cable_skip_chunk(
@@ -652,73 +656,130 @@ class RunSmolVLA(Policy):
         # Step 2: per-trial reset.
         self.policy.reset()
 
-        # Local buffer of post-processed actions awaiting dispatch.
-        # Each entry is a 1D tensor of shape (action_dim_padded,).
+        # Shared state — protected by queue_lock for thread safety.
         local_queue: list[torch.Tensor] = []
+        queue_lock = threading.Lock()
+        stop_evt = threading.Event()
+        err_box: list[BaseException] = []
+        stats = {"chunks": 0, "inference_ticks": 0}
+
+        def producer():
+            try:
+                while not stop_evt.is_set():
+                    # Refill only when the consumer has drained the buffer.
+                    with queue_lock:
+                        need_refill = len(local_queue) == 0
+                    if not need_refill:
+                        if stop_evt.wait(0.005):
+                            return
+                        continue
+
+                    obs_msg = get_observation()
+                    if obs_msg is None:
+                        if stop_evt.wait(0.01):
+                            return
+                        continue
+                    obs = self._build_obs_dict(obs_msg, task_str, port_pose)
+                    obs = self.preprocessor(obs)
+                    t_inf_start = _time.perf_counter()
+                    with torch.inference_mode():
+                        actions = self.policy.predict_action_chunk(obs)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    inf_ms = (_time.perf_counter() - t_inf_start) * 1000.0
+                    # actions: (1, chunk_size, action_dim_padded)
+                    chunk = actions.squeeze(0)
+                    # Drop the first skip_n; post-process each remaining step.
+                    new_actions: list[torch.Tensor] = []
+                    for t in range(skip_n, chunk_size):
+                        a_post = self.postprocessor(chunk[t : t + 1])
+                        new_actions.append(a_post[0].detach().cpu())
+                    with queue_lock:
+                        local_queue.extend(new_actions)
+                    stats["chunks"] += 1
+                    self.get_logger().info(
+                        f"[SKIP_CHUNK] chunk {stats['chunks']} "
+                        f"inf={inf_ms:.1f}ms dropped={skip_n} "
+                        f"buffered={len(new_actions)}"
+                    )
+            except BaseException as exc:  # noqa: BLE001
+                err_box.append(exc)
+
+        producer_thread = threading.Thread(
+            target=producer, name="RunSmolVLA-SkipChunk-Producer", daemon=True,
+        )
+        producer_thread.start()
 
         start_t = self.time_now()
         ticks = 0
-        chunks_produced = 0
         none_obs_count = 0
-        LOG_EVERY_N = 10
+        LOG_EVERY_N = 20
         last_a_port: np.ndarray | None = None
+        last_pose: Pose | None = None
         max_a_step_delta = 0.0
 
-        while (self.time_now() - start_t).nanoseconds / 1e9 < self.timeout_s:
-            # Refill if the local buffer is exhausted.
-            if not local_queue:
-                obs_msg = get_observation()
-                if obs_msg is None:
-                    none_obs_count += 1
-                    self.sleep_for(self.loop_period_s)
-                    continue
-                obs = self._build_obs_dict(obs_msg, task_str, port_pose)
-                obs = self.preprocessor(obs)
-                t_inf_start = _time.perf_counter()
-                with torch.inference_mode():
-                    actions = self.policy.predict_action_chunk(obs)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                inf_ms = (_time.perf_counter() - t_inf_start) * 1000.0
-                # actions: (1, chunk_size, action_dim_padded)
-                chunk = actions.squeeze(0)  # (chunk_size, A_padded)
-                # Drop the first skip_n; post-process each remaining step.
-                for t in range(skip_n, chunk_size):
-                    a_post = self.postprocessor(chunk[t : t + 1])
-                    local_queue.append(a_post[0].detach().cpu())
-                chunks_produced += 1
-                self.get_logger().info(
-                    f"[SKIP_CHUNK] chunk {chunks_produced} inf={inf_ms:.1f}ms "
-                    f"dropped={skip_n} buffered={len(local_queue)}"
+        try:
+            while (self.time_now() - start_t).nanoseconds / 1e9 < self.timeout_s:
+                if err_box:
+                    raise err_box[0]
+
+                with queue_lock:
+                    action = local_queue.pop(0) if local_queue else None
+
+                if action is not None:
+                    # Fresh action from the producer.
+                    a_port = action.numpy()[:7]
+                    pose = _action_port_to_baselink_pose(
+                        a_port.astype(np.float64), port_pose,
+                    )
+                    self.set_pose_target(move_robot, pose, frame_id="base_link")
+                    if last_a_port is not None:
+                        d = float(np.linalg.norm(a_port - last_a_port))
+                        max_a_step_delta = max(max_a_step_delta, d)
+                    last_a_port = a_port
+                    last_pose = pose
+                    if ticks % LOG_EVERY_N == 0:
+                        with queue_lock:
+                            qlen = len(local_queue)
+                        self.get_logger().info(
+                            f"[SKIP_CHUNK skip_n={skip_n}] tick={ticks:4d} "
+                            f"chunks={stats['chunks']} buf={qlen} "
+                            f"a_port[xyz]=({a_port[0]:+.3f},{a_port[1]:+.3f},"
+                            f"{a_port[2]:+.3f}) max_a_step_Δ={max_a_step_delta:.4f}"
+                        )
+                else:
+                    # Producer is currently running inference — re-dispatch
+                    # the last commanded pose so the controller keeps
+                    # receiving 20 Hz updates.
+                    stats["inference_ticks"] += 1
+                    if last_pose is not None:
+                        self.set_pose_target(move_robot, last_pose, frame_id="base_link")
+                        if stats["inference_ticks"] % 20 == 1:
+                            self.get_logger().info(
+                                f"[SKIP_CHUNK] tick={ticks:4d} re-dispatching "
+                                f"last pose (inference in flight, "
+                                f"total inf_ticks={stats['inference_ticks']})"
+                            )
+                    else:
+                        # Cold start — no last action yet; producer hasn't
+                        # delivered the first chunk. Just wait.
+                        none_obs_count += 1
+
+                send_feedback("running")
+                ticks += 1
+                self.sleep_for(self.loop_period_s)
+        finally:
+            stop_evt.set()
+            producer_thread.join(timeout=2.0)
+            if producer_thread.is_alive():
+                self.get_logger().warn(
+                    "SKIP_CHUNK producer thread did not exit within 2 s; "
+                    "continuing trial cleanup anyway"
                 )
-
-            action = local_queue.pop(0)
-            a_port = action.numpy()[:7]  # SmolVLA pads to max_action_dim=32
-            pose = _action_port_to_baselink_pose(
-                a_port.astype(np.float64), port_pose,
-            )
-            self.set_pose_target(move_robot, pose, frame_id="base_link")
-
-            if last_a_port is not None:
-                d = float(np.linalg.norm(a_port - last_a_port))
-                max_a_step_delta = max(max_a_step_delta, d)
-            last_a_port = a_port
-
-            if ticks % LOG_EVERY_N == 0:
-                self.get_logger().info(
-                    f"[SKIP_CHUNK skip_n={skip_n}] tick={ticks:4d} "
-                    f"chunks={chunks_produced} buf={len(local_queue)} "
-                    f"a_port[xyz]=({a_port[0]:+.3f},{a_port[1]:+.3f},{a_port[2]:+.3f}) "
-                    f"max_a_step_Δ={max_a_step_delta:.4f}"
-                )
-
-            send_feedback("running")
-            ticks += 1
-            self.sleep_for(self.loop_period_s)
 
         self.get_logger().info(
             f"RunSmolVLA.insert_cable[SKIP_CHUNK]: exit after {ticks} ticks "
-            f"(chunks={chunks_produced}, none_obs={none_obs_count}, "
-            f"max_a_step_Δ={max_a_step_delta:.4f})"
+            f"(chunks={stats['chunks']}, inf_ticks={stats['inference_ticks']}, "
+            f"cold_ticks={none_obs_count}, max_a_step_Δ={max_a_step_delta:.4f})"
         )
         return True
