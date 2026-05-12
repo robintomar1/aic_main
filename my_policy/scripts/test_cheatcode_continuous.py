@@ -866,6 +866,51 @@ def test_phase0_raise_to_phase1_continuity():
     )
 
 
+def test_descent_floor_does_not_terminate_trajectory():
+    """Trajectory must NOT auto-terminate when z_offset reaches insert_z_offset.
+    Instead, descent stops (z clamped) but PI/spiral/LATCH stay active until
+    insertion event fires or engine cancels at time_limit. Otherwise trials
+    burn out at ~descent-time and discard the remaining time_limit budget."""
+    # Spawn close to port so descent is short and we hit the floor quickly.
+    traj = _build_traj(plug_type="sfp",
+        port_xyz=(0.40, 0.0, 0.10),
+        gripper_xyz=(0.40, 0.0, 0.18),
+        plug_xyz=(0.40, 0.0, 0.13))
+    # Drive with wall_max_s much longer than descent time to verify trajectory
+    # KEEPS running past the descent floor.
+    hist = _drive_traj(traj, plug_xyz=(0.40, 0.0, 0.13),
+                      gripper_xyz=(0.40, 0.0, 0.18),
+                      port_xyz=(0.40, 0.0, 0.10), max_s=20.0)
+    # We expect the loop to use the FULL 20 s (because traj.is_done() never
+    # returns True from descent floor). At 50 ms tick, that's ~400 ticks.
+    assert len(hist) >= 350, (
+        f"loop terminated early at {len(hist)} ticks (expected ~400). "
+        f"is_done() may still be triggering on descent floor."
+    )
+    # Phase 3 must be the active phase at the END of the run (we haven't
+    # exited it). is_done() must remain False.
+    assert hist[-1][1] == traj.PHASE_3_DESCEND, (
+        f"final phase = {hist[-1][1]}, expected PHASE_3_DESCEND"
+    )
+    assert not traj.is_done(), (
+        "is_done() became True after descent floor — policy will terminate "
+        "early instead of using the full time_limit"
+    )
+    # Z should be CLAMPED at the insert depth for the latter portion of the run.
+    # Find when z_offset first reached the floor and verify it stayed there.
+    floor = traj.params.insert_z_offset
+    z_offsets_at_floor = sum(
+        1 for _, _, _, _ in hist
+        if traj._z_offset <= floor + 1e-9
+    )
+    # We don't know exactly when it hit the floor (depends on descent_ramp +
+    # path length), but it should have spent SOME ticks clamped.
+    assert traj._z_offset <= floor + 1e-9, (
+        f"final z_offset = {traj._z_offset}, expected ≤ {floor} "
+        f"(clamped at descent floor)"
+    )
+
+
 def test_phase1_lookahead_eliminates_p2_to_p3_xy_shift():
     """Phase 1 must anticipate Phase 2's rotation effect: with a non-trivial
     rotation, the Phase 1 target XY should be set so that AFTER the Phase 2
@@ -1020,6 +1065,7 @@ if __name__ == "__main__":
         test_phase0_raise_fires_when_initial_z_below_safe_floor,
         test_phase0_raise_skipped_when_initial_z_already_safe,
         test_phase0_raise_to_phase1_continuity,
+        test_descent_floor_does_not_terminate_trajectory,
         test_phase1_lookahead_eliminates_p2_to_p3_xy_shift,
         test_should_abort_propagation_via_policy,
     ]

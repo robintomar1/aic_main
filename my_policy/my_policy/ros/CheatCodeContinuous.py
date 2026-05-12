@@ -599,9 +599,15 @@ class TrajectoryGenerator:
             commanded, port_transform, plug_tf_stamped, effective_z,
         )
 
-        # Phase done condition.
-        if self._z_offset <= self.params.insert_z_offset and not in_hold:
-            self._phase = self.PHASE_DONE
+        # Don't auto-terminate Phase 3 when descent reaches insert_z_offset.
+        # z_offset is already clamped at insert_z_offset by the descent step
+        # above (max() floor), so Z stops decreasing — but PI on XY, spiral
+        # search, and LATCH stay live so the policy keeps trying to find the
+        # port. The loop exits only on (a) /scoring/insertion_event firing
+        # (handled in insert_cable) or (b) engine cancellation at time_limit
+        # (handled by _should_abort). This way every trial uses its full
+        # time_limit budget instead of giving up at the moment the commanded
+        # depth target is met.
 
         return commanded
 
