@@ -300,6 +300,103 @@ def distractor_mount_entity(rng: random.Random, rail: str) -> dict:
     }
 
 
+# =============================================================================
+# Grid-mode helpers (deterministic — no RNG, no jitter). Used for the
+# controlled discrete grid that drives IL data collection.
+# =============================================================================
+
+# Distractor occupations matching sample_config.yaml trial_1 (lines 93-128).
+# Used when --grid-distractors=trial1. sc_rail_0 also carries a distractor in
+# trial_1 but it lives on a TARGET rail (not a *_mount_rail), so we leave it
+# out of this map and let _grid_scene_skeleton handle target-rail occupancy.
+_TRIAL1_DISTRACTORS = {
+    "lc_mount_rail_0":  ("lc_mount_0",   0.02),
+    "sfp_mount_rail_0": ("sfp_mount_0",  0.03),
+    "sc_mount_rail_0":  ("sc_mount_0",  -0.02),
+    "lc_mount_rail_1":  ("lc_mount_1",  -0.01),
+}
+
+
+def grid_linspace(lo: float, hi: float, n: int) -> list:
+    """Return n evenly-spaced points across [lo, hi]. n=1 returns the midpoint
+    when the range is symmetric around 0 (so default --grid-nic-yaw-steps=1
+    yields yaw=0)."""
+    if n < 1:
+        raise ValueError(f"grid_linspace n must be >= 1, got {n}")
+    if n == 1:
+        return [0.0 if abs(lo + hi) < 1e-9 else lo]
+    return [float(v) for v in np.linspace(lo, hi, n).tolist()]
+
+
+def _deterministic_nic_card(index: int, translation: float, yaw: float) -> dict:
+    """Grid sibling of nic_card_entity — translation and yaw passed in."""
+    return {
+        "entity_present": True,
+        "entity_name": f"nic_card_{index}",
+        "entity_pose": {
+            "translation": translation,
+            "roll": 0.0, "pitch": 0.0, "yaw": yaw,
+        },
+    }
+
+
+def _deterministic_sc_mount(index: int, translation: float) -> dict:
+    """Grid sibling of sc_mount_entity. SC port yaw is FIXED at 0 in eval
+    (aic_bringup/README.md:146), so the grid version has no yaw jitter."""
+    return {
+        "entity_present": True,
+        "entity_name": f"sc_mount_{index}",
+        "entity_pose": {
+            "translation": translation,
+            "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
+        },
+    }
+
+
+def _grid_scene_skeleton(
+    board_pose: dict,
+    distractor_pattern: str,
+    target_rail_key: str,
+) -> dict:
+    """Build task_board scene with fixed board pose and all non-target rails
+    pre-filled (empty or trial_1 distractors). Caller overwrites the one
+    target rail slot afterwards. Refuses to place a distractor on target_rail_key.
+    """
+    scene = {
+        "task_board": {
+            "pose": {
+                "x": board_pose["x"], "y": board_pose["y"], "z": board_pose["z"],
+                "roll": 0.0, "pitch": 0.0, "yaw": board_pose["yaw"],
+            },
+        },
+    }
+    tb = scene["task_board"]
+    for rail in NIC_RAILS:
+        tb[rail] = empty_rail()
+    for rail in SC_RAILS:
+        tb[rail] = empty_rail()
+    if distractor_pattern == "none":
+        for rail in MOUNT_RAILS:
+            tb[rail] = empty_rail()
+    elif distractor_pattern == "trial1":
+        for rail in MOUNT_RAILS:
+            if rail == target_rail_key or rail not in _TRIAL1_DISTRACTORS:
+                tb[rail] = empty_rail()
+                continue
+            name, translation = _TRIAL1_DISTRACTORS[rail]
+            tb[rail] = {
+                "entity_present": True,
+                "entity_name": name,
+                "entity_pose": {
+                    "translation": translation,
+                    "roll": 0.0, "pitch": 0.0, "yaw": 0.0,
+                },
+            }
+    else:
+        raise ValueError(f"unknown distractor_pattern: {distractor_pattern}")
+    return scene
+
+
 def gen_sfp_trial(rng: random.Random, distractor_count: int) -> dict:
     """Randomized SFP-insertion trial.
 
@@ -420,6 +517,84 @@ def gen_sc_trial(rng: random.Random, distractor_count: int) -> dict:
     return {"scene": scene, "tasks": tasks}
 
 
+def sfp_grid_trial(
+    *,
+    nic_index: int,
+    translation: float,
+    nic_yaw: float,
+    sfp_port: str,
+    board_pose: dict,
+    distractor_pattern: str = "none",
+) -> dict:
+    """Deterministic SFP trial for the grid generator."""
+    target_rail = f"nic_rail_{nic_index}"
+    scene = _grid_scene_skeleton(board_pose, distractor_pattern, target_rail)
+    scene["task_board"][target_rail] = _deterministic_nic_card(nic_index, translation, nic_yaw)
+    scene["cables"] = {
+        "cable_0": {
+            "pose": {
+                "gripper_offset": {k: SFP_CABLE_OFFSET[k] for k in ("x", "y", "z")},
+                "roll": SFP_CABLE_OFFSET["roll"],
+                "pitch": SFP_CABLE_OFFSET["pitch"],
+                "yaw": SFP_CABLE_OFFSET["yaw"],
+            },
+            "attach_cable_to_gripper": True,
+            "cable_type": "sfp_sc_cable",
+        },
+    }
+    tasks = {
+        "task_1": {
+            "cable_type": "sfp_sc",
+            "cable_name": "cable_0",
+            "plug_type": "sfp",
+            "plug_name": "sfp_tip",
+            "port_type": "sfp",
+            "port_name": sfp_port,
+            "target_module_name": f"nic_card_mount_{nic_index}",
+            "time_limit": 50,
+        },
+    }
+    return {"scene": scene, "tasks": tasks}
+
+
+def sc_grid_trial(
+    *,
+    sc_index: int,
+    translation: float,
+    board_pose: dict,
+    distractor_pattern: str = "none",
+) -> dict:
+    """Deterministic SC trial for the grid generator."""
+    target_rail = f"sc_rail_{sc_index}"
+    scene = _grid_scene_skeleton(board_pose, distractor_pattern, target_rail)
+    scene["task_board"][target_rail] = _deterministic_sc_mount(sc_index, translation)
+    scene["cables"] = {
+        "cable_1": {
+            "pose": {
+                "gripper_offset": {k: SC_CABLE_OFFSET[k] for k in ("x", "y", "z")},
+                "roll": SC_CABLE_OFFSET["roll"],
+                "pitch": SC_CABLE_OFFSET["pitch"],
+                "yaw": SC_CABLE_OFFSET["yaw"],
+            },
+            "attach_cable_to_gripper": True,
+            "cable_type": "sfp_sc_cable_reversed",
+        },
+    }
+    tasks = {
+        "task_1": {
+            "cable_type": "sfp_sc",
+            "cable_name": "cable_1",
+            "plug_type": "sc",
+            "plug_name": "sc_tip",
+            "port_type": "sc",
+            "port_name": "sc_port_base",
+            "target_module_name": f"sc_port_{sc_index}",
+            "time_limit": 50,
+        },
+    }
+    return {"scene": scene, "tasks": tasks}
+
+
 def _gen_trial_unchecked(rng: random.Random, task_type: str, distractor_count: int) -> dict:
     if task_type == "sfp":
         return gen_sfp_trial(rng, distractor_count)
@@ -491,10 +666,156 @@ def gen_batch_config(
     return config
 
 
+def gen_grid_config_per_task(
+    template: dict,
+    *,
+    task_type: str,
+    steps: int,
+    nic_yaw_steps: int,
+    copies: int,
+    board_pose: dict,
+    distractor_pattern: str,
+    sfp_ports: list,
+    order: str,
+) -> dict:
+    """Build a full config (template + grid trials) for ONE task type.
+
+    SFP loop nesting (outermost first): rail -> translation -> nic_yaw -> port -> copy.
+    SC loop nesting: rail -> translation -> copy.
+    `order="grouped"` keeps copies adjacent; `"interleaved"` rotates copies
+    to the outermost loop so each unique cell is hit once before any repeats.
+    """
+    config = copy.deepcopy(template)
+
+    cells = []
+    if task_type == "sfp":
+        translations = grid_linspace(NIC_RAIL_MIN, NIC_RAIL_MAX, steps)
+        yaws = grid_linspace(math.radians(-10.0), math.radians(10.0), nic_yaw_steps)
+        for nic_index in range(5):
+            for translation in translations:
+                for yaw in yaws:
+                    for port in sfp_ports:
+                        cells.append(sfp_grid_trial(
+                            nic_index=nic_index,
+                            translation=translation,
+                            nic_yaw=yaw,
+                            sfp_port=port,
+                            board_pose=board_pose,
+                            distractor_pattern=distractor_pattern,
+                        ))
+    elif task_type == "sc":
+        translations = grid_linspace(SC_RAIL_MIN, SC_RAIL_MAX, steps)
+        for sc_index in range(2):
+            for translation in translations:
+                cells.append(sc_grid_trial(
+                    sc_index=sc_index,
+                    translation=translation,
+                    board_pose=board_pose,
+                    distractor_pattern=distractor_pattern,
+                ))
+    else:
+        raise ValueError(f"unknown task_type for grid: {task_type}")
+
+    trials = {}
+    if order == "grouped":
+        for cell in cells:
+            for _ in range(copies):
+                trials[f"trial_{len(trials) + 1}"] = copy.deepcopy(cell)
+    elif order == "interleaved":
+        for _ in range(copies):
+            for cell in cells:
+                trials[f"trial_{len(trials) + 1}"] = copy.deepcopy(cell)
+    else:
+        raise ValueError(f"unknown order: {order}")
+
+    config["trials"] = trials
+    return config
+
+
 def config_hash(config: dict) -> str:
     """Stable hash of the config content for reproducibility tagging."""
     blob = json.dumps(config, sort_keys=True).encode()
     return hashlib.sha256(blob).hexdigest()[:12]
+
+
+def _run_grid_mode(args, template: dict) -> None:
+    """Grid mode driver. Writes one YAML per task type into args.out (a directory)."""
+    if args.out.suffix == ".yaml":
+        raise SystemExit("--out must be a directory in --mode grid (got a .yaml file)")
+    if args.n_trials is not None:
+        print("WARNING: --n-trials is ignored in grid mode")
+    if args.seed != 0:
+        print("WARNING: --seed is ignored in grid mode (grid is deterministic)")
+
+    # Single board pose shared across SFP and SC. Trial_3's pose (x=0.17, y=0.0,
+    # yaw=3.0) was empirically verified to keep both NIC and SC zones in camera
+    # frame; trial_1's pose only works for SFP. CLI flags override.
+    board_pose = {
+        "x": args.board_x, "y": args.board_y,
+        "z": args.board_z, "yaw": args.board_yaw,
+    }
+
+    if args.grid_sfp_ports == "both":
+        sfp_ports = ["sfp_port_0", "sfp_port_1"]
+    else:
+        sfp_ports = [f"sfp_port_{args.grid_sfp_ports}"]
+
+    if args.task_type in ("both", "mixed"):
+        task_types = ["sfp", "sc"]
+    else:
+        task_types = [args.task_type]
+
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    summary = []
+    for tt in task_types:
+        config = gen_grid_config_per_task(
+            template,
+            task_type=tt,
+            steps=args.grid_steps,
+            nic_yaw_steps=args.grid_nic_yaw_steps,
+            copies=args.grid_copies,
+            board_pose=board_pose,
+            distractor_pattern=args.grid_distractors,
+            sfp_ports=sfp_ports,
+            order=args.grid_order,
+        )
+
+        n_invisible = 0
+        first_failures = []
+        for tname, trial in config["trials"].items():
+            visible, per_cam = target_port_visible_at_spawn(trial)
+            if not visible:
+                n_invisible += 1
+                if len(first_failures) < 5:
+                    first_failures.append((tname, per_cam))
+        if n_invisible:
+            for tname, per_cam in first_failures:
+                print(f"VISIBILITY FAIL: {tt} {tname}: {per_cam}")
+            raise SystemExit(
+                f"{n_invisible}/{len(config['trials'])} {tt} trials failed the "
+                f"visibility predicate. Aborting before write. Adjust --board-x/y/yaw "
+                f"or the grid range."
+            )
+
+        if tt == "sfp":
+            spec = f"5x{args.grid_steps}"
+            if args.grid_nic_yaw_steps > 1:
+                spec += f"x{args.grid_nic_yaw_steps}"
+            spec += f"x{len(sfp_ports)}x{args.grid_copies}"
+        else:
+            spec = f"2x{args.grid_steps}x{args.grid_copies}"
+
+        out_path = args.out / f"{tt}_{spec}.yaml"
+        with out_path.open("w") as f:
+            yaml.safe_dump(config, f, sort_keys=False)
+        summary.append((tt, len(config["trials"]), out_path))
+
+    parts = "  ".join(f"{tt}: {n}" for tt, n, _ in summary)
+    total = sum(n for _, n, _ in summary)
+    print(f"{parts}  total: {total}")
+    for tt, n, path in summary:
+        print(f"  {tt} -> {path}  ({n} trials)")
 
 
 def main() -> None:
@@ -509,12 +830,42 @@ def main() -> None:
     p.add_argument("--n-trials", type=int, default=None,
                    help="Batch mode: pack this many random trials into ONE config written to --out (file).")
     p.add_argument("--seed", type=int, default=0, help="Random seed.")
-    p.add_argument("--task-type", choices=["sfp", "sc", "mixed"], default="mixed",
-                   help="Which task type(s) to generate. 'mixed' picks per-trial uniformly.")
+    p.add_argument("--task-type", choices=["sfp", "sc", "mixed", "both"], default="mixed",
+                   help="Which task type(s) to generate. 'mixed' (random mode) picks "
+                        "per-trial uniformly. 'both' (grid mode) emits one YAML per task.")
     p.add_argument("--distractor-min", type=int, default=0, help="Min distractor mounts per trial.")
     p.add_argument("--distractor-max", type=int, default=4, help="Max distractor mounts per trial.")
     p.add_argument("--validate", type=Path, default=None,
                    help="Validation mode: load a config YAML and report per-trial visibility. No generation.")
+
+    # Grid-mode flags
+    p.add_argument("--mode", choices=["random", "grid"], default="random",
+                   help="Generation mode. 'random' = continuous sampling (default, "
+                        "existing behavior). 'grid' = deterministic discrete grid "
+                        "for IL data collection.")
+    p.add_argument("--grid-steps", type=int, default=5,
+                   help="Grid mode: number of evenly-spaced translation steps per rail.")
+    p.add_argument("--grid-nic-yaw-steps", type=int, default=1,
+                   help="Grid mode: NIC card yaw steps across [-10°, +10°]. "
+                        "Default 1 (yaw=0 only). >1 requires _target_port_in_board "
+                        "to be patched to rotate the port offset by card yaw.")
+    p.add_argument("--grid-copies", type=int, default=5,
+                   help="Grid mode: number of identical copies of each unique cell.")
+    p.add_argument("--board-x", type=float, default=0.17,
+                   help="Grid mode: fixed board x (default = trial_3, works for "
+                        "BOTH SFP and SC at the fixed home pose).")
+    p.add_argument("--board-y", type=float, default=0.0,
+                   help="Grid mode: fixed board y (default = trial_3).")
+    p.add_argument("--board-z", type=float, default=BOARD_Z,
+                   help="Grid mode: fixed board z in world frame.")
+    p.add_argument("--board-yaw", type=float, default=3.0,
+                   help="Grid mode: fixed board yaw in radians (default = trial_3).")
+    p.add_argument("--grid-distractors", choices=["none", "trial1"], default="none",
+                   help="Grid mode: distractor placement on mount rails.")
+    p.add_argument("--grid-sfp-ports", choices=["0", "1", "both"], default="both",
+                   help="Grid mode: which SFP port(s) on the NIC card to target.")
+    p.add_argument("--grid-order", choices=["grouped", "interleaved"], default="grouped",
+                   help="Grid mode: copy layout. 'grouped' keeps copies adjacent.")
     args = p.parse_args()
 
     if args.validate is not None:
@@ -544,6 +895,10 @@ def main() -> None:
 
     with args.template.open() as f:
         template = yaml.safe_load(f)
+
+    if args.mode == "grid":
+        _run_grid_mode(args, template)
+        return
 
     rng = random.Random(args.seed)
 
