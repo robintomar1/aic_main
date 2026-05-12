@@ -85,9 +85,9 @@ class ContinuousParams:
     # Safety floor for the plug's Z above port_z before any lateral motion.
     # Phase 0 (RAISE) fires only if the initial plug Z is below this — moves
     # straight up to clear the NIC card / SFP port / SC port body before
-    # Phase 1's XY approach engages. Conservative default 10 cm covers SFP
-    # port height (~46 mm) + NIC card lateral profile + buffer.
-    min_safe_plug_z_above_port_m: float = 0.10
+    # Phase 1's XY approach engages. 5 cm covers SFP port height (~46 mm)
+    # plus a small buffer; bump higher via env if extra clearance is wanted.
+    min_safe_plug_z_above_port_m: float = 0.05
     # Force-gate (no retreat — Z just freezes)
     force_stop_n: float = 18.0
     force_resume_n: float = 12.0
@@ -209,11 +209,56 @@ class TrajectoryGenerator:
         # else initial_z). Phase 1 itself doesn't touch Z.
         phase1_pz = self._phase0_target_pz
 
-        # Phase 1 target: XY-only correction. Gripper such that plug XY ≈ port_xy
-        # + injected_xy AT THE CURRENT ORIENTATION. Z stays at Phase 0 end Z.
+        # Compute the port-matching gripper orientation FIRST, so Phase 1's
+        # XY target can anticipate Phase 2's rotation effect (look-ahead).
+        # Without look-ahead, Phase 2's rotation arcs the plug off port,
+        # causing a visible XY "jump" at the start of Phase 3 when PI
+        # immediately drives gripper back. With look-ahead, plug ends up
+        # exactly at port_xy AFTER Phase 2 — no jump needed.
+        # q_target_gripper = q_diff(q_port, q_plug) ⊗ q_gripper_current
+        q_plug_inv = (
+            -initial_plug_quat[0], initial_plug_quat[1],
+            initial_plug_quat[2], initial_plug_quat[3],
+        )
+        q_diff = quaternion_multiply(self._port_quat, q_plug_inv)
+        q_gripper_target_tup = quaternion_multiply(
+            q_diff,
+            (self._initial_gripper_pose.qw, self._initial_gripper_pose.qx,
+             self._initial_gripper_pose.qy, self._initial_gripper_pose.qz),
+        )
+
+        # Compute the plug position in the GRIPPER's local frame at trial start:
+        #   plug_local = R(q_initial_gripper)⁻¹ × (plug_init − gripper_init)
+        # This vector is rigidly attached to the gripper; rotating the gripper
+        # rotates this vector in base frame too.
+        q_init_grip_inv = (
+            self._initial_gripper_pose.qw,
+            -self._initial_gripper_pose.qx,
+            -self._initial_gripper_pose.qy,
+            -self._initial_gripper_pose.qz,
+        )
+        plug_minus_gripper = (
+            initial_plug_xyz[0] - self._initial_gripper_pose.px,
+            initial_plug_xyz[1] - self._initial_gripper_pose.py,
+            initial_plug_xyz[2] - self._initial_gripper_pose.pz,
+        )
+        plug_local_in_gripper = rotate_vec_by_quat(
+            plug_minus_gripper, q_init_grip_inv)
+
+        # Plug position relative to gripper AFTER the Phase 2 rotation (in base
+        # frame): R(q_target_gripper) × plug_local_in_gripper.
+        plug_offset_after_rotation = rotate_vec_by_quat(
+            plug_local_in_gripper, q_gripper_target_tup)
+
+        # Phase 1 target XY: where the gripper must be so that, after Phase 2
+        # rotation, the plug ends EXACTLY at port_xy + injected_xy. Solving
+        # plug_after = gripper_after + plug_offset_after_rotation = port + inj
+        # gives gripper_after.xy = (port + inj).xy − plug_offset_after_rotation.xy.
         self._phase1_target = PoseSnapshot(
-            px=self._port_xyz[0] + gp_offset_base[0] + self._injected_xy_local[0],
-            py=self._port_xyz[1] + gp_offset_base[1] + self._injected_xy_local[1],
+            px=(self._port_xyz[0] + self._injected_xy_local[0]
+                - float(plug_offset_after_rotation[0])),
+            py=(self._port_xyz[1] + self._injected_xy_local[1]
+                - float(plug_offset_after_rotation[1])),
             pz=phase1_pz,
             qw=self._initial_gripper_pose.qw,
             qx=self._initial_gripper_pose.qx,
@@ -222,23 +267,12 @@ class TrajectoryGenerator:
         )
 
         # Phase 2 target: same XYZ as Phase 1; orientation = port-matching.
-        # q_target_gripper = q_diff(q_port, q_plug) ⊗ q_gripper_current
-        q_plug_inv = (
-            -initial_plug_quat[0], initial_plug_quat[1],
-            initial_plug_quat[2], initial_plug_quat[3],
-        )
-        q_diff = quaternion_multiply(self._port_quat, q_plug_inv)
-        q_gripper_target = quaternion_multiply(
-            q_diff,
-            (self._initial_gripper_pose.qw, self._initial_gripper_pose.qx,
-             self._initial_gripper_pose.qy, self._initial_gripper_pose.qz),
-        )
         self._phase2_target = PoseSnapshot(
             px=self._phase1_target.px,
             py=self._phase1_target.py,
             pz=self._phase1_target.pz,
-            qw=q_gripper_target[0], qx=q_gripper_target[1],
-            qy=q_gripper_target[2], qz=q_gripper_target[3],
+            qw=q_gripper_target_tup[0], qx=q_gripper_target_tup[1],
+            qy=q_gripper_target_tup[2], qz=q_gripper_target_tup[3],
         )
 
         # Compute Phase 0 / Phase 1 / Phase 2 durations dynamically based on

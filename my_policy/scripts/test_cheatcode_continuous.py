@@ -866,6 +866,53 @@ def test_phase0_raise_to_phase1_continuity():
     )
 
 
+def test_phase1_lookahead_eliminates_p2_to_p3_xy_shift():
+    """Phase 1 must anticipate Phase 2's rotation effect: with a non-trivial
+    rotation, the Phase 1 target XY should be set so that AFTER the Phase 2
+    rotation moves the plug, the plug ends EXACTLY at port_xy + injected_xy.
+    This eliminates the visible XY 'jump' at the start of Phase 3.
+
+    Verify by computing where the plug WOULD end up given the Phase 2 target
+    pose, and checking it equals port_xy.
+    """
+    # Set up a non-trivial rotation: port at 60° yaw vs identity plug/gripper.
+    port_q = (math.cos(math.pi / 6), 0.0, 0.0, math.sin(math.pi / 6))
+    plug_q = (1.0, 0.0, 0.0, 0.0)
+    gripper_q = (1.0, 0.0, 0.0, 0.0)
+    # Plug below+forward of gripper so rotation has a visible XY effect.
+    traj = _build_traj(
+        plug_type="sfp",
+        port_xyz=(0.40, 0.0, 0.10),
+        gripper_xyz=(0.42, 0.005, 0.30),
+        plug_xyz=(0.42, 0.005, 0.25),
+        port_quat=port_q, plug_quat=plug_q, gripper_quat=gripper_q,
+    )
+    # Compute where the plug ends up at Phase 2 end:
+    # plug_after = phase2_target.position + R(q_target_gripper) × plug_local_in_gripper
+    # plug_local_in_gripper = R(q_initial_gripper)⁻¹ × (plug_init − gripper_init)
+    from my_policy.trajectory import rotate_vec_by_quat
+    q_init_grip_inv = (gripper_q[0], -gripper_q[1], -gripper_q[2], -gripper_q[3])
+    plug_minus_grip = (
+        0.42 - traj._initial_gripper_pose.px,
+        0.005 - traj._initial_gripper_pose.py,
+        0.25 - traj._initial_gripper_pose.pz,
+    )
+    plug_local = rotate_vec_by_quat(plug_minus_grip, q_init_grip_inv)
+    q_target = traj._phase2_target.quat()
+    plug_offset_after_rot = rotate_vec_by_quat(plug_local, q_target)
+    plug_after_xy = (
+        traj._phase2_target.px + plug_offset_after_rot[0],
+        traj._phase2_target.py + plug_offset_after_rot[1],
+    )
+    err_xy = math.hypot(
+        plug_after_xy[0] - 0.40, plug_after_xy[1] - 0.0)
+    # Within ~10 micrometers (float64 precision floor for this composition).
+    assert err_xy < 1e-5, (
+        f"plug_after_phase2 XY = {plug_after_xy}, expected (0.40, 0.0). "
+        f"err = {err_xy * 1000:.4f}mm — look-ahead failed"
+    )
+
+
 def test_should_abort_propagation_via_policy():
     """Cancel during the policy's insert_cable loop must surface as a False
     return promptly. Tested at the policy level (insert_cable) not the
@@ -973,6 +1020,7 @@ if __name__ == "__main__":
         test_phase0_raise_fires_when_initial_z_below_safe_floor,
         test_phase0_raise_skipped_when_initial_z_already_safe,
         test_phase0_raise_to_phase1_continuity,
+        test_phase1_lookahead_eliminates_p2_to_p3_xy_shift,
         test_should_abort_propagation_via_policy,
     ]
     failures = 0

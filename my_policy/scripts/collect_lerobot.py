@@ -504,6 +504,9 @@ def run_collection_loop(
     event_count_at_trial_start = 0
     goal_terminated_at_trial_start = monitor.goal_terminated_count
     last_goal_started_count = monitor.goal_started_count
+    # Per-trial timeout — read from YAML at goal-start, used in overlong check.
+    # Initial value is the CLI cap; overwritten when each trial starts.
+    current_trial_max_s = max_episode_s
     # Local frame buffer — never touched outside this loop. Handed off to
     # save_episode_async on trial save (the worker thread then routes them
     # into the dataset). Replaces direct dataset.add_frame calls during
@@ -606,9 +609,18 @@ def run_collection_loop(
                 task = trials[trial_idx]
                 port_frame, plug_frame = task_to_frames(task)
                 instruction = task_to_instruction(task)
+                # Per-trial timeout from the YAML's `time_limit` field if
+                # present; otherwise fall back to the recorder-level cap. The
+                # engine enforces the YAML value as the trial deadline, so the
+                # recorder must use the same value to avoid discarding trials
+                # that the engine considers successful.
+                try:
+                    current_trial_max_s = float(task.get("time_limit", max_episode_s))
+                except (TypeError, ValueError):
+                    current_trial_max_s = max_episode_s
                 log.info(
                     f"[RECORD START] trial {trial_idx + 1}/{len(trials)}: "
-                    f"{instruction}"
+                    f"{instruction}  (time_limit={current_trial_max_s:.1f}s)"
                 )
                 log.info(f"    port_frame={port_frame}")
                 log.info(f"    plug_frame={plug_frame}")
@@ -627,7 +639,7 @@ def run_collection_loop(
         if recording:
             duration_sim = now_sim_s() - trial_start_sim_s
             terminal = monitor.goal_terminated_count > goal_terminated_at_trial_start
-            overlong = duration_sim > max_episode_s
+            overlong = duration_sim > current_trial_max_s
             if terminal or overlong:
                 insertion_event_fired = (
                     monitor.event_count > event_count_at_trial_start
@@ -645,7 +657,7 @@ def run_collection_loop(
                 # SUCCEEDED-but-no-insertion trials into the dataset.
                 discarded = overlong or (not succeeded) or (not insertion_event_fired)
                 if overlong:
-                    reason = f"overlong_{duration_sim:.1f}s_sim>{max_episode_s}s"
+                    reason = f"overlong_{duration_sim:.1f}s_sim>{current_trial_max_s}s"
                 else:
                     status_name = {
                         GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED",
