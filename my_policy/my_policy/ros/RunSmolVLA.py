@@ -315,6 +315,14 @@ class RunSmolVLA(Policy):
     RTC_GUIDANCE_WEIGHT_ENV = "AIC_PL_SMOLVLA_RTC_GUIDANCE_WEIGHT"
     RTC_ATTENTION_SCHEDULE_ENV = "AIC_PL_SMOLVLA_RTC_ATTENTION_SCHEDULE"
 
+    # SKIP_CHUNK opt-in. Setting to a positive integer N routes inference
+    # through predict_action_chunk and drops the FIRST N actions of every
+    # chunk before dispatch. Purely synchronous — no async producer, no RTC
+    # guidance, no smoothing. Mutually exclusive with RTC. Useful for
+    # treating the leading actions of each chunk as "stale" and only
+    # executing the later, more-considered tail.
+    SKIP_N_ENV = "AIC_PL_SMOLVLA_SKIP_N"
+
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device(
@@ -359,9 +367,29 @@ class RunSmolVLA(Policy):
                 self.RTC_INFERENCE_DELAY_ENV, RTC_DEFAULT_INFERENCE_DELAY,
             ))
 
+        # ---- SKIP_CHUNK config (opt-in) -------------------------------
+        skip_n_str = os.environ.get(self.SKIP_N_ENV, "").strip()
+        self.skip_n_chunks = int(skip_n_str) if skip_n_str else 0
+        if self.skip_n_chunks < 0:
+            raise ValueError(
+                f"{self.SKIP_N_ENV}={self.skip_n_chunks} must be >= 0"
+            )
+        self.skip_chunk_enabled = self.skip_n_chunks > 0
+        if self.skip_chunk_enabled and self.rtc_enabled:
+            raise ValueError(
+                f"{self.SKIP_N_ENV} and {self.RTC_ENABLED_ENV} are mutually "
+                f"exclusive — pick one mode"
+            )
+
         self.policy = _load_smolvla_policy(
             ckpt_path, self.device, n_action_steps_override, rtc_config=rtc_config,
         )
+        # Validate skip_n against chunk_size now that the policy is loaded.
+        if self.skip_chunk_enabled and self.skip_n_chunks >= self.policy.config.chunk_size:
+            raise ValueError(
+                f"{self.SKIP_N_ENV}={self.skip_n_chunks} must be < "
+                f"chunk_size={self.policy.config.chunk_size}"
+            )
 
         self.preprocessor = DataProcessorPipeline.from_pretrained(
             str(ckpt_path), config_filename="policy_preprocessor.json"
@@ -387,7 +415,12 @@ class RunSmolVLA(Policy):
             f"n_action_steps={self.policy.config.n_action_steps} "
             f"chunk_size={self.policy.config.chunk_size} "
             f"localizer_mode={self._localizer_mode()} "
-            f"rtc_enabled={self.rtc_enabled}"
+            f"rtc_enabled={self.rtc_enabled} "
+            f"skip_chunk_enabled={self.skip_chunk_enabled}"
+            + (
+                f" skip_n={self.skip_n_chunks}"
+                if self.skip_chunk_enabled else ""
+            )
             + (
                 f" rtc_inference_delay={self.rtc_inference_delay}"
                 f" rtc_execution_horizon={self.policy.config.rtc_config.execution_horizon}"
@@ -577,6 +610,10 @@ class RunSmolVLA(Policy):
         )
         if self.rtc_enabled:
             return self._insert_cable_rtc(
+                task, get_observation, move_robot, send_feedback,
+            )
+        if self.skip_chunk_enabled:
+            return self._insert_cable_skip_chunk(
                 task, get_observation, move_robot, send_feedback,
             )
         return self._insert_cable_sync(
@@ -873,6 +910,117 @@ class RunSmolVLA(Policy):
         self.get_logger().info(
             f"RunSmolVLA.insert_cable[RTC]: exit after {ticks} ticks "
             f"(chunks={stats['chunks']}, no_action={no_action_ticks}, "
+            f"max_a_step_Δ={max_a_step_delta:.4f})"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # SKIP_CHUNK loop. Synchronous (no producer thread, no RTC guidance).
+    # Calls predict_action_chunk to get the full chunk, discards the first
+    # `skip_n_chunks` actions, dispatches the remaining tail one per tick.
+    # When the local buffer drains, fires fresh inference on the latest obs.
+    # ------------------------------------------------------------------
+
+    def _insert_cable_skip_chunk(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        task_str = task_string_for(
+            task.target_module_name, task.port_name, task.port_type,
+        )
+        skip_n = self.skip_n_chunks
+        chunk_size = self.policy.config.chunk_size
+        self.get_logger().info(
+            f"task_str: {task_str!r}  [SKIP_CHUNK mode "
+            f"skip_n={skip_n} chunk_size={chunk_size} dispatched_per_chunk={chunk_size - skip_n}]"
+        )
+
+        port_pose = self._acquire_port_pose_baselink(task, get_observation)
+        if port_pose is None:
+            send_feedback("aborted: port pose unavailable")
+            return False
+
+        self.policy.reset()
+
+        # Local buffer of post-processed actions awaiting dispatch.
+        # Each entry is a 1D tensor of shape (action_dim_padded,).
+        local_queue: list[torch.Tensor] = []
+
+        start_t = self.time_now()
+        period_ns = int(self.loop_period_s * 1e9)
+        next_deadline = start_t + Duration(nanoseconds=period_ns)
+        ticks = 0
+        chunks_produced = 0
+        none_obs_count = 0
+        LOG_EVERY_N = 10
+        last_a_port: np.ndarray | None = None
+        max_a_step_delta = 0.0
+
+        while (self.time_now() - start_t).nanoseconds / 1e9 < self.timeout_s:
+            # Refill if the local buffer is exhausted.
+            if not local_queue:
+                obs_msg = get_observation()
+                if obs_msg is None:
+                    none_obs_count += 1
+                    self.sleep_for(self.loop_period_s)
+                    next_deadline = self.time_now() + Duration(nanoseconds=period_ns)
+                    continue
+                obs = self._build_obs_dict(obs_msg, task_str, port_pose)
+                obs = self.preprocessor(obs)
+                t_inf_start = _time.perf_counter()
+                with torch.inference_mode():
+                    actions = self.policy.predict_action_chunk(obs)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                inf_ms = (_time.perf_counter() - t_inf_start) * 1000.0
+                # actions: (1, chunk_size, action_dim_padded)
+                chunk = actions.squeeze(0)  # (chunk_size, A_padded)
+                # Drop the first skip_n and post-process each remaining step.
+                for t in range(skip_n, chunk_size):
+                    a_post = self.postprocessor(chunk[t : t + 1])
+                    # a_post: (1, A_padded); store unbatched on CPU.
+                    local_queue.append(a_post[0].detach().cpu())
+                chunks_produced += 1
+                self.get_logger().info(
+                    f"[SKIP_CHUNK] chunk {chunks_produced} inf={inf_ms:.1f}ms "
+                    f"dropped={skip_n} buffered={len(local_queue)}"
+                )
+
+            action = local_queue.pop(0)
+            a_port = action.numpy()[:7]
+            pose = _action_port_to_baselink_pose(
+                a_port.astype(np.float64), port_pose,
+            )
+            self.set_pose_target(move_robot, pose, frame_id="base_link")
+
+            if last_a_port is not None:
+                d = float(np.linalg.norm(a_port - last_a_port))
+                max_a_step_delta = max(max_a_step_delta, d)
+            last_a_port = a_port
+
+            if ticks % LOG_EVERY_N == 0:
+                self.get_logger().info(
+                    f"[SKIP_CHUNK skip_n={skip_n}] tick={ticks:4d} "
+                    f"chunks={chunks_produced} buf={len(local_queue)} "
+                    f"a_port[xyz]=({a_port[0]:+.3f},{a_port[1]:+.3f},{a_port[2]:+.3f}) "
+                    f"max_a_step_Δ={max_a_step_delta:.4f}"
+                )
+
+            send_feedback("running")
+            ticks += 1
+
+            now = self.time_now()
+            remaining_ns = (next_deadline - now).nanoseconds
+            if remaining_ns > 0:
+                self.sleep_for(remaining_ns / 1e9)
+            next_deadline = next_deadline + Duration(nanoseconds=period_ns)
+
+        self.get_logger().info(
+            f"RunSmolVLA.insert_cable[SKIP_CHUNK]: exit after {ticks} ticks "
+            f"(chunks={chunks_produced}, none_obs={none_obs_count}, "
             f"max_a_step_Δ={max_a_step_delta:.4f})"
         )
         return True
