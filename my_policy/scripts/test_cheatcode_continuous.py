@@ -697,36 +697,36 @@ def test_injection_deterministic_per_task():
 
 
 def test_phase1_duration_scales_with_distance():
-    """Phase 1 duration must be proportional to TCP→target displacement so
-    peak velocity stays ≤ max_linear_velocity_m_s regardless of how far
-    the port is from spawn."""
-    # Near initial position: small displacement.
+    """Phase 1 (XY-only) duration must be proportional to TCP→over-port
+    XY displacement so peak velocity stays ≤ max_linear_velocity_m_s
+    regardless of how far the port is from spawn. Phase 0 handles Z
+    separately, so we only check the Phase 1 XY component here."""
+    # Use spawn poses already above the safety floor so Phase 0 doesn't fire
+    # and confound the Phase 1 displacement check (gripper z = 0.30 → plug
+    # z = 0.25 → 15 cm above port_z=0.10 → safe).
     near = _build_traj(
-        gripper_xyz=(0.405, 0.001, 0.15),  # ~5cm above target hover
-        plug_xyz=(0.405, 0.001, 0.10),
+        gripper_xyz=(0.405, 0.001, 0.30),
+        plug_xyz=(0.405, 0.001, 0.25),
     )
-    # Far initial position: large displacement (~30cm path).
     far = _build_traj(
-        gripper_xyz=(0.10, 0.20, 0.60),
-        plug_xyz=(0.10, 0.20, 0.55),
+        gripper_xyz=(0.10, 0.20, 0.30),
+        plug_xyz=(0.10, 0.20, 0.25),
     )
     assert far._phase1_duration_s > near._phase1_duration_s, (
         f"far ({far._phase1_duration_s:.2f}s) must take longer than "
         f"near ({near._phase1_duration_s:.2f}s)"
     )
-    # Verify peak velocity ≤ max_linear_velocity_m_s + small slack.
     cap = far.params.max_linear_velocity_m_s
     for traj in [near, far]:
-        disp = math.sqrt(
+        # Phase 1 covers XY only — Phase 0 already moved Z to phase0_target_pz.
+        disp_xy = math.sqrt(
             (traj._phase1_target.px - traj._initial_gripper_pose.px) ** 2
             + (traj._phase1_target.py - traj._initial_gripper_pose.py) ** 2
-            + (traj._phase1_target.pz - traj._initial_gripper_pose.pz) ** 2
         )
-        # min-jerk peak velocity = 1.875 × disp / duration
-        peak_vel = 1.875 * disp / traj._phase1_duration_s
+        peak_vel = 1.875 * disp_xy / traj._phase1_duration_s
         assert peak_vel <= cap + 1e-6, (
             f"peak Phase 1 velocity {peak_vel * 1000:.1f}mm/s exceeds "
-            f"cap {cap * 1000:.1f}mm/s for disp {disp * 1000:.1f}mm"
+            f"cap {cap * 1000:.1f}mm/s for XY disp {disp_xy * 1000:.1f}mm"
         )
 
 
@@ -770,6 +770,100 @@ def test_phase2_duration_scales_with_angular_distance():
             f"exceeds cap {math.degrees(cap):.1f}°/s for angular dist "
             f"{math.degrees(ang_dist):.1f}°"
         )
+
+
+def test_phase0_raise_fires_when_initial_z_below_safe_floor():
+    """When initial plug Z is below port_z + min_safe_plug_z_above_port_m,
+    Phase 0 must fire and raise the gripper to the safe Z BEFORE any XY
+    motion. Required to avoid clipping NIC card / port body laterally."""
+    # gripper at z=0.13, plug at z=0.08, port at z=0.10. Plug is BELOW port —
+    # definitely below the safety floor (port + 0.10 = 0.20).
+    traj = _build_traj(
+        plug_type="sfp",
+        port_xyz=(0.40, 0.0, 0.10),
+        gripper_xyz=(0.42, 0.005, 0.13),
+        plug_xyz=(0.42, 0.005, 0.08),
+    )
+    assert traj._needs_raise is True, "expected Phase 0 to fire for low spawn"
+    # phase0_target_pz must equal port_z + min_safe + gp_offset_z
+    expected = 0.10 + traj.params.min_safe_plug_z_above_port_m + 0.05
+    assert abs(traj._phase0_target_pz - expected) < 1e-9, (
+        f"phase0 target z = {traj._phase0_target_pz}, expected {expected}"
+    )
+    # Drive the trajectory and verify Phase 0 ticks come BEFORE Phase 1 ticks,
+    # and during Phase 0 the XY stays at initial.
+    hist = _drive_traj(
+        traj,
+        gripper_xyz=(0.42, 0.005, 0.13),
+        plug_xyz=(0.42, 0.005, 0.08),
+        port_xyz=(0.40, 0.0, 0.10),
+    )
+    p0_ticks = [h for h in hist if h[1] == traj.PHASE_0_RAISE]
+    assert len(p0_ticks) >= 5, f"expected Phase 0 ticks, got {len(p0_ticks)}"
+    initial_x = traj._initial_gripper_pose.px
+    initial_y = traj._initial_gripper_pose.py
+    for _, _, pose, _ in p0_ticks:
+        assert abs(pose.px - initial_x) < 1e-9, (
+            f"Phase 0 must keep XY constant; px drifted to {pose.px}"
+        )
+        assert abs(pose.py - initial_y) < 1e-9
+    # Z must monotonically increase during Phase 0.
+    p0_z = [h[2].pz for h in p0_ticks]
+    for i in range(1, len(p0_z)):
+        assert p0_z[i] >= p0_z[i - 1] - 1e-12, (
+            f"Phase 0 Z must be monotone increasing; got {p0_z[i-1]} → {p0_z[i]}"
+        )
+
+
+def test_phase0_raise_skipped_when_initial_z_already_safe():
+    """When initial plug Z is already above the safety floor, Phase 0 must
+    be skipped — trajectory starts directly in PHASE_1_XY."""
+    # Plug at z=0.30, port at z=0.10 → 20 cm clearance, well above the 10 cm
+    # safety floor. No raise needed.
+    traj = _build_traj(
+        plug_type="sfp",
+        port_xyz=(0.40, 0.0, 0.10),
+        gripper_xyz=(0.42, 0.005, 0.35),
+        plug_xyz=(0.42, 0.005, 0.30),
+    )
+    assert traj._needs_raise is False, "expected Phase 0 to skip for safe spawn"
+    assert traj._phase == traj.PHASE_1_XY, (
+        f"trajectory must start in PHASE_1_XY when no raise needed; "
+        f"started in {traj._phase}"
+    )
+    # Phase 0 duration is 0 by construction.
+    assert traj._phase0_duration_s == 0.0
+
+
+def test_phase0_raise_to_phase1_continuity():
+    """Phase 0 → Phase 1 transition must preserve pose continuity (final
+    Phase 0 tick == first Phase 1 tick to within a small tolerance)."""
+    traj = _build_traj(
+        plug_type="sfp",
+        port_xyz=(0.40, 0.0, 0.10),
+        gripper_xyz=(0.42, 0.005, 0.13),
+        plug_xyz=(0.42, 0.005, 0.08),
+    )
+    hist = _drive_traj(
+        traj,
+        gripper_xyz=(0.42, 0.005, 0.13),
+        plug_xyz=(0.42, 0.005, 0.08),
+        port_xyz=(0.40, 0.0, 0.10),
+    )
+    transitions = []
+    for i in range(1, len(hist)):
+        if hist[i][1] != hist[i - 1][1]:
+            transitions.append(i)
+    assert len(transitions) >= 1, "expected at least one phase transition"
+    p01 = transitions[0]
+    pos_jump = math.sqrt(
+        (hist[p01 - 1][2].px - hist[p01][2].px) ** 2
+        + (hist[p01 - 1][2].py - hist[p01][2].py) ** 2
+        + (hist[p01 - 1][2].pz - hist[p01][2].pz) ** 2
+    )
+    assert pos_jump < 0.001, (
+        f"P0→P1 position jump {pos_jump * 1000:.4f}mm exceeds 1mm tolerance"
+    )
 
 
 def test_should_abort_propagation_via_policy():
@@ -876,6 +970,9 @@ if __name__ == "__main__":
         test_phase1_duration_scales_with_distance,
         test_phase1_duration_floor_for_tiny_movements,
         test_phase2_duration_scales_with_angular_distance,
+        test_phase0_raise_fires_when_initial_z_below_safe_floor,
+        test_phase0_raise_skipped_when_initial_z_already_safe,
+        test_phase0_raise_to_phase1_continuity,
         test_should_abort_propagation_via_policy,
     ]
     failures = 0

@@ -15,8 +15,10 @@ Properties (verified by test_cheatcode_continuous.py):
   * Phase boundaries preserve pose continuity to ~1e-6 m / 1e-6 quat.
   * Spiral on/off is ramped over 5 ticks (250 ms) — no instantaneous ±2 mm jump.
   * LATCH is blended over 5 ticks — no instantaneous XY freeze.
-  * Single hover_z per plug type (no separate APPROACH_Z_OFFSET) — eliminates
-    the 100 mm SC z-step at end of APPROACH that the prior CheatCodeRobust had.
+  * Phase 1 is strictly XY-only — Z stays at the initial gripper Z. Phase 3
+    owns the entire Z descent. Eliminates the 100 mm SC z-step that the prior
+    CheatCodeRobust had at the end of APPROACH (it forced Z to a hover height
+    before descent; we just don't touch Z until descent).
 
 Hybrid recovery-scenario injection (default 30 % of trials get a deterministic
 1–3 mm XY offset in plug-local frame, capped at 0.5 mm on the SC tight axis)
@@ -80,8 +82,12 @@ class ContinuousParams:
     descent_ramp_s: float = 1.0        # ramp descent rate 0 → full over 1 s using min-jerk
     tick_period_s: float = 0.05
     insert_z_offset: float = -0.015
-    hover_z_by_plug: dict = None
-    hover_z_default: float = 0.10
+    # Safety floor for the plug's Z above port_z before any lateral motion.
+    # Phase 0 (RAISE) fires only if the initial plug Z is below this — moves
+    # straight up to clear the NIC card / SFP port / SC port body before
+    # Phase 1's XY approach engages. Conservative default 10 cm covers SFP
+    # port height (~46 mm) + NIC card lateral profile + buffer.
+    min_safe_plug_z_above_port_m: float = 0.10
     # Force-gate (no retreat — Z just freezes)
     force_stop_n: float = 18.0
     force_resume_n: float = 12.0
@@ -112,8 +118,6 @@ class ContinuousParams:
     inject_max_m: float = 0.003
 
     def __post_init__(self):
-        if self.hover_z_by_plug is None:
-            self.hover_z_by_plug = {"sfp": 0.20, "sc": 0.10}
         if self.spiral_mode_by_plug is None:
             self.spiral_mode_by_plug = {"sc": "x_only", "sfp": "circular"}
         if self.inside_depth_by_plug is None:
@@ -130,6 +134,7 @@ class TrajectoryGenerator:
     """Stateful per-trial trajectory generator. step() returns the next
     commanded gripper pose."""
 
+    PHASE_0_RAISE = "PHASE_0_RAISE"
     PHASE_1_XY = "PHASE_1_XY_APPROACH"
     PHASE_2_ORIENT = "PHASE_2_ORIENT"
     PHASE_3_DESCEND = "PHASE_3_DESCEND"
@@ -185,15 +190,31 @@ class TrajectoryGenerator:
             self._initial_gripper_pose.pz - initial_plug_xyz[2],
         )
 
-        # Phase 1 target: gripper such that plug XY ≈ port_xy + injected_xy
-        # AT THE CURRENT ORIENTATION. Z lands at port_z + hover_z (+ offset).
-        hover_z = self.params.hover_z_by_plug.get(
-            getattr(task, "plug_type", ""), self.params.hover_z_default)
-        self._hover_z = hover_z
+        # Safety floor: plug must be at least min_safe_plug_z_above_port_m above
+        # port_z BEFORE any lateral motion (Phase 1) — otherwise the plug body
+        # could clip the NIC card / port body while sweeping over.
+        # plug_z = gripper_z - gp_offset_z, so:
+        #   safe gripper_z = port_z + min_safe_plug_z_above_port_m + gp_offset_z
+        safe_gripper_pz = (
+            self._port_xyz[2]
+            + self.params.min_safe_plug_z_above_port_m
+            + gp_offset_base[2]
+        )
+        self._needs_raise = self._initial_gripper_pose.pz < safe_gripper_pz
+        # Phase 0 raise target (only used if needs_raise).
+        self._phase0_target_pz = (
+            safe_gripper_pz if self._needs_raise else self._initial_gripper_pose.pz
+        )
+        # Phase 1 starts at whatever Z Phase 0 leaves us at (= safe_z if raised,
+        # else initial_z). Phase 1 itself doesn't touch Z.
+        phase1_pz = self._phase0_target_pz
+
+        # Phase 1 target: XY-only correction. Gripper such that plug XY ≈ port_xy
+        # + injected_xy AT THE CURRENT ORIENTATION. Z stays at Phase 0 end Z.
         self._phase1_target = PoseSnapshot(
             px=self._port_xyz[0] + gp_offset_base[0] + self._injected_xy_local[0],
             py=self._port_xyz[1] + gp_offset_base[1] + self._injected_xy_local[1],
-            pz=self._port_xyz[2] + hover_z + gp_offset_base[2],
+            pz=phase1_pz,
             qw=self._initial_gripper_pose.qw,
             qx=self._initial_gripper_pose.qx,
             qy=self._initial_gripper_pose.qy,
@@ -220,14 +241,26 @@ class TrajectoryGenerator:
             qy=q_gripper_target[2], qz=q_gripper_target[3],
         )
 
-        # Compute Phase 1 / Phase 2 durations dynamically based on actual
-        # displacement so the peak min-jerk velocity stays bounded.
+        # Compute Phase 0 / Phase 1 / Phase 2 durations dynamically based on
+        # actual displacement so the peak min-jerk velocity stays bounded.
         # min-jerk peak velocity = 1.875 × distance / duration
         # → duration = 1.875 × distance / max_velocity
+        # Phase 0 (RAISE) only runs if needs_raise; pure Z translation.
+        raise_distance = abs(
+            self._phase0_target_pz - self._initial_gripper_pose.pz)
+        self._phase0_duration_s = (
+            max(
+                self.params.min_phase_duration_s,
+                1.875 * raise_distance / max(1e-6, self.params.max_linear_velocity_m_s),
+            )
+            if self._needs_raise else 0.0
+        )
+        # Phase 1 displacement: from Phase 0 end (XY=initial, Z=phase0_target_pz)
+        # to phase1_target (XY=over-port, Z=phase0_target_pz). Pure XY motion.
         disp_xyz = (
             self._phase1_target.px - self._initial_gripper_pose.px,
             self._phase1_target.py - self._initial_gripper_pose.py,
-            self._phase1_target.pz - self._initial_gripper_pose.pz,
+            self._phase1_target.pz - self._phase0_target_pz,  # 0 by construction
         )
         disp_norm = math.sqrt(sum(d * d for d in disp_xyz))
         self._phase1_duration_s = max(
@@ -252,8 +285,15 @@ class TrajectoryGenerator:
             1.875 * ang_dist / max(1e-6, self.params.max_angular_velocity_rad_s),
         )
 
-        # Phase 3 state.
-        self._z_offset = hover_z  # decreases monotonically
+        # Phase 3 state. z_offset = current commanded plug Z relative to port Z.
+        # Starts wherever Phase 2 leaves us (= phase0_target_pz, since Phase 1/2
+        # don't touch Z), decreases monotonically until insert_z_offset.
+        self._gp_offset_z = gp_offset_base[2]
+        self._z_offset = (
+            self._phase0_target_pz
+            - self._port_xyz[2]
+            - gp_offset_base[2]
+        )
         self._integrator = (0.0, 0.0)
         self._prev_err = (0.0, 0.0)
         self._hold_start_ns: Optional[int] = None
@@ -270,8 +310,11 @@ class TrajectoryGenerator:
         # Phase 3 ramp-in (smooth handoff Phase 2 → Phase 3).
         self._phase3_handoff_t = 0
         self._phase3_handoff_ticks = self.params.latch_blend_ticks  # reuse 5 ticks
-        # Phase tracking.
-        self._phase = self.PHASE_1_XY
+        # Phase tracking. Start in PHASE_0_RAISE iff initial Z is below the
+        # safe-clearance floor; otherwise skip straight to PHASE_1_XY.
+        self._phase = (
+            self.PHASE_0_RAISE if self._needs_raise else self.PHASE_1_XY
+        )
         self._t_phase_start_ns: Optional[int] = None
         self._last_pose: Optional[PoseSnapshot] = None
         # Counters for end-of-trial logging.
@@ -335,7 +378,9 @@ class TrajectoryGenerator:
         """Advance the trajectory by one tick. Returns the commanded pose."""
         if self._t_phase_start_ns is None:
             self._t_phase_start_ns = now_ns
-        if self._phase == self.PHASE_1_XY:
+        if self._phase == self.PHASE_0_RAISE:
+            pose = self._step_phase0(now_ns)
+        elif self._phase == self.PHASE_1_XY:
             pose = self._step_phase1(now_ns)
         elif self._phase == self.PHASE_2_ORIENT:
             pose = self._step_phase2(now_ns)
@@ -349,12 +394,60 @@ class TrajectoryGenerator:
         self._last_pose = pose
         return pose
 
+    # ---------------- Phase 0: RAISE Z (safety pre-clearance) ----------------
+
+    def _step_phase0(self, now_ns: int) -> PoseSnapshot:
+        """Pure Z translation from initial Z to phase0_target_pz so the plug
+        clears NIC card / port body height before lateral motion. XY and
+        orientation frozen at initial values."""
+        elapsed_s = (now_ns - self._t_phase_start_ns) / 1e9
+        s = minjerk_s(elapsed_s / max(1e-6, self._phase0_duration_s))
+        new_z = (
+            self._initial_gripper_pose.pz
+            + s * (self._phase0_target_pz - self._initial_gripper_pose.pz)
+        )
+        if elapsed_s >= self._phase0_duration_s:
+            # Continuity: final tick returns the exact target Z.
+            self._phase = self.PHASE_1_XY
+            self._t_phase_start_ns = now_ns
+            return PoseSnapshot(
+                px=self._initial_gripper_pose.px,
+                py=self._initial_gripper_pose.py,
+                pz=self._phase0_target_pz,
+                qw=self._initial_gripper_pose.qw,
+                qx=self._initial_gripper_pose.qx,
+                qy=self._initial_gripper_pose.qy,
+                qz=self._initial_gripper_pose.qz,
+            )
+        return PoseSnapshot(
+            px=self._initial_gripper_pose.px,
+            py=self._initial_gripper_pose.py,
+            pz=new_z,
+            qw=self._initial_gripper_pose.qw,
+            qx=self._initial_gripper_pose.qx,
+            qy=self._initial_gripper_pose.qy,
+            qz=self._initial_gripper_pose.qz,
+        )
+
     # ---------------- Phase 1: XY APPROACH ----------------
 
     def _step_phase1(self, now_ns: int) -> PoseSnapshot:
         elapsed_s = (now_ns - self._t_phase_start_ns) / 1e9
         s = minjerk_s(elapsed_s / max(1e-6, self._phase1_duration_s))
-        out = lerp_pose(self._initial_gripper_pose, self._phase1_target, s)
+        # Interpolate from Phase 0 end pose (XY=initial, Z=phase0_target_pz,
+        # orientation=initial) to phase1_target (XY=over-port, Z=same,
+        # orientation=initial). Build the start snapshot inline so that
+        # whether or not Phase 0 ran, Phase 1 starts at the right pose.
+        phase1_start = PoseSnapshot(
+            px=self._initial_gripper_pose.px,
+            py=self._initial_gripper_pose.py,
+            pz=self._phase0_target_pz,
+            qw=self._initial_gripper_pose.qw,
+            qx=self._initial_gripper_pose.qx,
+            qy=self._initial_gripper_pose.qy,
+            qz=self._initial_gripper_pose.qz,
+        )
+        out = lerp_pose(phase1_start, self._phase1_target, s)
         if elapsed_s >= self._phase1_duration_s:
             # Continuity: final tick of Phase 1 returns the exact target pose.
             self._phase = self.PHASE_2_ORIENT
@@ -490,12 +583,13 @@ class TrajectoryGenerator:
         """Compute the PI-corrected gripper pose for descent. Mirrors
         CheatCodeRobust._calc_gripper_pose math, with orientation locked at
         phase2_target (the port-matching orientation)."""
-        # Fall-back: if any TF unavailable, return last-good or phase2_target.
+        # Fall-back: if any TF unavailable, command gripper Z based on stored
+        # plug-grip offset; XY/orientation frozen at phase2_target.
         if plug_tf_stamped is None or gripper_tf_stamped is None:
             return PoseSnapshot(
                 px=self._phase2_target.px,
                 py=self._phase2_target.py,
-                pz=self._phase2_target.pz - (self._hover_z - z_offset),
+                pz=self._port_xyz[2] + z_offset + self._gp_offset_z,
                 qw=self._phase2_target.qw, qx=self._phase2_target.qx,
                 qy=self._phase2_target.qy, qz=self._phase2_target.qz,
             )
@@ -724,8 +818,7 @@ class CheatCodeContinuous(Policy):
     MIN_PHASE_DURATION_S_ENV = "CHEATCODE_MIN_PHASE_DURATION_S"
     DESCENT_RATE_M_S_ENV = "CHEATCODE_DESCENT_RATE_M_S"
     DESCENT_RAMP_S_ENV = "CHEATCODE_DESCENT_RAMP_S"
-    HOVER_Z_SC_M_ENV = "CHEATCODE_HOVER_Z_SC_M"
-    HOVER_Z_SFP_M_ENV = "CHEATCODE_HOVER_Z_SFP_M"
+    MIN_SAFE_PLUG_Z_ABOVE_PORT_M_ENV = "CHEATCODE_MIN_SAFE_PLUG_Z_ABOVE_PORT_M"
     FORCE_STOP_N_ENV = "CHEATCODE_FORCE_STOP_N"
     FORCE_RESUME_N_ENV = "CHEATCODE_FORCE_RESUME_N"
     HOLD_TIMEOUT_S_ENV = "CHEATCODE_HOLD_TIMEOUT_S"
@@ -783,8 +876,10 @@ class CheatCodeContinuous(Policy):
             self.MIN_PHASE_DURATION_S_ENV, p.min_phase_duration_s)
         p.descent_rate_m_s = _f(self.DESCENT_RATE_M_S_ENV, p.descent_rate_m_s)
         p.descent_ramp_s = _f(self.DESCENT_RAMP_S_ENV, p.descent_ramp_s)
-        p.hover_z_by_plug["sc"] = _f(self.HOVER_Z_SC_M_ENV, p.hover_z_by_plug["sc"])
-        p.hover_z_by_plug["sfp"] = _f(self.HOVER_Z_SFP_M_ENV, p.hover_z_by_plug["sfp"])
+        p.min_safe_plug_z_above_port_m = _f(
+            self.MIN_SAFE_PLUG_Z_ABOVE_PORT_M_ENV,
+            p.min_safe_plug_z_above_port_m,
+        )
         p.force_stop_n = _f(self.FORCE_STOP_N_ENV, p.force_stop_n)
         p.force_resume_n = _f(self.FORCE_RESUME_N_ENV, p.force_resume_n)
         p.hold_timeout_s = _f(self.HOLD_TIMEOUT_S_ENV, p.hold_timeout_s)
