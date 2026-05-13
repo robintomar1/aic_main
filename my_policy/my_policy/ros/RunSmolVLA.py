@@ -99,7 +99,28 @@ IMAGE_SCALING = 0.25  # 1152x1024 → 288x256 (matches dataset).
 
 TF_LOOKUP_TIMEOUT_S = 5.0
 
-STATE_DIM = 26  # 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench (no tcp_error, no task one-hot)
+STATE_DIM = 26  # baseline (no conditioning): 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench
+STATE_DIM_CONDITIONED = 38  # 26 baseline + 7 prev_action + 1 depth + 4 phase one-hot
+
+# Port entrance offsets along port-local +z (positive distance above port_link).
+# Must match the values in my_policy/scripts/smolvla/build_conditioned_dataset.py.
+PORT_ENTRANCE_OFFSET_M = {
+    "sc": 0.01564,   # 15.64 mm — SC port entrance above port_link in port-local frame
+    "sfp": 0.0458,   # 45.8 mm — SFP port entrance above port_link in port-local frame
+}
+
+# Phase classifier thresholds (mirror build_conditioned_dataset.py defaults).
+# Override at runtime via env vars if needed.
+PHASE_D_DESCEND_THRESH_M = 0.10        # depth ≤ this = DESCEND
+PHASE_D_INSERTED_THRESH_M = 0.005      # depth ≤ this = INSERTED (overrides DESCEND)
+PHASE_F_CONTACT_THRESH_N = 8.0         # |F| ≥ this = CONTACT (overrides depth-based)
+# (Note: anything with depth > PHASE_D_DESCEND_THRESH_M is APPROACH by default.)
+
+PHASE_APPROACH = 0
+PHASE_DESCEND = 1
+PHASE_CONTACT = 2
+PHASE_INSERTED = 3
+PHASE_DIM = 4  # one-hot length
 
 
 # ---------------------------------------------------------------------------
@@ -166,23 +187,15 @@ def _compensated_wrench(obs_msg: Observation) -> tuple[float, float, float, floa
     )
 
 
-def _build_state_26(
+def _build_state_26_np(
     obs_msg: Observation,
     port_pose_baselink: np.ndarray,
-) -> torch.Tensor:
-    """Compose the 26-channel observation.state in the same layout as
-    `make_smolvla_dataset.py` produces (port-local frame, no tcp_error,
-    no task vec).
+) -> np.ndarray:
+    """Compose the 26-channel observation.state as numpy float32.
 
-    Layout:
-      [ 0..6 ] tcp_pose      — port frame
-      [ 7..12] tcp_velocity  — port frame
-      [13..19] joint_pos     — frame-invariant; pass-through
-      [20..25] wrench        — port frame (sensor frame ≈ TCP frame)
-
-    tcp_error is intentionally NOT in this layout. See module docstring.
-
-    Returns float32 [26], un-batched, un-normalized.
+    Layout: [tcp_pose 7 || tcp_velocity 6 || joint_pos 7 || wrench 6].
+    Used by both _build_state_26 (returns torch tensor) and
+    _build_state_38 (extends with conditioning channels).
     """
     if port_pose_baselink.shape != (7,):
         raise ValueError(f"port_pose must be shape (7,), got {port_pose_baselink.shape}")
@@ -213,12 +226,12 @@ def _build_state_26(
         tcp_pose_baselink=tcp_pose_bl,
         tcp_velocity_baselink=tcp_vel_bl,
         wrench_sensorframe=wrench_sensor,
-        action_baselink=tcp_pose_bl,  # placeholder; we don't read action_portframe here
+        action_baselink=tcp_pose_bl,
         port_pose_baselink=port_pose_baselink,
     )
     out = transform_frame(inp)
 
-    state = np.array(
+    return np.array(
         [
             *out.tcp_pose_portframe,         # 7  → [0..6]
             *out.tcp_velocity_portframe,     # 6  → [7..12]
@@ -227,6 +240,26 @@ def _build_state_26(
         ],
         dtype=np.float32,
     )
+
+
+def _classify_phase_depth(depth_above_entrance: float, wrench_fxyz: np.ndarray) -> int:
+    """Mirror of build_conditioned_dataset.classify_phase_depth, scalar version."""
+    fmag = float(np.linalg.norm(wrench_fxyz))
+    if fmag >= PHASE_F_CONTACT_THRESH_N:
+        return PHASE_CONTACT
+    if depth_above_entrance <= PHASE_D_INSERTED_THRESH_M:
+        return PHASE_INSERTED
+    if depth_above_entrance <= PHASE_D_DESCEND_THRESH_M:
+        return PHASE_DESCEND
+    return PHASE_APPROACH
+
+
+def _build_state_26(
+    obs_msg: Observation,
+    port_pose_baselink: np.ndarray,
+) -> torch.Tensor:
+    """Wrap _build_state_26_np with debug logging + torch tensor return."""
+    state = _build_state_26_np(obs_msg, port_pose_baselink)
     assert state.shape == (STATE_DIM,), f"state must be {STATE_DIM}-dim, got {state.shape}"
     if not getattr(_build_state_26, "_call_count", 0):
         _build_state_26._call_count = 0  # type: ignore[attr-defined]
@@ -237,6 +270,65 @@ def _build_state_26(
               f"tcp=({s[0]:+.3f},{s[1]:+.3f},{s[2]:+.3f})  "
               f"vel=({s[7]*1000:+.1f},{s[8]*1000:+.1f},{s[9]*1000:+.1f})mm/s  "
               f"|F|={np.linalg.norm(s[20:23]):.2f}N",
+              flush=True)
+    return torch.from_numpy(state)
+
+
+def _build_state_38(
+    obs_msg: Observation,
+    port_pose_baselink: np.ndarray,
+    port_type: str,
+    prev_action_port: np.ndarray,
+) -> torch.Tensor:
+    """Compose the 38-channel observation.state matching the conditioned
+    dataset built by build_conditioned_dataset.py.
+
+    Layout:
+      [ 0..25] same as _build_state_26 (port-local TCP pose/vel, joints, wrench)
+      [26..32] prev_action[1] in port-local frame (7-dim TCP pose target)
+      [33    ] tcp.depth_above_entrance (m, positive = above entrance)
+      [34..37] phase one-hot (approach / descend / contact / inserted)
+
+    Args:
+        port_type: 'sc' or 'sfp'; selects the entrance offset.
+        prev_action_port: 7-dim port-local action commanded on the
+            previous tick. Zero vector at trial start.
+    """
+    if port_type not in PORT_ENTRANCE_OFFSET_M:
+        raise ValueError(f"unknown port_type {port_type!r}")
+    if prev_action_port.shape != (7,):
+        raise ValueError(
+            f"prev_action_port must be shape (7,), got {prev_action_port.shape}")
+
+    state_26 = _build_state_26_np(obs_msg, port_pose_baselink)
+    entrance_offset = PORT_ENTRANCE_OFFSET_M[port_type]
+    tcp_z_port = float(state_26[2])
+    depth = -tcp_z_port - entrance_offset
+    wrench_fxyz = state_26[20:23]
+    phase = _classify_phase_depth(depth, wrench_fxyz)
+    phase_onehot = np.zeros(PHASE_DIM, dtype=np.float32)
+    phase_onehot[phase] = 1.0
+
+    state = np.concatenate([
+        state_26,
+        prev_action_port.astype(np.float32),
+        np.array([depth], dtype=np.float32),
+        phase_onehot,
+    ]).astype(np.float32)
+    assert state.shape == (STATE_DIM_CONDITIONED,), \
+        f"state must be {STATE_DIM_CONDITIONED}-dim, got {state.shape}"
+
+    if not getattr(_build_state_38, "_call_count", 0):
+        _build_state_38._call_count = 0  # type: ignore[attr-defined]
+    _build_state_38._call_count += 1  # type: ignore[attr-defined]
+    if _build_state_38._call_count <= 3 or _build_state_38._call_count % 50 == 0:
+        phase_name = ("approach", "descend", "contact", "inserted")[phase]
+        print(f"[state_dbg #{_build_state_38._call_count}] "
+              f"tcp=({state_26[0]:+.3f},{state_26[1]:+.3f},{state_26[2]:+.3f}) "
+              f"depth={depth*1000:+.1f}mm "
+              f"|F|={np.linalg.norm(wrench_fxyz):.2f}N "
+              f"phase={phase_name} "
+              f"prev_a_z={prev_action_port[2]:+.3f}",
               flush=True)
     return torch.from_numpy(state)
 
@@ -350,6 +442,21 @@ class RunSmolVLA(Policy):
 
         self._localizer = None
 
+        # Detect the dataset's expected state dim from the loaded policy
+        # config. Two supported sizes:
+        #   26 — baseline (no conditioning)
+        #   38 — conditioned dataset (prev_action + depth + phase one-hot)
+        state_feat = self.policy.config.input_features.get("observation.state")
+        if state_feat is None:
+            raise RuntimeError("policy config has no observation.state feature")
+        self._state_dim = int(state_feat.shape[0])
+        if self._state_dim not in (STATE_DIM, STATE_DIM_CONDITIONED):
+            raise RuntimeError(
+                f"unsupported state_dim {self._state_dim} — expected "
+                f"{STATE_DIM} (baseline) or {STATE_DIM_CONDITIONED} (conditioned)"
+            )
+        self._uses_conditioning = self._state_dim == STATE_DIM_CONDITIONED
+
         self.get_logger().info(
             f"RunSmolVLA loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
@@ -359,6 +466,9 @@ class RunSmolVLA(Policy):
             f"localizer_mode={self._localizer_mode()} "
             f"skip_chunk_enabled={self.skip_chunk_enabled}"
             + (f" skip_n={self.skip_n_chunks}" if self.skip_chunk_enabled else "")
+            + f" state_dim={self._state_dim}"
+            + (" (CONDITIONED: prev_action + depth + phase)"
+               if self._uses_conditioning else " (baseline)")
         )
 
     # ------------------------------------------------------------------
@@ -510,10 +620,25 @@ class RunSmolVLA(Policy):
         obs_msg: Observation,
         task_str: str,
         port_pose_baselink: np.ndarray,
+        *,
+        port_type: str | None = None,
+        prev_action_port: np.ndarray | None = None,
     ) -> dict[str, Any]:
         # `task` is lifted into complementary_data by the pipeline's
         # batch_to_transition, then consumed by SmolVLANewLineProcessor +
         # TokenizerProcessorStep.
+        if self._uses_conditioning:
+            if port_type is None:
+                raise RuntimeError(
+                    "conditioned model requires port_type at inference"
+                )
+            if prev_action_port is None:
+                prev_action_port = np.zeros(7, dtype=np.float32)
+            state_tensor = _build_state_38(
+                obs_msg, port_pose_baselink, port_type, prev_action_port,
+            )
+        else:
+            state_tensor = _build_state_26(obs_msg, port_pose_baselink)
         return {
             "observation.images.left_camera":
                 _ros_image_to_chw_float(obs_msg.left_image, IMAGE_SCALING),
@@ -521,8 +646,7 @@ class RunSmolVLA(Policy):
                 _ros_image_to_chw_float(obs_msg.center_image, IMAGE_SCALING),
             "observation.images.right_camera":
                 _ros_image_to_chw_float(obs_msg.right_image, IMAGE_SCALING),
-            "observation.state": _build_state_26(
-                obs_msg, port_pose_baselink),
+            "observation.state": state_tensor,
             "task": task_str,
         }
 
@@ -576,7 +700,11 @@ class RunSmolVLA(Policy):
                 self.sleep_for(self.loop_period_s)
                 continue
 
-            obs = self._build_obs_dict(obs_msg, task_str, port_pose)
+            obs = self._build_obs_dict(
+                obs_msg, task_str, port_pose,
+                port_type=task.port_type,
+                prev_action_port=last_action_port,
+            )
             obs = self.preprocessor(obs)
             with torch.inference_mode():
                 action = self.policy.select_action(obs)
@@ -662,6 +790,11 @@ class RunSmolVLA(Policy):
         stop_evt = threading.Event()
         err_box: list[BaseException] = []
         stats = {"chunks": 0, "inference_ticks": 0}
+        # Track the last consumer-dispatched port-local action so the
+        # producer can feed it as prev_action when the model expects
+        # conditioned state. Consumer updates under last_a_port_lock.
+        last_a_port_lock = threading.Lock()
+        last_a_port_shared: list[np.ndarray | None] = [None]
 
         def producer():
             try:
@@ -679,7 +812,15 @@ class RunSmolVLA(Policy):
                         if stop_evt.wait(0.01):
                             return
                         continue
-                    obs = self._build_obs_dict(obs_msg, task_str, port_pose)
+                    with last_a_port_lock:
+                        prev_a = last_a_port_shared[0]
+                    if prev_a is not None:
+                        prev_a = prev_a.copy()
+                    obs = self._build_obs_dict(
+                        obs_msg, task_str, port_pose,
+                        port_type=task.port_type,
+                        prev_action_port=prev_a,
+                    )
                     # Diagnostic: log the TCP-z we're feeding to inference,
                     # so we can compare against the first commanded z of the
                     # resulting chunk. If obs.tcp_z is low but a_port[2] of
@@ -777,6 +918,9 @@ class RunSmolVLA(Policy):
                         max_a_step_delta = max(max_a_step_delta, d)
                     last_a_port = a_port
                     last_pose = pose
+                    # Publish for the producer thread's prev_action conditioning.
+                    with last_a_port_lock:
+                        last_a_port_shared[0] = a_port
                     if ticks % LOG_EVERY_N == 0:
                         with queue_lock:
                             qlen = len(local_queue)
