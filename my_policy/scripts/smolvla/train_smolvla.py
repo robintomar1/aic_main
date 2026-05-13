@@ -176,6 +176,13 @@ def main() -> int:
                         "(load_vlm_weights, vlm_model_name, max_state_dim, "
                         "max_action_dim) are inherited from the pretrained "
                         "config and cannot be overridden cleanly.")
+    p.add_argument("--rename-map", type=str, default=None,
+                   help="JSON-like dict mapping dataset feature keys to "
+                        "policy-expected keys. Required when fine-tuning a "
+                        "pretrained policy whose feature names differ from "
+                        "the dataset's. Default in fine-tune mode: maps our "
+                        "left/center/right cameras to camera1/2/3 (the "
+                        "SO-100 convention used by lerobot/smolvla_base).")
     args = p.parse_args()
 
     train_episodes_path = args.train_episodes_file \
@@ -238,11 +245,21 @@ def main() -> int:
                 f"stats.json supplies the values.", file=sys.stderr,
             )
         print(f"[mode] FINE-TUNE from pretrained: {args.pretrained_policy_path}")
+        # Default rename map for lerobot/smolvla_base (SO-100 convention).
+        # User can override --rename-map for a different pretrained policy.
+        default_rename = (
+            '{"observation.images.left_camera": "observation.images.camera1", '
+            '"observation.images.center_camera": "observation.images.camera2", '
+            '"observation.images.right_camera": "observation.images.camera3"}'
+        )
+        rename_map = args.rename_map or default_rename
+        print(f"[mode] rename_map: {rename_map}")
         cli += [
             f"--policy.path={args.pretrained_policy_path}",
             f"--policy.repo_id=local/{args.name}",
             "--policy.push_to_hub=false",
             f"--policy.n_obs_steps={args.n_obs_steps}",
+            f"--rename_map={rename_map}",
         ]
     else:
         # From-scratch-expert mode: random-init the SmolVLA action expert,
