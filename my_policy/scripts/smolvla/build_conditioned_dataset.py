@@ -46,13 +46,77 @@ import pyarrow.parquet as pq
 
 
 # ---------------------------------------------------------------------------
-# Phase classifier
+# Port-agnostic depth + phase classifier
 # ---------------------------------------------------------------------------
 
 # Channel indices in the source 26-dim state.
 SRC_TCP_Z_IDX = 2
 SRC_WRENCH_F_START = 20  # wrench.fx,fy,fz are at [20:23]
 SRC_WRENCH_F_END = 23
+
+# port_link_entrance offset along port-local −z (i.e. how far above the
+# `port_link` origin the chamfer/insertion mouth sits). Different per port
+# type — without correcting for this, "tcp_z = −0.05" means different
+# physical things for SC vs SFP.
+PORT_ENTRANCE_OFFSET_M = {
+    "sc": 0.01564,   # 15.64 mm
+    "sfp": 0.0458,   # 45.8 mm
+}
+
+
+def infer_port_type_from_task_string(task: str) -> str:
+    """Parse 'sc' or 'sfp' from a task string like
+    'insert sc plug into sc_port_base on sc_port_0' or
+    'insert sfp plug into sfp_port_0 on nic_card_mount_3'."""
+    t = task.lower()
+    # 'sfp' is more specific than 'sc'; check it first to avoid the 'sc'
+    # substring matching 'sfp' indirectly via something like 'sc_port'.
+    if " sfp " in t or "sfp plug" in t:
+        return "sfp"
+    if " sc " in t or "sc plug" in t:
+        return "sc"
+    raise ValueError(f"could not infer port type from task string: {task!r}")
+
+
+def build_entrance_offset_per_frame(
+    src_root: Path,
+    episode_index: np.ndarray,
+) -> np.ndarray:
+    """Return entrance offset (port-local +z, positive value) per frame.
+
+    Reads tasks.parquet + per-episode metadata to determine each
+    episode's port type, then maps frame → episode → port_type → offset.
+    """
+    import pandas as pd
+    tasks_path = src_root / "meta" / "tasks.parquet"
+    tasks_df = pd.read_parquet(tasks_path)
+    # tasks_df is indexed by task string with a single 'task_index' column.
+    task_idx_to_str = {int(row["task_index"]): name
+                       for name, row in tasks_df.iterrows()}
+
+    eps_parquet = src_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    eps_table = pq.read_table(str(eps_parquet)).to_pylist()
+    ep_to_offset: dict[int, float] = {}
+    for rec in eps_table:
+        ep = int(rec["episode_index"])
+        # Try `tasks` list first; fall back to `task_index`.
+        task_str = None
+        if rec.get("tasks"):
+            task_str = rec["tasks"][0]
+        elif "task_index" in rec:
+            task_str = task_idx_to_str.get(int(rec["task_index"]))
+        if task_str is None:
+            raise ValueError(f"episode {ep} has no task identification")
+        ptype = infer_port_type_from_task_string(task_str)
+        ep_to_offset[ep] = PORT_ENTRANCE_OFFSET_M[ptype]
+
+    # Map per-frame.
+    offsets = np.array(
+        [ep_to_offset[int(e)] for e in episode_index],
+        dtype=np.float32,
+    )
+    return offsets
+
 
 PHASE_APPROACH = 0
 PHASE_DESCEND = 1
@@ -61,29 +125,34 @@ PHASE_INSERTED = 3
 PHASE_NAMES = ["approach", "descend", "contact", "inserted"]
 
 
-def classify_phase(
+def classify_phase_depth(
+    depth_above_entrance: np.ndarray,
     state_26: np.ndarray,
-    z_approach_thresh: float,
-    z_chamfer_thresh: float,
-    z_inserted_thresh: float,
+    d_approach_thresh: float,
+    d_descend_thresh: float,
+    d_inserted_thresh: float,
     f_contact_thresh: float,
 ) -> np.ndarray:
-    """Return integer phase id per frame, shape (N,).
+    """Return integer phase id per frame, shape (N,), based on port-agnostic
+    depth above the port entrance.
 
-    Decision tree (first match wins):
-      * |F| ≥ f_contact_thresh           → CONTACT
-      * tcp_z ≥ z_inserted_thresh        → INSERTED
-      * tcp_z ≥ z_chamfer_thresh         → DESCEND
-      * else                             → APPROACH
+    Decision tree (first match wins, applied in order):
+      * depth ≤ d_inserted_thresh        → INSERTED   (at or past entrance)
+      * depth ≤ d_descend_thresh         → DESCEND    (near chamfer)
+      * depth ≤ d_approach_thresh        → APPROACH   (mid descent)
+      * else                             → APPROACH   (anything farther)
+      * |F| ≥ f_contact_thresh OVERRIDES → CONTACT    (force-gated)
+
+    `depth_above_entrance` is positive when TCP is above the entrance,
+    negative when below (i.e. inserted). Thresholds are also positive
+    values denoting "how far above entrance."
     """
-    tcp_z = state_26[:, SRC_TCP_Z_IDX]
+    depth = depth_above_entrance
     f = state_26[:, SRC_WRENCH_F_START:SRC_WRENCH_F_END]
     fmag = np.linalg.norm(f, axis=1)
-    phase = np.full(tcp_z.shape, PHASE_APPROACH, dtype=np.int32)
-    phase = np.where(tcp_z >= z_chamfer_thresh, PHASE_DESCEND, phase)
-    phase = np.where(tcp_z >= z_inserted_thresh, PHASE_INSERTED, phase)
-    # Contact overrides z-based phase because force is the more reliable signal
-    # for "we're seating into the chamfer."
+    phase = np.full(depth.shape, PHASE_APPROACH, dtype=np.int32)
+    phase = np.where(depth <= d_descend_thresh, PHASE_DESCEND, phase)
+    phase = np.where(depth <= d_inserted_thresh, PHASE_INSERTED, phase)
     phase = np.where(fmag >= f_contact_thresh, PHASE_CONTACT, phase)
     return phase
 
@@ -140,7 +209,9 @@ def build_prev_action_history(
 # Dataset I/O helpers
 # ---------------------------------------------------------------------------
 
-def build_state_names(prev_k: int, add_phase: bool) -> list[str]:
+def build_state_names(
+    prev_k: int, add_depth: bool, add_phase: bool,
+) -> list[str]:
     names: list[str] = [
         "tcp_pose.position.x", "tcp_pose.position.y", "tcp_pose.position.z",
         "tcp_pose.orientation.x", "tcp_pose.orientation.y",
@@ -159,6 +230,8 @@ def build_state_names(prev_k: int, add_phase: bool) -> list[str]:
             f"prev_action[{k}].orientation.x", f"prev_action[{k}].orientation.y",
             f"prev_action[{k}].orientation.z", f"prev_action[{k}].orientation.w",
         ])
+    if add_depth:
+        names.append("tcp.depth_above_entrance")
     if add_phase:
         names.extend([f"phase.{p}" for p in PHASE_NAMES])
     return names
@@ -193,18 +266,27 @@ def main() -> int:
     p.add_argument("--prev-K", type=int, default=1,
                    help="Number of previous actions to concatenate into state. "
                         "0 disables. Default 1 (most recent action only).")
+    p.add_argument("--depth-channel", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Append a port-agnostic depth_above_entrance channel "
+                        "(positive when above entrance, negative when inside "
+                        "the port). Computed per-frame using the episode's "
+                        "port type from tasks.parquet. Default ON.")
     p.add_argument("--phase-indicator", action=argparse.BooleanOptionalAction,
                    default=True,
-                   help="Append 4-class phase one-hot (approach/descend/contact/inserted). "
-                        "Default ON. Pass --no-phase-indicator to disable.")
-    p.add_argument("--z-approach-thresh", type=float, default=-0.15,
-                   help="port-local TCP_z below this (more negative) = APPROACH.")
-    p.add_argument("--z-chamfer-thresh", type=float, default=-0.05,
-                   help="port-local TCP_z above this = DESCEND (else APPROACH).")
-    p.add_argument("--z-inserted-thresh", type=float, default=-0.01,
-                   help="port-local TCP_z above this = INSERTED (overrides DESCEND).")
+                   help="Append 4-class phase one-hot (approach/descend/contact/inserted), "
+                        "classified on depth_above_entrance (port-agnostic). Default ON.")
+    p.add_argument("--d-approach-thresh", type=float, default=0.10,
+                   help="depth_above_entrance above this (m) = APPROACH.")
+    p.add_argument("--d-descend-thresh", type=float, default=0.02,
+                   help="depth_above_entrance below this (m) = DESCEND.")
+    p.add_argument("--d-inserted-thresh", type=float, default=0.005,
+                   help="depth_above_entrance below this (m) = INSERTED "
+                        "(overrides DESCEND). Slightly above zero so SC "
+                        "(which never reaches negative depth) still gets "
+                        "some inserted frames.")
     p.add_argument("--f-contact-thresh", type=float, default=8.0,
-                   help="|F| above this (N) = CONTACT (overrides z-based phase).")
+                   help="|F| above this (N) = CONTACT (overrides depth-based phase).")
     p.add_argument("--force", action="store_true",
                    help="Overwrite --dst if it exists.")
     args = p.parse_args()
@@ -254,25 +336,52 @@ def main() -> int:
         pieces.append(prev)
         print(f"  prev_action history: K={args.prev_K} → +{args.prev_K * 7} channels")
 
+    # depth_above_entrance: port-agnostic distance above the port entrance.
+    # Always computed (cheap), only added to state if --depth-channel.
+    depth_above_entrance = None
+    if args.depth_channel or args.phase_indicator:
+        entrance_offsets = build_entrance_offset_per_frame(args.src, episode_index)
+        # In port frame, "above entrance" = -tcp_z - entrance_offset.
+        # (tcp_z is negative when TCP is above port_link; entrance is at
+        # negative z by entrance_offset, so subtract.)
+        depth_above_entrance = (-state_26[:, SRC_TCP_Z_IDX] - entrance_offsets).astype(np.float32)
+        # Per-port-type stats for sanity.
+        is_sc = np.isclose(entrance_offsets, PORT_ENTRANCE_OFFSET_M["sc"])
+        is_sfp = np.isclose(entrance_offsets, PORT_ENTRANCE_OFFSET_M["sfp"])
+        print(f"  depth_above_entrance computed for "
+              f"{int(is_sc.sum())} SC frames, "
+              f"{int(is_sfp.sum())} SFP frames")
+        if depth_above_entrance is not None and is_sc.any():
+            d_sc = depth_above_entrance[is_sc]
+            print(f"    SC  depth range:  {d_sc.min():+.4f} → {d_sc.max():+.4f} m")
+        if depth_above_entrance is not None and is_sfp.any():
+            d_sfp = depth_above_entrance[is_sfp]
+            print(f"    SFP depth range:  {d_sfp.min():+.4f} → {d_sfp.max():+.4f} m")
+
+    if args.depth_channel and depth_above_entrance is not None:
+        pieces.append(depth_above_entrance[:, None])
+        print(f"  depth_above_entrance channel: +1 channel")
+
     phase_int = phase_distribution = None
     if args.phase_indicator:
-        phase_int = classify_phase(
+        phase_int = classify_phase_depth(
+            depth_above_entrance,
             state_26,
-            z_approach_thresh=args.z_approach_thresh,
-            z_chamfer_thresh=args.z_chamfer_thresh,
-            z_inserted_thresh=args.z_inserted_thresh,
+            d_approach_thresh=args.d_approach_thresh,
+            d_descend_thresh=args.d_descend_thresh,
+            d_inserted_thresh=args.d_inserted_thresh,
             f_contact_thresh=args.f_contact_thresh,
         )
         pieces.append(phase_to_onehot(phase_int))
         counts = np.bincount(phase_int, minlength=4)
         phase_distribution = dict(zip(PHASE_NAMES, counts.tolist()))
-        print(f"  phase indicator: +4 channels")
+        print(f"  phase indicator: +4 channels (port-agnostic, depth-based)")
         for name, c in phase_distribution.items():
             print(f"    {name:>10}: {c:>7} frames ({100 * c / n_rows:.1f}%)")
 
     new_state = np.concatenate(pieces, axis=1).astype(np.float32)
     new_state_dim = new_state.shape[1]
-    new_names = build_state_names(args.prev_K, args.phase_indicator)
+    new_names = build_state_names(args.prev_K, args.depth_channel, args.phase_indicator)
     assert len(new_names) == new_state_dim, \
         f"name/value count mismatch: {len(new_names)} vs {new_state_dim}"
     print(f"  new state dim: {new_state_dim}")
@@ -306,12 +415,14 @@ def main() -> int:
     new_info["conditioning"] = {
         "source": str(args.src),
         "prev_K": args.prev_K,
+        "depth_channel": args.depth_channel,
         "phase_indicator": args.phase_indicator,
-        "phase_thresholds": {
-            "z_approach": args.z_approach_thresh,
-            "z_chamfer": args.z_chamfer_thresh,
-            "z_inserted": args.z_inserted_thresh,
-            "f_contact": args.f_contact_thresh,
+        "port_entrance_offsets_m": PORT_ENTRANCE_OFFSET_M,
+        "phase_thresholds_depth_m": {
+            "d_approach": args.d_approach_thresh,
+            "d_descend": args.d_descend_thresh,
+            "d_inserted": args.d_inserted_thresh,
+            "f_contact_n": args.f_contact_thresh,
         } if args.phase_indicator else None,
         "phase_distribution": phase_distribution,
     }
@@ -371,7 +482,9 @@ def main() -> int:
     print()
     print(f"DONE: {args.dst}")
     print(f"  state dim {26} -> {new_state_dim} "
-          f"(prev_K={args.prev_K}, phase={'yes' if args.phase_indicator else 'no'})")
+          f"(prev_K={args.prev_K}, "
+          f"depth={'yes' if args.depth_channel else 'no'}, "
+          f"phase={'yes' if args.phase_indicator else 'no'})")
     return 0
 
 
