@@ -167,6 +167,15 @@ def main() -> int:
     p.add_argument("--max-action-dim", type=int, default=None,
                    help="Override policy.max_action_dim. Default 32 (SmolVLA "
                         "built-in) which fits our 7-dim action with headroom.")
+    p.add_argument("--pretrained-policy-path", type=str, default=None,
+                   help="HF Hub id or local path to a pretrained SmolVLA "
+                        "checkpoint (e.g. 'lerobot/smolvla_base'). When set, "
+                        "loads the action expert + VLM weights from this "
+                        "checkpoint as a starting point (fine-tune) instead "
+                        "of random-initializing the expert. Some flags "
+                        "(load_vlm_weights, vlm_model_name, max_state_dim, "
+                        "max_action_dim) are inherited from the pretrained "
+                        "config and cannot be overridden cleanly.")
     args = p.parse_args()
 
     train_episodes_path = args.train_episodes_file \
@@ -202,32 +211,51 @@ def main() -> int:
                   "different --name.", file=sys.stderr)
             return 1
 
-    cli = [
+    cli: list[str] = [
         "lerobot-train",
         # Dataset.
         f"--dataset.repo_id=local/{args.name}",
         f"--dataset.root={args.dataset_root}",
         f"--dataset.episodes={eps_arg}",
         "--dataset.video_backend=pyav",
-        # Policy.
-        "--policy.type=smolvla",
-        f"--policy.repo_id=local/{args.name}",
-        "--policy.push_to_hub=false",
-        f"--policy.chunk_size={args.chunk_size}",
-        f"--policy.n_action_steps={args.n_action_steps}",
-        f"--policy.load_vlm_weights={str(args.load_vlm_weights).lower()}",
-        f"--policy.freeze_vision_encoder={str(args.freeze_vision_encoder).lower()}",
-        f"--policy.train_expert_only={str(args.train_expert_only).lower()}",
-        f"--policy.vlm_model_name={args.vlm_model_name}",
-        # Pass full normalization_mapping as a dict literal (draccus accepts
-        # this syntax for dict fields, dot-notation does not work). VISUAL
-        # stays IDENTITY since SmolVLA handles SigLIP rescaling internally.
-        f"--policy.normalization_mapping={{VISUAL: IDENTITY, "
-        f"STATE: {args.state_normalization}, "
-        f"ACTION: {args.action_normalization}}}",
-        f"--policy.n_obs_steps={args.n_obs_steps}",
-        f"--policy.max_state_dim={max_state_dim}",
-        f"--policy.max_action_dim={max_action_dim}",
+    ]
+    if args.pretrained_policy_path:
+        # Fine-tune mode: load the pretrained policy (expert + VLM) from the
+        # given path. The pretrained config drives architecture (chunk_size,
+        # n_action_steps, max_state_dim, max_action_dim, load_vlm_weights,
+        # freeze_vision_encoder, train_expert_only, vlm_model_name). Only
+        # safe runtime overrides (normalization, n_obs_steps) are passed.
+        print(f"[mode] FINE-TUNE from pretrained: {args.pretrained_policy_path}")
+        cli += [
+            f"--policy.path={args.pretrained_policy_path}",
+            f"--policy.repo_id=local/{args.name}",
+            "--policy.push_to_hub=false",
+            f"--policy.normalization_mapping={{VISUAL: IDENTITY, "
+            f"STATE: {args.state_normalization}, "
+            f"ACTION: {args.action_normalization}}}",
+            f"--policy.n_obs_steps={args.n_obs_steps}",
+        ]
+    else:
+        # From-scratch-expert mode: random-init the SmolVLA action expert,
+        # optionally with pretrained SmolVLM2 backbone weights frozen.
+        cli += [
+            "--policy.type=smolvla",
+            f"--policy.repo_id=local/{args.name}",
+            "--policy.push_to_hub=false",
+            f"--policy.chunk_size={args.chunk_size}",
+            f"--policy.n_action_steps={args.n_action_steps}",
+            f"--policy.load_vlm_weights={str(args.load_vlm_weights).lower()}",
+            f"--policy.freeze_vision_encoder={str(args.freeze_vision_encoder).lower()}",
+            f"--policy.train_expert_only={str(args.train_expert_only).lower()}",
+            f"--policy.vlm_model_name={args.vlm_model_name}",
+            f"--policy.normalization_mapping={{VISUAL: IDENTITY, "
+            f"STATE: {args.state_normalization}, "
+            f"ACTION: {args.action_normalization}}}",
+            f"--policy.n_obs_steps={args.n_obs_steps}",
+            f"--policy.max_state_dim={max_state_dim}",
+            f"--policy.max_action_dim={max_action_dim}",
+        ]
+    cli += [
         # Trainer.
         f"--output_dir={output_dir}",
         f"--job_name={args.name}",
@@ -278,20 +306,30 @@ def main() -> int:
     sys.argv = cli
 
     print(f"=== v9-pl-smolvla training run: {args.name} ===")
+    if args.pretrained_policy_path:
+        print(f"MODE                : FINE-TUNE from pretrained policy")
+        print(f"pretrained policy   : {args.pretrained_policy_path}")
+        print(f"  (chunk_size, n_action_steps, max_state_dim, max_action_dim, "
+              f"load_vlm_weights, freeze_vision, train_expert_only, vlm "
+              f"are INHERITED from the pretrained config — CLI overrides "
+              f"are ignored except where listed below.)")
+    else:
+        print(f"MODE                : FROM-SCRATCH expert (random-init action expert)")
     print(f"dataset_root        : {args.dataset_root}")
     print(f"output_dir          : {output_dir}")
     print(f"train episodes      : {len(train_episodes)} (from {train_episodes_path.name})")
     print(f"steps               : {args.steps}")
     print(f"batch_size          : {args.batch_size}  (num_workers={args.num_workers})")
-    print(f"chunk_size          : {args.chunk_size}  (n_action_steps={args.n_action_steps})")
-    print(f"normalization       : ACTION={args.action_normalization}  STATE={args.state_normalization}")
-    print(f"n_obs_steps         : {args.n_obs_steps}")
-    print(f"max_state_dim       : {max_state_dim}  (dataset state_dim={dataset_state_dim})")
-    print(f"max_action_dim      : {max_action_dim}  (dataset action_dim={dataset_action_dim})")
-    print(f"vlm                 : {args.vlm_model_name}")
-    print(f"load_vlm_weights    : {args.load_vlm_weights}")
-    print(f"freeze_vision       : {args.freeze_vision_encoder}")
-    print(f"train_expert_only   : {args.train_expert_only}")
+    if not args.pretrained_policy_path:
+        print(f"chunk_size          : {args.chunk_size}  (n_action_steps={args.n_action_steps})")
+        print(f"max_state_dim       : {max_state_dim}  (dataset state_dim={dataset_state_dim})")
+        print(f"max_action_dim      : {max_action_dim}  (dataset action_dim={dataset_action_dim})")
+        print(f"vlm                 : {args.vlm_model_name}")
+        print(f"load_vlm_weights    : {args.load_vlm_weights}")
+        print(f"freeze_vision       : {args.freeze_vision_encoder}")
+        print(f"train_expert_only   : {args.train_expert_only}")
+    print(f"normalization       : ACTION={args.action_normalization}  STATE={args.state_normalization}  (override)")
+    print(f"n_obs_steps         : {args.n_obs_steps}  (override)")
     print(f"image augs          : {'OFF' if args.no_image_transforms else 'ON'}")
     print(f"tracker             : {'disabled' if args.no_trackio else f'trackio (project={args.trackio_project})'}")
     print(f"resume              : {args.resume}")
