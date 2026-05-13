@@ -155,6 +155,10 @@ def main() -> int:
     p.add_argument("--state-normalization", type=str, default="MEAN_STD",
                    choices=["MEAN_STD", "MIN_MAX", "IDENTITY"],
                    help="Normalization mode for observation.state.")
+    p.add_argument("--n-obs-steps", type=int, default=1,
+                   help="Number of observation frames stacked into a single "
+                        "model input window. Default 1 (current frame only). "
+                        "Set to 4 or 8 to give the policy short-term history.")
     args = p.parse_args()
 
     train_episodes_path = args.train_episodes_file \
@@ -200,6 +204,7 @@ def main() -> int:
         f"--policy.normalization_mapping={{VISUAL: IDENTITY, "
         f"STATE: {args.state_normalization}, "
         f"ACTION: {args.action_normalization}}}",
+        f"--policy.n_obs_steps={args.n_obs_steps}",
         # Trainer.
         f"--output_dir={output_dir}",
         f"--job_name={args.name}",
@@ -257,6 +262,7 @@ def main() -> int:
     print(f"batch_size          : {args.batch_size}  (num_workers={args.num_workers})")
     print(f"chunk_size          : {args.chunk_size}  (n_action_steps={args.n_action_steps})")
     print(f"normalization       : ACTION={args.action_normalization}  STATE={args.state_normalization}")
+    print(f"n_obs_steps         : {args.n_obs_steps}")
     print(f"vlm                 : {args.vlm_model_name}")
     print(f"load_vlm_weights    : {args.load_vlm_weights}")
     print(f"freeze_vision       : {args.freeze_vision_encoder}")
