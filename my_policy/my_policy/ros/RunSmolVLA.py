@@ -680,6 +680,14 @@ class RunSmolVLA(Policy):
                             return
                         continue
                     obs = self._build_obs_dict(obs_msg, task_str, port_pose)
+                    # Diagnostic: log the TCP-z we're feeding to inference,
+                    # so we can compare against the first commanded z of the
+                    # resulting chunk. If obs.tcp_z is low but a_port[2] of
+                    # the first dispatched action is high, the model is
+                    # ignoring current TCP (not a stale-obs bug).
+                    obs_state_port = obs["observation.state"].detach().cpu().numpy().reshape(-1)
+                    obs_tcp_port_z = float(obs_state_port[2])
+                    obs_wrench_mag = float(np.linalg.norm(obs_state_port[20:23]))
                     obs = self.preprocessor(obs)
                     t_inf_start = _time.perf_counter()
                     with torch.inference_mode():
@@ -697,10 +705,18 @@ class RunSmolVLA(Policy):
                     with queue_lock:
                         local_queue.extend(new_actions)
                     stats["chunks"] += 1
+                    # First post-skip action's port-frame z = what the
+                    # robot is ABOUT to be commanded. Compare to
+                    # obs_tcp_port_z above.
+                    first_a_port_z = float(new_actions[0].numpy()[2]) if new_actions else float("nan")
                     self.get_logger().info(
                         f"[SKIP_CHUNK] chunk {stats['chunks']} "
                         f"inf={inf_ms:.1f}ms dropped={skip_n} "
-                        f"buffered={len(new_actions)}"
+                        f"buffered={len(new_actions)} "
+                        f"obs_tcp_z={obs_tcp_port_z:+.3f} "
+                        f"|F|_obs={obs_wrench_mag:.2f}N "
+                        f"first_a_z={first_a_port_z:+.3f} "
+                        f"Δ(a-obs)={first_a_port_z - obs_tcp_port_z:+.3f}"
                     )
             except BaseException as exc:  # noqa: BLE001
                 err_box.append(exc)
