@@ -705,9 +705,13 @@ class RunSmolVLA(Policy):
                     with queue_lock:
                         local_queue.extend(new_actions)
                     stats["chunks"] += 1
-                    # First post-skip action's port-frame z = what the
-                    # robot is ABOUT to be commanded. Compare to
-                    # obs_tcp_port_z above.
+                    # Full-chunk diagnostic: dump every action's port-frame
+                    # z so we can see the shape of the model's chunk plan.
+                    # Includes the dropped prefix too, so we can compare
+                    # "what we threw away" vs "what we'll dispatch."
+                    chunk_np = chunk.detach().cpu().numpy()  # (chunk_size, A_padded)
+                    z_pre = chunk_np[:skip_n, 2] if skip_n > 0 else np.array([])
+                    z_post = chunk_np[skip_n:, 2]
                     first_a_port_z = float(new_actions[0].numpy()[2]) if new_actions else float("nan")
                     self.get_logger().info(
                         f"[SKIP_CHUNK] chunk {stats['chunks']} "
@@ -718,6 +722,25 @@ class RunSmolVLA(Policy):
                         f"first_a_z={first_a_port_z:+.3f} "
                         f"Δ(a-obs)={first_a_port_z - obs_tcp_port_z:+.3f}"
                     )
+                    # Z-trajectory sampled every 10 ticks; spans the FULL
+                    # chunk (raw, before skip) so we can spot internal cycles.
+                    z_sample = chunk_np[::10, 2]
+                    sample_str = " ".join(f"{z:+.3f}" for z in z_sample)
+                    self.get_logger().info(
+                        f"[SKIP_CHUNK] chunk {stats['chunks']} "
+                        f"raw_a_z (every 10 ticks, full chunk): {sample_str}"
+                    )
+                    # Per-segment stats: pre-skip and post-skip ranges.
+                    if skip_n > 0:
+                        self.get_logger().info(
+                            f"[SKIP_CHUNK] chunk {stats['chunks']} "
+                            f"pre-skip z[min/max/Δ]="
+                            f"{z_pre.min():+.3f}/{z_pre.max():+.3f}/"
+                            f"{z_pre.max() - z_pre.min():+.3f} | "
+                            f"post-skip z[min/max/Δ]="
+                            f"{z_post.min():+.3f}/{z_post.max():+.3f}/"
+                            f"{z_post.max() - z_post.min():+.3f}"
+                        )
             except BaseException as exc:  # noqa: BLE001
                 err_box.append(exc)
 
