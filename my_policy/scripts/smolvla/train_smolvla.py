@@ -146,6 +146,15 @@ def main() -> int:
     p.add_argument("--train-episodes-file", type=Path, default=None,
                    help="Override train episode-index list. Defaults to "
                         "<dataset-root>/train_episodes.json.")
+    p.add_argument("--action-normalization", type=str, default="MEAN_STD",
+                   choices=["MEAN_STD", "MIN_MAX", "IDENTITY"],
+                   help="Normalization mode for the action stream. Default "
+                        "MEAN_STD (SmolVLA default). MIN_MAX maps the demo's "
+                        "[min, max] action range to normalized [-1, +1], "
+                        "useful when the model under-extends the tails.")
+    p.add_argument("--state-normalization", type=str, default="MEAN_STD",
+                   choices=["MEAN_STD", "MIN_MAX", "IDENTITY"],
+                   help="Normalization mode for observation.state.")
     args = p.parse_args()
 
     train_episodes_path = args.train_episodes_file \
@@ -185,6 +194,12 @@ def main() -> int:
         f"--policy.freeze_vision_encoder={str(args.freeze_vision_encoder).lower()}",
         f"--policy.train_expert_only={str(args.train_expert_only).lower()}",
         f"--policy.vlm_model_name={args.vlm_model_name}",
+        # Pass full normalization_mapping as a dict literal (draccus accepts
+        # this syntax for dict fields, dot-notation does not work). VISUAL
+        # stays IDENTITY since SmolVLA handles SigLIP rescaling internally.
+        f"--policy.normalization_mapping={{VISUAL: IDENTITY, "
+        f"STATE: {args.state_normalization}, "
+        f"ACTION: {args.action_normalization}}}",
         # Trainer.
         f"--output_dir={output_dir}",
         f"--job_name={args.name}",
@@ -241,6 +256,7 @@ def main() -> int:
     print(f"steps               : {args.steps}")
     print(f"batch_size          : {args.batch_size}  (num_workers={args.num_workers})")
     print(f"chunk_size          : {args.chunk_size}  (n_action_steps={args.n_action_steps})")
+    print(f"normalization       : ACTION={args.action_normalization}  STATE={args.state_normalization}")
     print(f"vlm                 : {args.vlm_model_name}")
     print(f"load_vlm_weights    : {args.load_vlm_weights}")
     print(f"freeze_vision       : {args.freeze_vision_encoder}")
