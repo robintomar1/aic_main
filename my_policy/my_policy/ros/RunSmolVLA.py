@@ -387,6 +387,14 @@ class RunSmolVLA(Policy):
     # env var is unset or 0.
     SKIP_N_ENV = "AIC_PL_SMOLVLA_SKIP_N"
 
+    # Override state-composer dispatch. Useful when fine-tuning from a
+    # pretrained policy whose config.input_features still reflects the
+    # pretrained dataset's dim (e.g. lerobot/smolvla_base has shape=[6]
+    # baked in even after fine-tuning on our 26-dim data — lerobot pads
+    # internally to max_state_dim and the input_features field is never
+    # rewritten). Values: "26" (baseline) or "38" (conditioned).
+    STATE_MODE_ENV = "AIC_PL_SMOLVLA_STATE_MODE"
+
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device(
@@ -442,19 +450,44 @@ class RunSmolVLA(Policy):
 
         self._localizer = None
 
-        # Detect the dataset's expected state dim from the loaded policy
-        # config. Two supported sizes:
+        # Determine the state composer. Two supported modes:
         #   26 — baseline (no conditioning)
         #   38 — conditioned dataset (prev_action + depth + phase one-hot)
-        state_feat = self.policy.config.input_features.get("observation.state")
-        if state_feat is None:
-            raise RuntimeError("policy config has no observation.state feature")
-        self._state_dim = int(state_feat.shape[0])
-        if self._state_dim not in (STATE_DIM, STATE_DIM_CONDITIONED):
-            raise RuntimeError(
-                f"unsupported state_dim {self._state_dim} — expected "
-                f"{STATE_DIM} (baseline) or {STATE_DIM_CONDITIONED} (conditioned)"
-            )
+        # Detection order:
+        #   1. AIC_PL_SMOLVLA_STATE_MODE env override ("26" or "38").
+        #   2. policy.config.input_features["observation.state"].shape if
+        #      it matches one of the supported values.
+        #   3. Fallback to 26 with a warning — handles fine-tuned-from-
+        #      pretrained checkpoints whose input_features still reflects
+        #      the pretrained policy's original dataset (e.g. SO-100 with
+        #      shape=[6]). The model's preprocessor will zero-pad our
+        #      26-dim state to whatever max_state_dim is internally.
+        state_mode_env = os.environ.get(self.STATE_MODE_ENV, "").strip()
+        if state_mode_env:
+            forced = int(state_mode_env)
+            if forced not in (STATE_DIM, STATE_DIM_CONDITIONED):
+                raise ValueError(
+                    f"{self.STATE_MODE_ENV}={forced} must be "
+                    f"{STATE_DIM} or {STATE_DIM_CONDITIONED}"
+                )
+            self._state_dim = forced
+            self._state_mode_source = "env"
+        else:
+            state_feat = self.policy.config.input_features.get("observation.state")
+            cfg_dim = int(state_feat.shape[0]) if state_feat is not None else None
+            if cfg_dim in (STATE_DIM, STATE_DIM_CONDITIONED):
+                self._state_dim = cfg_dim
+                self._state_mode_source = "config"
+            else:
+                self._state_dim = STATE_DIM
+                self._state_mode_source = "fallback"
+                self.get_logger().warn(
+                    f"policy.config.input_features state dim is "
+                    f"{cfg_dim!r}, neither {STATE_DIM} nor "
+                    f"{STATE_DIM_CONDITIONED}. Defaulting to "
+                    f"{STATE_DIM} (baseline). Override via "
+                    f"{self.STATE_MODE_ENV}=26|38 if this is wrong."
+                )
         self._uses_conditioning = self._state_dim == STATE_DIM_CONDITIONED
 
         self.get_logger().info(
@@ -469,6 +502,7 @@ class RunSmolVLA(Policy):
             + f" state_dim={self._state_dim}"
             + (" (CONDITIONED: prev_action + depth + phase)"
                if self._uses_conditioning else " (baseline)")
+            + f" [source={self._state_mode_source}]"
         )
 
     # ------------------------------------------------------------------
