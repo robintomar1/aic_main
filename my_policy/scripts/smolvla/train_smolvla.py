@@ -221,18 +221,27 @@ def main() -> int:
     ]
     if args.pretrained_policy_path:
         # Fine-tune mode: load the pretrained policy (expert + VLM) from the
-        # given path. The pretrained config drives architecture (chunk_size,
-        # n_action_steps, max_state_dim, max_action_dim, load_vlm_weights,
-        # freeze_vision_encoder, train_expert_only, vlm_model_name). Only
-        # safe runtime overrides (normalization, n_obs_steps) are passed.
+        # given path. The pretrained config drives architecture AND
+        # normalization mode — we cannot override normalization_mapping via
+        # CLI in path-load mode (draccus's cli_overrides parser rejects the
+        # dict-literal syntax). The dataset's stats.json still supplies the
+        # actual mean/std/min/max values used by the preprocessor.
+        if (
+            args.action_normalization != "MEAN_STD"
+            or args.state_normalization != "MEAN_STD"
+        ):
+            print(
+                f"[warn] --action-normalization / --state-normalization "
+                f"are IGNORED when fine-tuning from a pretrained policy. "
+                f"Normalization mode is inherited from "
+                f"{args.pretrained_policy_path}'s config; the dataset "
+                f"stats.json supplies the values.", file=sys.stderr,
+            )
         print(f"[mode] FINE-TUNE from pretrained: {args.pretrained_policy_path}")
         cli += [
             f"--policy.path={args.pretrained_policy_path}",
             f"--policy.repo_id=local/{args.name}",
             "--policy.push_to_hub=false",
-            f"--policy.normalization_mapping={{VISUAL: IDENTITY, "
-            f"STATE: {args.state_normalization}, "
-            f"ACTION: {args.action_normalization}}}",
             f"--policy.n_obs_steps={args.n_obs_steps}",
         ]
     else:
