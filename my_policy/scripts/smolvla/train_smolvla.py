@@ -159,6 +159,14 @@ def main() -> int:
                    help="Number of observation frames stacked into a single "
                         "model input window. Default 1 (current frame only). "
                         "Set to 4 or 8 to give the policy short-term history.")
+    p.add_argument("--max-state-dim", type=int, default=None,
+                   help="Override policy.max_state_dim. Default: auto-detect "
+                        "from dataset info.json. SmolVLA's built-in default is "
+                        "32, so any state dim > 32 (e.g. conditioned datasets) "
+                        "needs this bumped.")
+    p.add_argument("--max-action-dim", type=int, default=None,
+                   help="Override policy.max_action_dim. Default 32 (SmolVLA "
+                        "built-in) which fits our 7-dim action with headroom.")
     args = p.parse_args()
 
     train_episodes_path = args.train_episodes_file \
@@ -169,6 +177,19 @@ def main() -> int:
     train_episodes: list[int] = json.loads(train_episodes_path.read_text())
     eps_arg = "[" + ",".join(str(e) for e in train_episodes) + "]"
     output_dir = args.output_root / args.name
+
+    # Detect dataset's state/action dims so we can bump policy.max_state_dim
+    # past SmolVLA's hardcoded default of 32 when needed.
+    info_path = args.dataset_root / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    dataset_state_dim = int(info["features"]["observation.state"]["shape"][0])
+    dataset_action_dim = int(info["features"]["action"]["shape"][0])
+    max_state_dim = args.max_state_dim or max(32, dataset_state_dim)
+    max_action_dim = args.max_action_dim or max(32, dataset_action_dim)
+    if dataset_state_dim > max_state_dim:
+        print(f"error: dataset state_dim {dataset_state_dim} > "
+              f"max_state_dim {max_state_dim}", file=sys.stderr)
+        return 1
 
     if output_dir.exists() and not args.resume:
         if args.force:
@@ -205,6 +226,8 @@ def main() -> int:
         f"STATE: {args.state_normalization}, "
         f"ACTION: {args.action_normalization}}}",
         f"--policy.n_obs_steps={args.n_obs_steps}",
+        f"--policy.max_state_dim={max_state_dim}",
+        f"--policy.max_action_dim={max_action_dim}",
         # Trainer.
         f"--output_dir={output_dir}",
         f"--job_name={args.name}",
@@ -263,6 +286,8 @@ def main() -> int:
     print(f"chunk_size          : {args.chunk_size}  (n_action_steps={args.n_action_steps})")
     print(f"normalization       : ACTION={args.action_normalization}  STATE={args.state_normalization}")
     print(f"n_obs_steps         : {args.n_obs_steps}")
+    print(f"max_state_dim       : {max_state_dim}  (dataset state_dim={dataset_state_dim})")
+    print(f"max_action_dim      : {max_action_dim}  (dataset action_dim={dataset_action_dim})")
     print(f"vlm                 : {args.vlm_model_name}")
     print(f"load_vlm_weights    : {args.load_vlm_weights}")
     print(f"freeze_vision       : {args.freeze_vision_encoder}")
