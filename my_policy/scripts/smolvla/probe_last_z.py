@@ -1,20 +1,43 @@
 #!/usr/bin/env python3
-"""Probe the model's raw output saturation as a function of obs.tcp_z.
+"""Probe SmolVLA's raw output saturation vs obs.tcp_z, across every
+checkpoint in a run directory, for both port types, averaged over
+multiple real images per (port_type, tcp_z) cell.
 
-Confirms the saturation hypothesis: if raw_z[max] caps near +1.0 even when
-obs.tcp_z is set to the demo's end (~0.00), the model literally cannot
-output beyond raw=+1.0 and the un-normalized target stays at z ≈ -0.082.
+For each step checkpoint under <run-dir>/checkpoints/:
+  For each port_type in {sc, sfp}:
+    Sample N (episode, frame) pairs from a reference dataset whose tasks
+    match that port_type.
+    For each tcp_z in the sweep:
+      For each (ep, frame) sample:
+        Build obs = state(tcp_z, port_type) + real images from that frame
+        Run predict_action_chunk
+        Record raw_z[max], raw_z[-1], un_z[-1]
+      Print mean ± std across the N samples.
+
+Tells you (a) how saturation evolves across training steps, (b) whether
+the model behaves differently for SC vs SFP, and (c) how much image
+content (vs state alone) drives the chunk output.
 
 Usage:
-    AIC_PL_SMOLVLA_CHECKPOINT=/root/aic_data/sc_build/runs/<run>/checkpoints/last/pretrained_model \
-        pixi run python my_policy/scripts/smolvla/probe_last_z.py
+    pixi run python my_policy/scripts/smolvla/probe_last_z.py \\
+        --run-dir /root/aic_data/v9_act_build/runs/v9_pl_smolvla_v3_corr_cond_minmax \\
+        --dataset-root /root/aic_data/v9_act_build/v9_port_local_smolvla_dataset_with_corrections \\
+        --n-images 5
+
+Backward compat: if --run-dir points at a single .../pretrained_model
+directory, only that checkpoint is probed.
 """
 from __future__ import annotations
 
+import argparse
 import json
-import os
+import random
+import sys
+from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
+import cv2
 import draccus
 import numpy as np
 import torch
@@ -25,149 +48,365 @@ from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.processor.pipeline import DataProcessorPipeline
 
 
-def main() -> int:
-    ckpt_env = os.environ.get("AIC_PL_SMOLVLA_CHECKPOINT", "").strip()
-    if not ckpt_env:
+# ---------------------------------------------------------------------------
+# Constants — must match build_conditioned_dataset.py + RunSmolVLA.
+# ---------------------------------------------------------------------------
+
+PORT_OFFSETS = {"sc": 0.01564, "sfp": 0.0458}
+D_DESCEND_THRESH = 0.10
+D_INSERTED_THRESH = 0.005
+F_CONTACT_THRESH = 8.0
+
+# Defaults for port-specific task strings; --task-strs can override.
+DEFAULT_TASK_STR = {
+    "sc": "insert sc plug into sc_port_base on sc_port_0",
+    "sfp": "insert sfp plug into sfp_port_0 on nic_card_mount_0",
+}
+
+# tcp_z sweep (port-local meters).
+DEFAULT_TCP_Z_SWEEP = (-0.30, -0.20, -0.10, -0.05, -0.01, 0.00)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint discovery
+# ---------------------------------------------------------------------------
+
+def discover_checkpoints(run_dir: Path) -> list[Path]:
+    """Returns a sorted list of pretrained_model dirs under run_dir.
+
+    If run_dir IS a pretrained_model dir already, returns [run_dir].
+    Otherwise expects <run_dir>/checkpoints/<step>/pretrained_model/ layout.
+    """
+    if (run_dir / "model.safetensors").exists() and (run_dir / "config.json").exists():
+        return [run_dir]
+
+    ckpts_root = run_dir / "checkpoints"
+    if not ckpts_root.is_dir():
         raise SystemExit(
-            "AIC_PL_SMOLVLA_CHECKPOINT env var is required — set it to "
-            "the .../checkpoints/<step>/pretrained_model/ dir."
+            f"{run_dir} is neither a pretrained_model dir nor a run dir "
+            f"with a checkpoints/ subdir."
         )
-    ckpt = Path(ckpt_env)
+    step_dirs = []
+    for d in ckpts_root.iterdir():
+        if not d.is_dir():
+            continue
+        # Skip the "last" symlink to avoid double-probing the same checkpoint.
+        if d.name == "last":
+            continue
+        pretrained = d / "pretrained_model"
+        if pretrained.is_dir() and (pretrained / "model.safetensors").exists():
+            step_dirs.append(pretrained)
+    if not step_dirs:
+        raise SystemExit(f"no checkpoints found under {ckpts_root}")
+    # Sort by step number (the parent's name).
+    step_dirs.sort(key=lambda p: int(p.parent.name) if p.parent.name.isdigit() else -1)
+    return step_dirs
+
+
+# ---------------------------------------------------------------------------
+# Per-port-type episode discovery + image sampling
+# ---------------------------------------------------------------------------
+
+def discover_episodes_by_port_type(dataset_root: Path) -> dict[str, list[int]]:
+    """Reads tasks.parquet + per-episode metadata; returns
+    {port_type: [episode_index, ...]} for the episodes in the dataset.
+    """
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    tasks_df = pd.read_parquet(dataset_root / "meta" / "tasks.parquet")
+    task_idx_to_str = {int(row["task_index"]): str(name)
+                       for name, row in tasks_df.iterrows()}
+
+    eps = pq.read_table(
+        str(dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
+    ).to_pylist()
+
+    out: dict[str, list[int]] = defaultdict(list)
+    for rec in eps:
+        ep = int(rec["episode_index"])
+        task_str = None
+        if rec.get("tasks"):
+            task_str = rec["tasks"][0]
+        elif "task_index" in rec:
+            task_str = task_idx_to_str.get(int(rec["task_index"]))
+        if task_str is None:
+            continue
+        t = task_str.lower()
+        if "sfp" in t:
+            out["sfp"].append(ep)
+        elif "sc" in t:
+            out["sc"].append(ep)
+    return dict(out)
+
+
+def find_camera_video(dataset_root: Path, camera: str, episode_idx: int) -> Path:
+    """Find the mp4 for a given camera and episode in the dataset's videos dir.
+
+    Handles both flat (<videos>/<camera>/episode_N.mp4) and nested
+    (<videos>/observation.images.<camera>/.../episode_N.mp4) layouts.
+    """
+    videos = dataset_root / "videos"
+    name = f"episode_{episode_idx:06d}.mp4"
+    # Try most-likely paths first.
+    for cand in (
+        videos / f"observation.images.{camera}" / "chunk-000" / name,
+        videos / "chunk-000" / f"observation.images.{camera}" / name,
+    ):
+        if cand.exists():
+            return cand
+    # Fallback: search.
+    for p in videos.rglob(name):
+        if camera in str(p):
+            return p
+    raise FileNotFoundError(f"no video for camera={camera} ep={episode_idx} in {videos}")
+
+
+def load_image_chw(video_path: Path, frame_idx: int) -> torch.Tensor:
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        raise RuntimeError(f"failed to read frame {frame_idx} from {video_path}")
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame = cv2.resize(frame, (288, 256), interpolation=cv2.INTER_AREA)  # (W, H)
+    t = torch.from_numpy(frame.copy()).permute(2, 0, 1).float() / 255.0
+    return t.unsqueeze(0).cuda()  # (1, 3, 256, 288)
+
+
+def episode_length(dataset_root: Path, episode_idx: int) -> int:
+    """Look up an episode's frame count from the per-episode meta parquet."""
+    import pyarrow.parquet as pq
+    eps = pq.read_table(
+        str(dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
+    ).to_pylist()
+    for rec in eps:
+        if int(rec["episode_index"]) == episode_idx:
+            return int(rec["length"])
+    raise KeyError(f"episode {episode_idx} not in meta")
+
+
+# ---------------------------------------------------------------------------
+# State composer (mirrors RunSmolVLA._build_state_*)
+# ---------------------------------------------------------------------------
+
+def make_state(state_dim: int, tcp_z: float, port_type: str) -> torch.Tensor:
+    s = np.zeros(state_dim, dtype=np.float32)
+    s[3:7] = [0.0, 0.0, 0.0, 1.0]  # identity quat
+    s[2] = tcp_z
+    if state_dim == 38:
+        entrance_offset = PORT_OFFSETS[port_type]
+        depth = -tcp_z - entrance_offset
+        s[33] = depth
+        fmag = 0.0
+        if fmag >= F_CONTACT_THRESH:
+            phase_idx = 2
+        elif depth <= D_INSERTED_THRESH:
+            phase_idx = 3
+        elif depth <= D_DESCEND_THRESH:
+            phase_idx = 1
+        else:
+            phase_idx = 0
+        s[34 + phase_idx] = 1.0
+    return torch.from_numpy(s).unsqueeze(0).cuda()
+
+
+# ---------------------------------------------------------------------------
+# Un-normalization (auto-detects MEAN_STD vs MIN_MAX from postprocessor)
+# ---------------------------------------------------------------------------
+
+def build_unnorm_fn(ckpt: Path):
+    from safetensors import safe_open
+    post_json = ckpt / "policy_postprocessor.json"
+    action_mode = "MEAN_STD"
+    if post_json.exists():
+        post_cfg = json.loads(post_json.read_text())
+        for step in post_cfg.get("steps", []):
+            nm = step.get("config", {}).get("norm_map") if step.get("config") else None
+            if nm and "ACTION" in nm:
+                action_mode = nm["ACTION"]
+                break
+    safetensors_path = next(
+        ckpt.glob("policy_postprocessor_step_*_unnormalizer_processor.safetensors"),
+        None,
+    )
+    if safetensors_path is None:
+        return action_mode, (lambda raw: float(raw))
+    with safe_open(str(safetensors_path), framework="numpy") as f:
+        try:
+            am = f.get_tensor("action.mean")
+            asd = f.get_tensor("action.std")
+        except Exception:
+            am = asd = None
+        try:
+            amin = f.get_tensor("action.min")
+            amax = f.get_tensor("action.max")
+        except Exception:
+            amin = amax = None
+    if action_mode == "MIN_MAX" and amin is not None and amax is not None:
+        mid = (float(amin[2]) + float(amax[2])) / 2.0
+        half = (float(amax[2]) - float(amin[2])) / 2.0
+        return action_mode, (lambda raw: mid + raw * half)
+    if am is not None and asd is not None:
+        m, sd = float(am[2]), float(asd[2])
+        return action_mode, (lambda raw: m + raw * sd)
+    return action_mode, (lambda raw: float(raw))
+
+
+# ---------------------------------------------------------------------------
+# Per-checkpoint probe
+# ---------------------------------------------------------------------------
+
+def probe_one_checkpoint(
+    ckpt: Path,
+    dataset_root: Path,
+    eps_by_port: dict[str, list[int]],
+    tcp_z_values: list[float],
+    n_images: int,
+    rng: random.Random,
+) -> None:
+    print(f"\n{'=' * 78}\nCHECKPOINT: {ckpt.parent.name}/pretrained_model")
+    print(f"  path: {ckpt}")
 
     cfg_dict = json.loads((ckpt / "config.json").read_text())
     cfg_dict.pop("type", None)
     cfg_dict.pop("rtc_config", None)
     config = draccus.decode(SmolVLAConfig, cfg_dict)
-
     policy = SmolVLAPolicy(config)
     policy.load_state_dict(load_file(str(ckpt / "model.safetensors")))
     policy.eval()
     policy.to("cuda")
-
     pre = DataProcessorPipeline.from_pretrained(
         str(ckpt), config_filename="policy_preprocessor.json"
     )
 
-    # Detect state dim from the policy config so we build the right shape.
     state_feat = config.input_features.get("observation.state")
     state_dim = int(state_feat.shape[0]) if state_feat is not None else 26
     if state_dim not in (26, 38):
-        print(f"WARNING: unexpected state_dim={state_dim}, defaulting to 26 layout")
+        print(f"  WARN: unexpected state_dim={state_dim}, defaulting to 26 layout")
         state_dim = 26
 
-    # Port entrance offsets — match build_conditioned_dataset.py.
-    PORT_OFFSETS = {"sc": 0.01564, "sfp": 0.0458}
-    # For probing, assume SC port (matches the task string below).
-    PROBE_PORT_TYPE = "sc"
-    ENTRANCE_OFFSET = PORT_OFFSETS[PROBE_PORT_TYPE]
+    action_mode, unnorm_fn = build_unnorm_fn(ckpt)
+    print(f"  chunk_size={config.chunk_size}  n_action_steps={config.n_action_steps}  "
+          f"state_dim={state_dim}  action_norm={action_mode}")
 
-    # Phase thresholds (mirror build_conditioned_dataset.py defaults).
-    D_DESCEND_THRESH = 0.10
-    D_INSERTED_THRESH = 0.005
-    F_CONTACT_THRESH = 8.0
-
-    def make_state(tcp_z: float) -> torch.Tensor:
-        # Baseline 26-dim layout:
-        #   [0:7]   tcp_pose (xyz + xyzw quat)
-        #   [7:13]  tcp_velocity
-        #   [13:20] joint positions
-        #   [20:26] wrench (fx,fy,fz, tx,ty,tz)
-        s = np.zeros(state_dim, dtype=np.float32)
-        s[3:7] = [0.0, 0.0, 0.0, 1.0]  # identity quat
-        s[2] = tcp_z
-        if state_dim == 38:
-            # Conditioned layout extras:
-            #   [26:33] prev_action (zero-pad; matches dataset's first-frame convention)
-            #   [33]    tcp.depth_above_entrance = -tcp_z - entrance_offset
-            #   [34:38] phase one-hot (approach, descend, contact, inserted)
-            depth = -tcp_z - ENTRANCE_OFFSET
-            s[33] = depth
-            # classify phase
-            fmag = 0.0  # zero wrench in probe
-            if fmag >= F_CONTACT_THRESH:
-                phase_idx = 2  # contact
-            elif depth <= D_INSERTED_THRESH:
-                phase_idx = 3  # inserted
-            elif depth <= D_DESCEND_THRESH:
-                phase_idx = 1  # descend
-            else:
-                phase_idx = 0  # approach
-            s[34 + phase_idx] = 1.0
-        return torch.from_numpy(s).unsqueeze(0).cuda()
-
-    dummy_imgs = {
-        "observation.images.left_camera":   torch.zeros(1, 3, 256, 288, device="cuda"),
-        "observation.images.center_camera": torch.zeros(1, 3, 256, 288, device="cuda"),
-        "observation.images.right_camera":  torch.zeros(1, 3, 256, 288, device="cuda"),
-        "task": f"insert {PROBE_PORT_TYPE} plug into sc_port_base on sc_port_0",
-    }
-
-    print(f"checkpoint: {ckpt}")
-    print(f"chunk_size: {config.chunk_size}  n_action_steps: {config.n_action_steps}")
-    print(f"state_dim:  {state_dim}  ({'CONDITIONED' if state_dim == 38 else 'baseline'})")
-    print(f"probe port: {PROBE_PORT_TYPE}  (entrance offset = {ENTRANCE_OFFSET:.5f} m)")
-    print()
-    header = f"{'obs.tcp_z':>11} | {'raw_z[0]':>9} {'raw_z[-1]':>10} {'raw_z[min]':>11} {'raw_z[max]':>11} | {'un_z[0]':>9} {'un_z[-1]':>10}"
-    print(header)
-    print("-" * len(header))
-
-    # Read stats from postprocessor and detect normalization mode for ACTION.
-    post_json = ckpt / "policy_postprocessor.json"
-    post_safetensors = next(
-        ckpt.glob("policy_postprocessor_step_*_unnormalizer_processor.safetensors"),
-        None,
-    )
-    action_mode = "MEAN_STD"  # fallback
-    if post_json.exists():
-        post_cfg = json.loads(post_json.read_text())
-        for step in post_cfg.get("steps", []):
-            norm_map = step.get("config", {}).get("norm_map") if step.get("config") else None
-            if norm_map and "ACTION" in norm_map:
-                action_mode = norm_map["ACTION"]
-                break
-    if post_safetensors is not None:
-        from safetensors import safe_open
-        with safe_open(str(post_safetensors), framework="numpy") as f:
-            am = f.get_tensor("action.mean")
-            asd = f.get_tensor("action.std")
+    # Pre-sample N (episode, frame) image triplets for each port type.
+    image_samples: dict[str, list[dict[str, torch.Tensor]]] = {}
+    for port_type in ("sc", "sfp"):
+        eps_pool = eps_by_port.get(port_type, [])
+        if not eps_pool:
+            print(f"  no episodes for port_type={port_type}; skipping")
+            image_samples[port_type] = []
+            continue
+        samples: list[dict[str, torch.Tensor]] = []
+        for _ in range(n_images):
+            ep = rng.choice(eps_pool)
             try:
-                amin = f.get_tensor("action.min")
-                amax = f.get_tensor("action.max")
+                ep_len = episode_length(dataset_root, ep)
             except Exception:
-                amin = amax = None
-    else:
-        am = np.full((7,), -0.1893, dtype=np.float32)
-        asd = np.full((7,), 0.10692, dtype=np.float32)
-        amin = amax = None
+                ep_len = 200  # fallback
+            frame_idx = rng.randint(0, max(0, ep_len - 1))
+            imgs = {}
+            for cam in ("left_camera", "center_camera", "right_camera"):
+                try:
+                    vp = find_camera_video(dataset_root, cam, ep)
+                    imgs[f"observation.images.{cam}"] = load_image_chw(vp, frame_idx)
+                except Exception as e:
+                    print(f"  WARN: failed to load {cam} ep={ep} frame={frame_idx}: {e}")
+                    imgs[f"observation.images.{cam}"] = torch.zeros(
+                        1, 3, 256, 288, device="cuda"
+                    )
+            samples.append(imgs)
+        image_samples[port_type] = samples
 
-    if action_mode == "MIN_MAX" and amin is not None and amax is not None:
-        mid = (float(amin[2]) + float(amax[2])) / 2.0
-        half = (float(amax[2]) - float(amin[2])) / 2.0
-        unnorm_fn = lambda raw: mid + raw * half
-        print(f"  ACTION normalization = MIN_MAX")
-        print(f"  un-norm: action_z = {mid:+.5f} + raw * {half:+.5f}  "
-              f"(min={float(amin[2]):+.5f}, max={float(amax[2]):+.5f})")
-    else:
-        m, s = float(am[2]), float(asd[2])
-        unnorm_fn = lambda raw: m + raw * s
-        print(f"  ACTION normalization = {action_mode}")
-        print(f"  un-norm: action_z = {m:+.5f} + raw * {s:+.5f}")
+    # Sweep.
+    for port_type in ("sc", "sfp"):
+        if not image_samples[port_type]:
+            continue
+        offset = PORT_OFFSETS[port_type]
+        print()
+        print(f"  --- port_type={port_type}  entrance_offset={offset:+.5f}m  "
+              f"n_images={len(image_samples[port_type])} ---")
+        header = (f"  {'obs.tcp_z':>10} | "
+                  f"{'raw_z[max] μ±σ':>18} {'raw_z[-1] μ±σ':>18} | "
+                  f"{'un_z[-1] μ±σ (m)':>22}")
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        task_str = DEFAULT_TASK_STR[port_type]
+        for tcp_z in tcp_z_values:
+            state = make_state(state_dim, tcp_z, port_type)
+            raw_maxs = []
+            raw_lasts = []
+            un_lasts = []
+            for imgs in image_samples[port_type]:
+                raw_obs = {**imgs, "task": task_str, "observation.state": state}
+                obs = pre(raw_obs)
+                with torch.no_grad():
+                    actions = policy.predict_action_chunk(obs)
+                az = actions[0, :, 2].cpu().numpy()
+                raw_maxs.append(float(az.max()))
+                raw_lasts.append(float(az[-1]))
+                un_lasts.append(unnorm_fn(float(az[-1])))
+            rmax_m, rmax_s = float(np.mean(raw_maxs)), float(np.std(raw_maxs))
+            rlast_m, rlast_s = float(np.mean(raw_lasts)), float(np.std(raw_lasts))
+            ulast_m, ulast_s = float(np.mean(un_lasts)), float(np.std(un_lasts))
+            print(f"  {tcp_z:+10.3f} | "
+                  f"{rmax_m:+8.3f}±{rmax_s:.3f}    "
+                  f"{rlast_m:+8.3f}±{rlast_s:.3f}   | "
+                  f"{ulast_m:+10.4f}±{ulast_s:.4f}")
 
-    for tcp_z in (-0.30, -0.20, -0.10, -0.05, -0.01, 0.00):
-        raw_obs = dict(dummy_imgs)
-        raw_obs["observation.state"] = make_state(tcp_z)
-        obs = pre(raw_obs)
-        with torch.no_grad():
-            actions = policy.predict_action_chunk(obs)  # (1, chunk_size, A_padded)
-        az = actions[0, :, 2].cpu().numpy()
-        un_first = unnorm_fn(float(az[0]))
-        un_last = unnorm_fn(float(az[-1]))
-        print(
-            f"{tcp_z:+11.3f} | {az[0]:+9.3f} {az[-1]:+10.3f} "
-            f"{az.min():+11.3f} {az.max():+11.3f} | "
-            f"{un_first:+9.4f} {un_last:+10.4f}"
+    # Free GPU memory before the next checkpoint loads.
+    del policy
+    torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--run-dir", type=Path, required=True,
+                   help="Either a run directory (containing checkpoints/) "
+                        "or a single .../pretrained_model dir.")
+    p.add_argument("--dataset-root", type=Path, required=True,
+                   help="Reference dataset to source real images from "
+                        "(e.g. v9_port_local_smolvla_dataset_with_corrections).")
+    p.add_argument("--n-images", type=int, default=5,
+                   help="Number of (episode, frame) samples per port type "
+                        "averaged at each tcp_z value. Default 5.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="RNG seed for image sampling. Default 0 — same images "
+                        "across checkpoints so direct comparison is meaningful.")
+    p.add_argument(
+        "--tcp-z-values", type=float, nargs="+", default=list(DEFAULT_TCP_Z_SWEEP),
+        help=f"Port-local tcp_z values to sweep. Default {list(DEFAULT_TCP_Z_SWEEP)}.",
+    )
+    args = p.parse_args()
+
+    if not args.dataset_root.is_dir():
+        raise SystemExit(f"--dataset-root not a directory: {args.dataset_root}")
+
+    print(f"discovering checkpoints under: {args.run_dir}")
+    ckpts = discover_checkpoints(args.run_dir)
+    print(f"found {len(ckpts)} checkpoint(s):")
+    for c in ckpts:
+        print(f"  {c.parent.name}")
+
+    print(f"\nlisting episodes by port type from: {args.dataset_root}")
+    eps_by_port = discover_episodes_by_port_type(args.dataset_root)
+    for port, eps in eps_by_port.items():
+        print(f"  {port}: {len(eps)} episodes")
+
+    rng = random.Random(args.seed)
+    for ckpt in ckpts:
+        probe_one_checkpoint(
+            ckpt, args.dataset_root, eps_by_port,
+            tcp_z_values=list(args.tcp_z_values),
+            n_images=args.n_images,
+            rng=random.Random(args.seed),  # same images per checkpoint
         )
-
     return 0
 
 
