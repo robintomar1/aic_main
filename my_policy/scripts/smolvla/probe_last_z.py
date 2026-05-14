@@ -47,6 +47,11 @@ from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.processor.pipeline import DataProcessorPipeline
 
+# Path setup so we can pull ACT_VALID_TARGETS for ACT task-vec composition.
+_REPO_ROOT = Path(__file__).resolve().parents[2]  # .../aic_main
+if str(_REPO_ROOT / "my_policy") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "my_policy"))
+
 
 # ---------------------------------------------------------------------------
 # Constants — must match build_conditioned_dataset.py + RunSmolVLA.
@@ -57,10 +62,17 @@ D_DESCEND_THRESH = 0.10
 D_INSERTED_THRESH = 0.005
 F_CONTACT_THRESH = 8.0
 
-# Defaults for port-specific task strings; --task-strs can override.
+# Defaults for port-specific task strings (SmolVLA language input).
 DEFAULT_TASK_STR = {
     "sc": "insert sc plug into sc_port_base on sc_port_0",
     "sfp": "insert sfp plug into sfp_port_0 on nic_card_mount_0",
+}
+
+# Default (mount, port) pairs to use when composing the ACT task_vec
+# one-hot for each port type. Must exist in my_policy.act.labels.ACT_VALID_TARGETS.
+DEFAULT_ACT_TARGET = {
+    "sc": ("sc_port_0", "sc_port_base"),
+    "sfp": ("nic_card_mount_0", "sfp_port_0"),
 }
 
 # tcp_z sweep (port-local meters).
@@ -140,26 +152,58 @@ def discover_episodes_by_port_type(dataset_root: Path) -> dict[str, list[int]]:
     return dict(out)
 
 
-def find_camera_video(dataset_root: Path, camera: str, episode_idx: int) -> Path:
-    """Find the mp4 for a given camera and episode in the dataset's videos dir.
+def build_video_index(dataset_root: Path) -> dict[tuple[str, int], Path]:
+    """Walk the dataset's videos/ tree once and return a
+    {(camera, episode_idx): path} map. Handles arbitrary nested layouts
+    and episode-filename conventions by matching on path components.
 
-    Handles both flat (<videos>/<camera>/episode_N.mp4) and nested
-    (<videos>/observation.images.<camera>/.../episode_N.mp4) layouts.
+    Camera detection: the path contains one of {left_camera, center_camera,
+    right_camera}. Episode detection: filename matches episode_<NNNN>.mp4
+    (with or without zero-padding).
     """
+    import re
     videos = dataset_root / "videos"
-    name = f"episode_{episode_idx:06d}.mp4"
-    # Try most-likely paths first.
-    for cand in (
-        videos / f"observation.images.{camera}" / "chunk-000" / name,
-        videos / "chunk-000" / f"observation.images.{camera}" / name,
-    ):
-        if cand.exists():
-            return cand
-    # Fallback: search.
-    for p in videos.rglob(name):
-        if camera in str(p):
-            return p
-    raise FileNotFoundError(f"no video for camera={camera} ep={episode_idx} in {videos}")
+    if not videos.is_dir():
+        raise SystemExit(f"--dataset-root has no videos/ subdir: {videos}")
+    cameras = ("left_camera", "center_camera", "right_camera")
+    ep_re = re.compile(r"episode_0*(\d+)\.mp4$")
+
+    # videos may itself be a symlink — follow it.
+    videos_resolved = videos.resolve()
+
+    index: dict[tuple[str, int], Path] = {}
+    for p in videos_resolved.rglob("*.mp4"):
+        path_str = str(p)
+        # Identify the camera by looking for one of the names in the path.
+        matched_camera = None
+        for c in cameras:
+            if c in path_str:
+                matched_camera = c
+                break
+        if matched_camera is None:
+            continue
+        m = ep_re.search(p.name)
+        if not m:
+            continue
+        ep_idx = int(m.group(1))
+        index[(matched_camera, ep_idx)] = p
+    if not index:
+        raise SystemExit(
+            f"no camera-episode mp4 files found under {videos_resolved}; "
+            f"checked for {cameras} and episode_<N>.mp4 naming."
+        )
+    return index
+
+
+def find_camera_video(
+    video_index: dict[tuple[str, int], Path],
+    camera: str, episode_idx: int,
+) -> Path:
+    key = (camera, episode_idx)
+    if key not in video_index:
+        raise FileNotFoundError(
+            f"no video indexed for camera={camera} ep={episode_idx}")
+    return video_index[key]
 
 
 def load_image_chw(video_path: Path, frame_idx: int) -> torch.Tensor:
@@ -188,10 +232,46 @@ def episode_length(dataset_root: Path, episode_idx: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# State composer (mirrors RunSmolVLA._build_state_*)
+# Policy-type detection + loaders
 # ---------------------------------------------------------------------------
 
-def make_state(state_dim: int, tcp_z: float, port_type: str) -> torch.Tensor:
+def detect_policy_type(ckpt: Path) -> str:
+    """Return 'act' or 'smolvla' based on config.json's `type` field.
+    Falls back to 'smolvla' if not set (backward compat with our old runs)."""
+    cfg = json.loads((ckpt / "config.json").read_text())
+    t = (cfg.get("type") or "smolvla").lower()
+    if t not in ("smolvla", "act"):
+        raise ValueError(f"unsupported policy.type={t!r} in {ckpt / 'config.json'}")
+    return t
+
+
+def load_policy(ckpt: Path, policy_type: str):
+    """Returns (policy, config, state_dim)."""
+    cfg_dict = json.loads((ckpt / "config.json").read_text())
+    cfg_dict.pop("type", None)
+    if policy_type == "smolvla":
+        cfg_dict.pop("rtc_config", None)
+        config = draccus.decode(SmolVLAConfig, cfg_dict)
+        policy = SmolVLAPolicy(config)
+    else:  # act
+        from lerobot.policies.act.modeling_act import ACTPolicy
+        from lerobot.policies.act.configuration_act import ACTConfig
+        config = draccus.decode(ACTConfig, cfg_dict)
+        policy = ACTPolicy(config)
+    policy.load_state_dict(load_file(str(ckpt / "model.safetensors")))
+    policy.eval()
+    policy.to("cuda")
+    state_feat = config.input_features.get("observation.state")
+    state_dim = int(state_feat.shape[0]) if state_feat is not None else 26
+    return policy, config, state_dim
+
+
+# ---------------------------------------------------------------------------
+# State composers
+# ---------------------------------------------------------------------------
+
+def _smolvla_state(state_dim: int, tcp_z: float, port_type: str) -> torch.Tensor:
+    """Compose state for SmolVLA: 26-dim baseline or 38-dim conditioned."""
     s = np.zeros(state_dim, dtype=np.float32)
     s[3:7] = [0.0, 0.0, 0.0, 1.0]  # identity quat
     s[2] = tcp_z
@@ -199,10 +279,7 @@ def make_state(state_dim: int, tcp_z: float, port_type: str) -> torch.Tensor:
         entrance_offset = PORT_OFFSETS[port_type]
         depth = -tcp_z - entrance_offset
         s[33] = depth
-        fmag = 0.0
-        if fmag >= F_CONTACT_THRESH:
-            phase_idx = 2
-        elif depth <= D_INSERTED_THRESH:
+        if depth <= D_INSERTED_THRESH:
             phase_idx = 3
         elif depth <= D_DESCEND_THRESH:
             phase_idx = 1
@@ -210,6 +287,52 @@ def make_state(state_dim: int, tcp_z: float, port_type: str) -> torch.Tensor:
             phase_idx = 0
         s[34 + phase_idx] = 1.0
     return torch.from_numpy(s).unsqueeze(0).cuda()
+
+
+# Cache the ACT_VALID_TARGETS list once (importing my_policy.act.labels).
+_ACT_VALID_TARGETS_CACHE = None
+
+
+def _act_valid_targets():
+    global _ACT_VALID_TARGETS_CACHE
+    if _ACT_VALID_TARGETS_CACHE is None:
+        from my_policy.act.labels import ACT_VALID_TARGETS  # noqa: WPS433
+        _ACT_VALID_TARGETS_CACHE = list(ACT_VALID_TARGETS)
+    return _ACT_VALID_TARGETS_CACHE
+
+
+def _act_state(state_dim: int, tcp_z: float, port_type: str) -> torch.Tensor:
+    """Compose state for ACT, 44-dim with task one-hot.
+
+    Layout (from my_policy/scripts/make_port_local_dataset.py):
+      [ 0:7 ]  tcp_pose (xyz + xyzw quat)
+      [ 7:13]  tcp_velocity
+      [13:19]  tcp_error
+      [19:26]  joint_positions
+      [26:32]  wrench
+      [32:44]  task_vec — 12-dim one-hot over (mount, port_name) targets
+    """
+    s = np.zeros(state_dim, dtype=np.float32)
+    s[3:7] = [0.0, 0.0, 0.0, 1.0]
+    s[2] = tcp_z
+    if state_dim >= 44:
+        # Set the matching task_vec one-hot.
+        mount, port_name = DEFAULT_ACT_TARGET[port_type]
+        try:
+            idx = _act_valid_targets().index((mount, port_name))
+            s[32 + idx] = 1.0
+        except ValueError:
+            print(f"  WARN: ({mount},{port_name}) not in ACT_VALID_TARGETS — "
+                  f"task_vec will be all zeros for {port_type}", file=sys.stderr)
+    return torch.from_numpy(s).unsqueeze(0).cuda()
+
+
+def make_state(
+    policy_type: str, state_dim: int, tcp_z: float, port_type: str,
+) -> torch.Tensor:
+    if policy_type == "smolvla":
+        return _smolvla_state(state_dim, tcp_z, port_type)
+    return _act_state(state_dim, tcp_z, port_type)
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +385,7 @@ def probe_one_checkpoint(
     ckpt: Path,
     dataset_root: Path,
     eps_by_port: dict[str, list[int]],
+    video_index: dict[tuple[str, int], Path],
     tcp_z_values: list[float],
     n_images: int,
     rng: random.Random,
@@ -269,27 +393,22 @@ def probe_one_checkpoint(
     print(f"\n{'=' * 78}\nCHECKPOINT: {ckpt.parent.name}/pretrained_model")
     print(f"  path: {ckpt}")
 
-    cfg_dict = json.loads((ckpt / "config.json").read_text())
-    cfg_dict.pop("type", None)
-    cfg_dict.pop("rtc_config", None)
-    config = draccus.decode(SmolVLAConfig, cfg_dict)
-    policy = SmolVLAPolicy(config)
-    policy.load_state_dict(load_file(str(ckpt / "model.safetensors")))
-    policy.eval()
-    policy.to("cuda")
+    policy_type = detect_policy_type(ckpt)
+    policy, config, state_dim = load_policy(ckpt, policy_type)
     pre = DataProcessorPipeline.from_pretrained(
         str(ckpt), config_filename="policy_preprocessor.json"
     )
-
-    state_feat = config.input_features.get("observation.state")
-    state_dim = int(state_feat.shape[0]) if state_feat is not None else 26
-    if state_dim not in (26, 38):
-        print(f"  WARN: unexpected state_dim={state_dim}, defaulting to 26 layout")
+    if policy_type == "smolvla" and state_dim not in (26, 38):
+        print(f"  WARN: unexpected smolvla state_dim={state_dim}, "
+              f"forcing baseline 26 layout")
         state_dim = 26
 
     action_mode, unnorm_fn = build_unnorm_fn(ckpt)
-    print(f"  chunk_size={config.chunk_size}  n_action_steps={config.n_action_steps}  "
-          f"state_dim={state_dim}  action_norm={action_mode}")
+    chunk_size_attr = getattr(config, "chunk_size", "?")
+    n_action_steps_attr = getattr(config, "n_action_steps", "?")
+    print(f"  policy_type={policy_type}  chunk_size={chunk_size_attr}  "
+          f"n_action_steps={n_action_steps_attr}  state_dim={state_dim}  "
+          f"action_norm={action_mode}")
 
     # Pre-sample N (episode, frame) image triplets for each port type.
     image_samples: dict[str, list[dict[str, torch.Tensor]]] = {}
@@ -308,15 +427,19 @@ def probe_one_checkpoint(
                 ep_len = 200  # fallback
             frame_idx = rng.randint(0, max(0, ep_len - 1))
             imgs = {}
+            ok_count = 0
             for cam in ("left_camera", "center_camera", "right_camera"):
                 try:
-                    vp = find_camera_video(dataset_root, cam, ep)
+                    vp = find_camera_video(video_index, cam, ep)
                     imgs[f"observation.images.{cam}"] = load_image_chw(vp, frame_idx)
+                    ok_count += 1
                 except Exception as e:
                     print(f"  WARN: failed to load {cam} ep={ep} frame={frame_idx}: {e}")
                     imgs[f"observation.images.{cam}"] = torch.zeros(
                         1, 3, 256, 288, device="cuda"
                     )
+            if ok_count < 3:
+                print(f"  NOTE: ep={ep} frame={frame_idx} loaded {ok_count}/3 cameras")
             samples.append(imgs)
         image_samples[port_type] = samples
 
@@ -335,12 +458,16 @@ def probe_one_checkpoint(
         print("  " + "-" * (len(header) - 2))
         task_str = DEFAULT_TASK_STR[port_type]
         for tcp_z in tcp_z_values:
-            state = make_state(state_dim, tcp_z, port_type)
+            state = make_state(policy_type, state_dim, tcp_z, port_type)
             raw_maxs = []
             raw_lasts = []
             un_lasts = []
             for imgs in image_samples[port_type]:
-                raw_obs = {**imgs, "task": task_str, "observation.state": state}
+                raw_obs = {**imgs, "observation.state": state}
+                # Language input is SmolVLA-only; ACT consumes task as a
+                # one-hot inside observation.state instead.
+                if policy_type == "smolvla":
+                    raw_obs["task"] = task_str
                 obs = pre(raw_obs)
                 with torch.no_grad():
                     actions = policy.predict_action_chunk(obs)
@@ -399,10 +526,21 @@ def main() -> int:
     for port, eps in eps_by_port.items():
         print(f"  {port}: {len(eps)} episodes")
 
-    rng = random.Random(args.seed)
+    print(f"\nbuilding video index from: {args.dataset_root / 'videos'}")
+    video_index = build_video_index(args.dataset_root)
+    cam_counts: dict[str, int] = {}
+    for (cam, _ep) in video_index:
+        cam_counts[cam] = cam_counts.get(cam, 0) + 1
+    print(f"  indexed {len(video_index)} (camera, episode) videos: {cam_counts}")
+    sample_keys = list(video_index)[:3]
+    if sample_keys:
+        print(f"  sample entries:")
+        for k in sample_keys:
+            print(f"    {k}: {video_index[k]}")
+
     for ckpt in ckpts:
         probe_one_checkpoint(
-            ckpt, args.dataset_root, eps_by_port,
+            ckpt, args.dataset_root, eps_by_port, video_index,
             tcp_z_values=list(args.tcp_z_values),
             n_images=args.n_images,
             rng=random.Random(args.seed),  # same images per checkpoint
