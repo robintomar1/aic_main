@@ -95,6 +95,13 @@ DEFAULT_TIMEOUT_S = 30.0
 LOOP_HZ = 20.0
 LOOP_PERIOD_S = 1.0 / LOOP_HZ
 
+# Z-advance filter: clamp action port-local z to no more than this many metres
+# above the current TCP port-local z.  In port-local frame, negative z = closer
+# to the port, so this prevents any action that would command the arm to retreat
+# upward past the current position.  2 mm allows for noise; set the env var
+# AIC_PL_SMOLVLA_Z_ADVANCE_LIMIT_M to override.
+Z_ADVANCE_LIMIT_DEFAULT_M = 0.002
+
 IMAGE_SCALING = 0.25  # 1152x1024 → 288x256 (matches dataset).
 
 TF_LOOKUP_TIMEOUT_S = 5.0
@@ -407,6 +414,11 @@ class RunSmolVLA(Policy):
     PER_CHUNK_SEED_ENV = "AIC_PL_SMOLVLA_PER_CHUNK_SEED"
     PER_CHUNK_SEED_DEFAULT = 0
 
+    # Z-advance filter: prevent the policy from commanding the arm to retreat
+    # above the current TCP port-local z.  Value is the tolerance in metres
+    # (positive = allow action z up to this much above current TCP z).
+    Z_ADVANCE_LIMIT_ENV = "AIC_PL_SMOLVLA_Z_ADVANCE_LIMIT_M"
+
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device(
@@ -513,6 +525,9 @@ class RunSmolVLA(Policy):
         else:
             self._per_chunk_seed = int(per_chunk_seed_raw)
 
+        z_lim_str = os.environ.get(self.Z_ADVANCE_LIMIT_ENV, "").strip()
+        self._z_advance_limit_m = float(z_lim_str) if z_lim_str else Z_ADVANCE_LIMIT_DEFAULT_M
+
         self.get_logger().info(
             f"RunSmolVLA loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
@@ -526,7 +541,8 @@ class RunSmolVLA(Policy):
             + (" (CONDITIONED: prev_action + depth + phase)"
                if self._uses_conditioning else " (baseline)")
             + f" [source={self._state_mode_source}] "
-            + f"per_chunk_seed={self._per_chunk_seed}"
+            + f"per_chunk_seed={self._per_chunk_seed} "
+            + f"z_advance_limit={self._z_advance_limit_m*1000:.1f}mm"
         )
 
     def _seed_before_inference(self) -> None:
@@ -851,6 +867,7 @@ class RunSmolVLA(Policy):
         start_t = self.time_now()
         ticks = 0
         none_obs_count = 0
+        z_filter_hits = 0
         LOG_EVERY_N = 10
         last_action_port: np.ndarray | None = None
         max_action_delta = 0.0
@@ -867,6 +884,9 @@ class RunSmolVLA(Policy):
                 port_type=task.port_type,
                 prev_action_port=last_action_port,
             )
+            # Capture port-local TCP z before the preprocessor normalises
+            # the state — used by the Z-advance filter below.
+            tcp_z_port = float(obs["observation.state"][2])
             obs = self.preprocessor(obs)
             # Reset RNG before each select_action so flow-matching's
             # noise is deterministic per (state, image). select_action
@@ -878,6 +898,24 @@ class RunSmolVLA(Policy):
                 action = self.policy.select_action(obs)
             action = self.postprocessor(action)
             a_port = action[0].cpu().numpy()[:7]  # SmolVLA pads to max_action_dim=32
+
+            # Z-advance filter: reject any action that would command the arm to
+            # retreat upward away from the port.  The port frame is ~180° around
+            # X relative to base_link, so port-local Z is INVERTED: less negative
+            # = closer to port (arm descending), more negative = farther from port
+            # (arm retreating up).  We block actions whose port-local z is more
+            # negative than the current TCP z by more than the tolerance.
+            if a_port[2] < tcp_z_port - self._z_advance_limit_m:
+                a_port = a_port.copy()
+                raw_z = a_port[2]
+                a_port[2] = tcp_z_port
+                z_filter_hits += 1
+                if z_filter_hits <= 5 or z_filter_hits % 50 == 0:
+                    self.get_logger().info(
+                        f"Z-filter hit #{z_filter_hits}: "
+                        f"blocked retreat a_port_z={raw_z:+.4f} → {tcp_z_port:+.4f} "
+                        f"(tcp_z={tcp_z_port:+.4f}, limit={self._z_advance_limit_m*1000:.1f}mm)"
+                    )
 
             pose = _action_port_to_baselink_pose(
                 a_port.astype(np.float64), port_pose,
@@ -911,7 +949,8 @@ class RunSmolVLA(Policy):
 
         self.get_logger().info(
             f"RunSmolVLA.insert_cable: exit after {ticks} ticks "
-            f"(none_obs={none_obs_count}, max_a_step_Δ={max_action_delta:.4f})"
+            f"(none_obs={none_obs_count}, max_a_step_Δ={max_action_delta:.4f}, "
+            f"z_filter_hits={z_filter_hits})"
         )
         return True
 
@@ -960,7 +999,7 @@ class RunSmolVLA(Policy):
         queue_lock = threading.Lock()
         stop_evt = threading.Event()
         err_box: list[BaseException] = []
-        stats = {"chunks": 0, "inference_ticks": 0}
+        stats = {"chunks": 0, "inference_ticks": 0, "z_filter_hits": 0}
         # Track the last consumer-dispatched port-local action so the
         # producer can feed it as prev_action when the model expects
         # conditioned state. Consumer updates under last_a_port_lock.
@@ -1019,6 +1058,21 @@ class RunSmolVLA(Policy):
                     for t in range(skip_n, chunk_size):
                         a_post = self.postprocessor(chunk[t : t + 1])
                         new_actions.append(a_post[0].detach().cpu())
+
+                    # Z-advance filter: clamp each action's port-local z to not
+                    # be more negative than obs_tcp_port_z - limit.  Port-local Z
+                    # is inverted vs base_link Z (port frame is ~180° around X),
+                    # so more negative = farther from port = arm going up.
+                    chunk_z_hits = 0
+                    for i in range(len(new_actions)):
+                        a_np = new_actions[i].numpy()
+                        if a_np[2] < obs_tcp_port_z - self._z_advance_limit_m:
+                            a_np = a_np.copy()
+                            a_np[2] = obs_tcp_port_z
+                            new_actions[i] = torch.from_numpy(a_np)
+                            chunk_z_hits += 1
+                    stats["z_filter_hits"] += chunk_z_hits
+
                     with queue_lock:
                         local_queue.extend(new_actions)
                     stats["chunks"] += 1
@@ -1037,7 +1091,8 @@ class RunSmolVLA(Policy):
                         f"obs_tcp_z={obs_tcp_port_z:+.3f} "
                         f"|F|_obs={obs_wrench_mag:.2f}N "
                         f"first_a_z={first_a_port_z:+.3f} "
-                        f"Δ(a-obs)={first_a_port_z - obs_tcp_port_z:+.3f}"
+                        f"Δ(a-obs)={first_a_port_z - obs_tcp_port_z:+.3f} "
+                        f"z_filtered={chunk_z_hits}/{len(new_actions)}"
                     )
                     # Z-trajectory sampled every 10 ticks; spans the FULL
                     # chunk (raw, before skip) so we can spot internal cycles.
@@ -1155,6 +1210,7 @@ class RunSmolVLA(Policy):
         self.get_logger().info(
             f"RunSmolVLA.insert_cable[SKIP_CHUNK]: exit after {ticks} ticks "
             f"(chunks={stats['chunks']}, inf_ticks={stats['inference_ticks']}, "
-            f"cold_ticks={none_obs_count}, max_a_step_Δ={max_a_step_delta:.4f})"
+            f"cold_ticks={none_obs_count}, max_a_step_Δ={max_a_step_delta:.4f}, "
+            f"z_filter_hits={stats['z_filter_hits']})"
         )
         return True
