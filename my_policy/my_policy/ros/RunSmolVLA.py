@@ -684,6 +684,54 @@ class RunSmolVLA(Policy):
             "task": task_str,
         }
 
+    def _publish_hold_current_pose(
+        self,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+    ) -> bool:
+        """Read the live TCP pose and publish it as a pose-command target.
+
+        Required at the start of every trial because the aic_controller
+        keeps tracking the LAST setpoint we published — once trial N ends
+        and the engine teleports the robot home between trials, the
+        controller still has trial N's last commanded pose as its target
+        and immediately drives back to it as soon as the new scene spawns.
+        Publishing the current observed TCP as a hold target overwrites
+        that stale setpoint with "where the robot currently is."
+
+        Returns True on success, False if no observation was available.
+        """
+        # Retry a few ticks because the eval container's observation stream
+        # may briefly be empty right after a scene reset.
+        obs_msg = None
+        for _ in range(10):
+            obs_msg = get_observation()
+            if obs_msg is not None:
+                break
+            self.sleep_for(0.02)
+        if obs_msg is None:
+            self.get_logger().warn(
+                "no observation available for hold-pose at trial start; "
+                "controller setpoint will remain whatever it was from the "
+                "previous trial until the model publishes its first action"
+            )
+            return False
+        cur = obs_msg.controller_state.tcp_pose
+        hold = Pose(
+            position=Point(x=cur.position.x, y=cur.position.y, z=cur.position.z),
+            orientation=Quaternion(
+                x=cur.orientation.x, y=cur.orientation.y,
+                z=cur.orientation.z, w=cur.orientation.w,
+            ),
+        )
+        self.set_pose_target(move_robot, hold, frame_id="base_link")
+        self.get_logger().info(
+            f"hold-pose published at trial start: "
+            f"({hold.position.x:+.3f}, {hold.position.y:+.3f}, "
+            f"{hold.position.z:+.3f}) — overwrites stale setpoint"
+        )
+        return True
+
     def _hard_reset_for_new_trial(self) -> None:
         """Flush every piece of state that could leak between trials.
 
@@ -746,6 +794,14 @@ class RunSmolVLA(Policy):
         # Step 2: hard reset — action queue + RNG + CUDA cache, not just
         # policy.reset() which leaves RNG state leaked from prior trial.
         self._hard_reset_for_new_trial()
+
+        # Step 2b: overwrite the controller's stale setpoint from the
+        # previous trial with the current (post-scene-reset) TCP pose.
+        # Without this, the engine's home-teleport happens AFTER our
+        # trial ended; the controller still has our last command in its
+        # setpoint queue and drives the robot back to that pose as soon
+        # as the new scene spawns.
+        self._publish_hold_current_pose(get_observation, move_robot)
 
         # Step 3: 20 Hz loop.
         start_t = self.time_now()
@@ -845,6 +901,9 @@ class RunSmolVLA(Policy):
 
         # Step 2: hard reset — action queue + RNG + CUDA cache.
         self._hard_reset_for_new_trial()
+
+        # Step 2b: overwrite controller's stale setpoint from previous trial.
+        self._publish_hold_current_pose(get_observation, move_robot)
 
         # Shared state — protected by queue_lock for thread safety.
         local_queue: list[torch.Tensor] = []
