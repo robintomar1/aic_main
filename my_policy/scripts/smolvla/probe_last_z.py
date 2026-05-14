@@ -151,6 +151,42 @@ def discover_episodes_by_port_type(dataset_root: Path) -> dict[str, list[int]]:
     return dict(out)
 
 
+def build_frame_index_by_port_z(
+    dataset_root: Path,
+    eps_by_port: dict[str, list[int]],
+    ep_info: dict[int, dict],
+) -> dict[str, list[tuple[int, int, float, np.ndarray]]]:
+    """Walk the dataset's data parquet and return, per port type, a list of
+    (episode_idx, local_frame_idx, recorded_tcp_z, full_state_26plus) tuples.
+
+    Used to filter frames by recorded tcp_z so the probe can pair an
+    image with a state from the SAME frame (no synthetic-state / random-
+    image mismatch).
+    """
+    import pyarrow.parquet as pq
+    data = pq.read_table(
+        str(dataset_root / "data" / "chunk-000" / "file-000.parquet"),
+        columns=["episode_index", "frame_index", "observation.state"],
+    ).to_pylist()
+
+    eps_to_port: dict[int, str] = {}
+    for port, eps in eps_by_port.items():
+        for e in eps:
+            eps_to_port[e] = port
+
+    out: dict[str, list[tuple[int, int, float, np.ndarray]]] = {"sc": [], "sfp": []}
+    for r in data:
+        ep = int(r["episode_index"])
+        port = eps_to_port.get(ep)
+        if port is None:
+            continue
+        state = np.asarray(r["observation.state"], dtype=np.float32)
+        tcp_z = float(state[2])
+        local_frame = int(r["frame_index"])
+        out[port].append((ep, local_frame, tcp_z, state))
+    return out
+
+
 def build_episode_index(dataset_root: Path) -> dict[int, dict]:
     """Returns {episode_idx: {'from_index': int, 'length': int}} by reading
     the per-episode meta parquet. Used to translate (ep, local_frame) into
@@ -385,8 +421,10 @@ def probe_one_checkpoint(
     eps_by_port: dict[str, list[int]],
     ep_info: dict[int, dict],
     ds_loader,
+    frame_index_by_port: dict[str, list[tuple[int, int, float, np.ndarray]]],
     tcp_z_values: list[float],
     n_images: int,
+    tol_m: float,
     rng: random.Random,
 ) -> None:
     print(f"\n{'=' * 78}\nCHECKPOINT: {ckpt.parent.name}/pretrained_model")
@@ -409,73 +447,85 @@ def probe_one_checkpoint(
           f"n_action_steps={n_action_steps_attr}  state_dim={state_dim}  "
           f"action_norm={action_mode}")
 
-    # Pre-sample N (episode, frame) image triplets for each port type.
-    image_samples: dict[str, list[dict[str, torch.Tensor]]] = {}
+    # Sweep — for each (port_type, target_tcp_z), filter dataset frames by
+    # recorded tcp_z to within tol_m, then sample N frames from that bucket.
+    # We feed each frame's REAL recorded state and REAL image — no more
+    # synthetic-state / random-image mismatch.
     for port_type in ("sc", "sfp"):
-        eps_pool = eps_by_port.get(port_type, [])
-        if not eps_pool:
-            print(f"  no episodes for port_type={port_type}; skipping")
-            image_samples[port_type] = []
-            continue
-        samples: list[dict[str, torch.Tensor]] = []
-        for _ in range(n_images):
-            ep = rng.choice(eps_pool)
-            try:
-                ep_len = episode_length(ep_info, ep)
-            except KeyError:
-                print(f"  WARN: ep={ep} not in episode index; skipping sample")
-                continue
-            frame_idx = rng.randint(0, max(0, ep_len - 1))
-            try:
-                imgs = fetch_camera_frames(ds_loader, ep_info, ep, frame_idx)
-            except Exception as e:
-                print(f"  WARN: failed to fetch ep={ep} frame={frame_idx}: {e}")
-                imgs = {
-                    f"observation.images.{cam}":
-                        torch.zeros(1, 3, 256, 288, device="cuda")
-                    for cam in ("left_camera", "center_camera", "right_camera")
-                }
-            samples.append(imgs)
-        image_samples[port_type] = samples
-
-    # Sweep.
-    for port_type in ("sc", "sfp"):
-        if not image_samples[port_type]:
+        frames = frame_index_by_port.get(port_type, [])
+        if not frames:
+            print(f"  no frames for port_type={port_type}; skipping")
             continue
         offset = PORT_OFFSETS[port_type]
+        all_z = np.array([f[2] for f in frames])
         print()
         print(f"  --- port_type={port_type}  entrance_offset={offset:+.5f}m  "
-              f"n_images={len(image_samples[port_type])} ---")
-        header = (f"  {'obs.tcp_z':>10} | "
-                  f"{'raw_z[max] μ±σ':>18} {'raw_z[-1] μ±σ':>18} | "
+              f"dataset z range=[{all_z.min():+.4f}, {all_z.max():+.4f}]  "
+              f"tol=±{int(tol_m*1000)}mm ---")
+        header = (f"  {'tgt tcp_z':>9} {'avail':>5} {'used':>4} | "
+                  f"{'recorded_z μ±σ':>16} {'raw_z[max] μ±σ':>17} "
+                  f"{'raw_z[-1] μ±σ':>17} | "
                   f"{'un_z[-1] μ±σ (m)':>22}")
         print(header)
         print("  " + "-" * (len(header) - 2))
         task_str = DEFAULT_TASK_STR[port_type]
-        for tcp_z in tcp_z_values:
-            state = make_state(policy_type, state_dim, tcp_z, port_type)
-            raw_maxs = []
-            raw_lasts = []
-            un_lasts = []
-            for imgs in image_samples[port_type]:
-                raw_obs = {**imgs, "observation.state": state}
-                # Language input is SmolVLA-only; ACT consumes task as a
-                # one-hot inside observation.state instead.
+
+        for tcp_z_target in tcp_z_values:
+            # Filter frames by recorded tcp_z proximity to target.
+            bucket = [f for f in frames if abs(f[2] - tcp_z_target) <= tol_m]
+            if not bucket:
+                print(f"  {tcp_z_target:+9.3f}  {0:>5}  {0:>4} | "
+                      f"--- OOD (no frames within ±{int(tol_m*1000)}mm) ---")
+                continue
+            # Sample (without replacement when possible).
+            n_used = min(n_images, len(bucket))
+            chosen = rng.sample(bucket, n_used)
+
+            recorded_zs = []
+            raw_maxs, raw_lasts, un_lasts = [], [], []
+            for ep, local_frame, rec_z, rec_state in chosen:
+                try:
+                    imgs = fetch_camera_frames(ds_loader, ep_info, ep, local_frame)
+                except Exception as e:
+                    print(f"  WARN: failed to fetch ep={ep} fr={local_frame}: {e}")
+                    continue
+                # Use the FULL recorded state — it matches the image's
+                # actual TCP altitude AND has correct joint/velocity/
+                # wrench values, so this is the model's true training
+                # distribution.
+                if rec_state.shape[0] != state_dim:
+                    raise SystemExit(
+                        f"\nFATAL: dataset state_dim {rec_state.shape[0]} "
+                        f"does not match model state_dim {state_dim}.\n"
+                        f"Model was trained on a dataset whose state shape "
+                        f"is [{state_dim}]; point --dataset-root at THAT "
+                        f"dataset (likely the '_cond' variant if your "
+                        f"model is conditioned).\n"
+                        f"Current --dataset-root: {dataset_root}"
+                    )
+                state_t = torch.from_numpy(rec_state.astype(np.float32)).unsqueeze(0).cuda()
+                raw_obs = {**imgs, "observation.state": state_t}
                 if policy_type == "smolvla":
                     raw_obs["task"] = task_str
                 obs = pre(raw_obs)
                 with torch.no_grad():
                     actions = policy.predict_action_chunk(obs)
                 az = actions[0, :, 2].cpu().numpy()
+                recorded_zs.append(rec_z)
                 raw_maxs.append(float(az.max()))
                 raw_lasts.append(float(az[-1]))
                 un_lasts.append(unnorm_fn(float(az[-1])))
+
+            if not raw_maxs:
+                continue
+            rec_m, rec_s = float(np.mean(recorded_zs)), float(np.std(recorded_zs))
             rmax_m, rmax_s = float(np.mean(raw_maxs)), float(np.std(raw_maxs))
             rlast_m, rlast_s = float(np.mean(raw_lasts)), float(np.std(raw_lasts))
             ulast_m, ulast_s = float(np.mean(un_lasts)), float(np.std(un_lasts))
-            print(f"  {tcp_z:+10.3f} | "
-                  f"{rmax_m:+8.3f}±{rmax_s:.3f}    "
-                  f"{rlast_m:+8.3f}±{rlast_s:.3f}   | "
+            print(f"  {tcp_z_target:+9.3f}  {len(bucket):>5}  {n_used:>4} | "
+                  f"{rec_m:+7.3f}±{rec_s:.3f}  "
+                  f"{rmax_m:+7.3f}±{rmax_s:.3f}   "
+                  f"{rlast_m:+7.3f}±{rlast_s:.3f}   | "
                   f"{ulast_m:+10.4f}±{ulast_s:.4f}")
 
     # Free GPU memory before the next checkpoint loads.
@@ -503,8 +553,12 @@ def main() -> int:
                         "across checkpoints so direct comparison is meaningful.")
     p.add_argument(
         "--tcp-z-values", type=float, nargs="+", default=list(DEFAULT_TCP_Z_SWEEP),
-        help=f"Port-local tcp_z values to sweep. Default {list(DEFAULT_TCP_Z_SWEEP)}.",
+        help=f"Port-local tcp_z TARGETS to sweep. Default {list(DEFAULT_TCP_Z_SWEEP)}.",
     )
+    p.add_argument("--tol-mm", type=float, default=10.0,
+                   help="Tolerance (mm) around each target tcp_z when filtering "
+                        "dataset frames. Default 10mm. Larger = more frames per "
+                        "bucket, more averaging.")
     args = p.parse_args()
 
     if not args.dataset_root.is_dir():
@@ -532,12 +586,26 @@ def main() -> int:
     ds_loader = make_dataset_loader(args.dataset_root)
     print(f"  total frames in dataset: {len(ds_loader)}")
 
+    print(f"\nbuilding per-frame index by port type + recorded tcp_z")
+    frame_index_by_port = build_frame_index_by_port_z(
+        args.dataset_root, eps_by_port, ep_info,
+    )
+    for port, frames in frame_index_by_port.items():
+        zs = np.array([f[2] for f in frames])
+        if len(zs):
+            print(f"  {port}: {len(frames)} frames, "
+                  f"tcp_z range=[{zs.min():+.4f}, {zs.max():+.4f}]")
+
+    tol_m = args.tol_mm / 1000.0
+
     for ckpt in ckpts:
         probe_one_checkpoint(
             ckpt, args.dataset_root, eps_by_port, ep_info, ds_loader,
+            frame_index_by_port=frame_index_by_port,
             tcp_z_values=list(args.tcp_z_values),
             n_images=args.n_images,
-            rng=random.Random(args.seed),  # same images per checkpoint
+            tol_m=tol_m,
+            rng=random.Random(args.seed),  # same samples per checkpoint
         )
     return 0
 
