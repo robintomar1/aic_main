@@ -23,9 +23,9 @@ Setup (one-time, inside pixi):
     pixi run pip install trackio
 
 Run (inside the dev container at ~/ws_aic/src/aic):
-    pixi run python my_policy/scripts/train_act.py --name v9_act_v1
+    pixi run python my_policy/scripts/act/train_act.py --name v9_act_v1
     # to resume from <output-root>/<name>/ when an existing checkpoint exists:
-    pixi run python my_policy/scripts/train_act.py --name v9_act_v1 --resume
+    pixi run python my_policy/scripts/act/train_act.py --name v9_act_v1 --resume
 
 Dataset (verified from meta/info.json on 2026-05-04):
   - 426 episodes / 198,766 frames @ 20 Hz (340 train / 86 val)

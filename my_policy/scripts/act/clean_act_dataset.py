@@ -32,7 +32,7 @@ After both transforms:
 Pure pyarrow + numpy. No torch / lerobot dependency. Run anywhere.
 
 Usage:
-    python3 my_policy/scripts/clean_act_dataset.py \\
+    python3 my_policy/scripts/act/clean_act_dataset.py \\
         --src /root/aic_data/v9_act_build/v9_act_merged \\
         --dst /root/aic_data/v9_act_build/v9_act_merged_clean
 """

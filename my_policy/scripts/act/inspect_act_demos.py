@@ -21,7 +21,7 @@ Output:
   stdout: summary table per batch + per-task-type breakdown.
 
 Run:
-    python3 my_policy/scripts/inspect_act_demos.py \\
+    python3 my_policy/scripts/act/inspect_act_demos.py \\
         --collection-dir /root/aic_data \\
         --batches batch_100_a batch_100_b batch_100_c batch_100_d batch_100_e
 

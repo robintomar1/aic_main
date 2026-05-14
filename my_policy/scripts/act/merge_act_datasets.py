@@ -25,7 +25,7 @@ Pure pyarrow + numpy + json. No torch / lerobot. Run inside or outside
 pixi.
 
 Usage:
-    python3 my_policy/scripts/merge_act_datasets.py \\
+    python3 my_policy/scripts/act/merge_act_datasets.py \\
         --sources /tmp/v9_act_build/batch_100_a_act_dataset \\
                   /tmp/v9_act_build/batch_100_b_act_dataset \\
                   /tmp/v9_act_build/batch_500_a_act_dataset \\

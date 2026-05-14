@@ -23,7 +23,7 @@ splits already had (i.e. an episode that was in train remains in train) —
 only filters out episodes whose task doesn't match.
 
 Run:
-    python3 my_policy/scripts/make_task_filtered_splits.py \\
+    python3 my_policy/scripts/act/make_task_filtered_splits.py \\
         --dataset-root /root/aic_data/v9_act_build/v9_act_merged_clean \\
         --task-contains "sc plug" \\
         --out-dir /root/aic_data/v9_act_build/v9_act_merged_clean

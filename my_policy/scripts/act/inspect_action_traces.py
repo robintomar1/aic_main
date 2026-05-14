@@ -8,7 +8,7 @@ If the action z descends but the model output stays high, it's a model
 training failure — fix is in training.
 
 Run:
-    pixi run python my_policy/scripts/inspect_action_traces.py
+    pixi run python my_policy/scripts/act/inspect_action_traces.py
 """
 from __future__ import annotations
 

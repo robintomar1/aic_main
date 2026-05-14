@@ -4,7 +4,7 @@
 No torch / lerobot / rclpy — pure numpy. Verifies the 12-dim structured
 task vector for shape, coverage, and round-trip correctness.
 
-Run: `python3 my_policy/scripts/test_act_labels.py`
+Run: `python3 my_policy/scripts/act/test_act_labels.py`
 """
 from __future__ import annotations
 

@@ -16,7 +16,7 @@ This script:
   5. Writes `meta/stats.json` via lerobot's `write_stats`.
 
 Run:
-    pixi run python my_policy/scripts/aggregate_act_stats.py \\
+    pixi run python my_policy/scripts/act/aggregate_act_stats.py \\
         --root /root/aic_data/v9_act_build/v9_act_merged
 """
 from __future__ import annotations

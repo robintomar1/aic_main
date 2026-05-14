@@ -173,7 +173,7 @@ None of these is proven to fix the model — they are hypotheses backed by failu
 
 **R4. Soften Z stiffness during INSERT (compliance descent).** Listed in `project_aic_oracle_policy.md` as an unbuilt candidate. Bypass `set_pose_target` and construct `MotionUpdate` with reduced Z stiffness so the plug finds the port via mechanical compliance rather than rigid commanded descent. Two payoffs: (a) INSERT becomes robust to small XY misalignment (plug slides along chamfer instead of jamming or triggering force gate), (b) the *recorded action target* becomes meaningful in itself — under low Z stiffness, the action represents a "soft pull toward this point", which is closer to what the model can learn to predict than "rigid command target".
 
-**R5. Publish action targets at 20 Hz with linear interpolation between waypoints.** Currently the oracle publishes pose targets at a lower rate during APPROACH; the recorder samples at 20 Hz, producing the 4-frame stair-step pattern (~5–10 mm jumps every 4 frames). Publishing at full 20 Hz with linear interpolation removes the stair-steps. SmolVLA learned through these on SFP, but they add noise that competes with the actual signal and they amplify the SC discontinuity problem. Verify with `pixi run python my_policy/scripts/inspect_action_traces.py <recording>` first to confirm the stair-step pattern is still present in current code.
+**R5. Publish action targets at 20 Hz with linear interpolation between waypoints.** Currently the oracle publishes pose targets at a lower rate during APPROACH; the recorder samples at 20 Hz, producing the 4-frame stair-step pattern (~5–10 mm jumps every 4 frames). Publishing at full 20 Hz with linear interpolation removes the stair-steps. SmolVLA learned through these on SFP, but they add noise that competes with the actual signal and they amplify the SC discontinuity problem. Verify with `pixi run python my_policy/scripts/act/inspect_action_traces.py <recording>` first to confirm the stair-step pattern is still present in current code.
 
 ### Tier 3 — verification, not modification
 
@@ -375,7 +375,7 @@ All builders are pure pyarrow + numpy + yaml — no torch/lerobot at preprocess 
 ### 10.1 Episode classification (clean vs messy)
 
 ```bash
-pixi run python my_policy/scripts/inspect_act_demos.py --batch <batch> --out /root/aic_data/v9_act_build/<batch>_act_clean_episodes.json
+pixi run python my_policy/scripts/act/inspect_act_demos.py --batch <batch> --out /root/aic_data/v9_act_build/<batch>_act_clean_episodes.json
 ```
 
 Episode is `messy` if:
@@ -388,7 +388,7 @@ Empirical rate across 6 batches: **80.5% clean**.
 ### 10.2 Build per-batch ACT dataset
 
 ```bash
-pixi run python my_policy/scripts/build_act_dataset.py --batch <batch> --clean-episodes-json <...>_clean_episodes.json
+pixi run python my_policy/scripts/act/build_act_dataset.py --batch <batch> --clean-episodes-json <...>_clean_episodes.json
 ```
 
 Produces `<batch>_act_dataset/` with 44-dim observation.state and 7-dim action. **Note (§8.4):** `tasks.parquet` here is NOT string-indexed. Fine for ACT, broken for SmolVLA.
@@ -396,7 +396,7 @@ Produces `<batch>_act_dataset/` with 44-dim observation.state and 7-dim action. 
 ### 10.3 Merge batches
 
 ```bash
-pixi run python my_policy/scripts/merge_act_datasets.py --sources <batch_a>_act_dataset <batch_b>_act_dataset ... --out v9_act_merged
+pixi run python my_policy/scripts/act/merge_act_datasets.py --sources <batch_a>_act_dataset <batch_b>_act_dataset ... --out v9_act_merged
 ```
 
 Verifies `tasks.parquet` is identical across sources (it should be — 12 entries indexed by `ACT_VALID_TARGETS`). Fails fast if not.
@@ -404,7 +404,7 @@ Verifies `tasks.parquet` is identical across sources (it should be — 12 entrie
 ### 10.4 Clean (stale leading frames + quat sign)
 
 ```bash
-pixi run python my_policy/scripts/clean_act_dataset.py --src v9_act_merged --dst v9_act_merged_clean
+pixi run python my_policy/scripts/act/clean_act_dataset.py --src v9_act_merged --dst v9_act_merged_clean
 ```
 
 Two fixes (both required, both implemented in `dataset_io.patch_stale_leading_actions` + builder quat handling):
@@ -504,10 +504,10 @@ docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_p
 docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/viz_dataset.py --repo-id local/inspect --root /root/aic_data/<batch>_run --episode-index 0 --num-workers 0'
 
 # ---------- Build pipeline ----------
-docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/inspect_act_demos.py --batch <batch> --out /root/aic_data/v9_act_build/<batch>_act_clean_episodes.json'
-docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/build_act_dataset.py --batch <batch> --clean-episodes-json /root/aic_data/v9_act_build/<batch>_act_clean_episodes.json'
-docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/merge_act_datasets.py --sources <batch_a>_act_dataset <batch_b>_act_dataset --out v9_act_merged'
-docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/clean_act_dataset.py --src v9_act_merged --dst v9_act_merged_clean'
+docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/act/inspect_act_demos.py --batch <batch> --out /root/aic_data/v9_act_build/<batch>_act_clean_episodes.json'
+docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/act/build_act_dataset.py --batch <batch> --clean-episodes-json /root/aic_data/v9_act_build/<batch>_act_clean_episodes.json'
+docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/act/merge_act_datasets.py --sources <batch_a>_act_dataset <batch_b>_act_dataset --out v9_act_merged'
+docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/act/clean_act_dataset.py --src v9_act_merged --dst v9_act_merged_clean'
 
 # (Optional) port-local + smolvla variants
 docker compose exec dev bash -c 'cd /root/ws_aic/src/aic && pixi run python my_policy/scripts/make_port_local_dataset.py --src v9_act_merged_clean --dst v9_port_local_dataset'

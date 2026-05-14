@@ -28,8 +28,8 @@ Three tiers (ALL must pass before bringing up docker compose):
     treat the result as a lower bound.
 
 Run:
-    pixi run python my_policy/scripts/test_runact_offline.py
-    pixi run python my_policy/scripts/test_runact_offline.py --skip-tier2 --skip-tier3
+    pixi run python my_policy/scripts/act/test_runact_offline.py
+    pixi run python my_policy/scripts/act/test_runact_offline.py --skip-tier2 --skip-tier3
 """
 from __future__ import annotations
 

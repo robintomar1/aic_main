@@ -22,7 +22,7 @@ The recorder already saved 354 episodes / ~172k frames across `batch_100_a..e` w
 
 ACT can only learn what's in the demos. Of the 354 saved trials, some inserted via a clean approach-align-descend sequence; others recovered via the force-gate retreat cycle and/or the spiral search. The messy ones teach the model to wiggle arbitrarily during INSERT — a real failure mode.
 
-Write a one-shot inspection script `my_policy/scripts/inspect_act_demos.py` that walks each saved episode's actions + force history and tags it as:
+Write a one-shot inspection script `my_policy/scripts/act/inspect_act_demos.py` that walks each saved episode's actions + force history and tags it as:
 - **clean**: zero force-gate engagements (peak force never crossed `FORCE_STOP_N=18N` for >250ms), zero spiral activations.
 - **messy**: had at least one force-gate retreat cycle or spiral engagement.
 
@@ -64,7 +64,7 @@ target_module_one_hot (7) || port_in_module_one_hot (3) || port_type_one_hot (2)
 
 Define this as `ACT_TASK_VECTOR_LAYOUT` in a new module `my_policy/my_policy/act/labels.py` (parallel to `localizer/labels.py`). New file rather than extending the localizer's labels.py because the vector is deliberately ACT-specific and the localizer code shouldn't grow a dependency on it. Encoded deterministically from the known module/port topology — future port additions = explicit edit, never auto-derived from a YAML.
 
-**Decision:** add the 12-dim task vector at training-time as a dataset transform (cheaper than re-recording). Build a preprocessing script `my_policy/scripts/build_act_dataset.py` that:
+**Decision:** add the 12-dim task vector at training-time as a dataset transform (cheaper than re-recording). Build a preprocessing script `my_policy/scripts/act/build_act_dataset.py` that:
 - Reads the YAML + summary.json for each batch.
 - Joins via `match_episodes_to_trials` (already in `my_policy/localizer/labels.py`) to map episode_index → `(target_module_name, port_name, port_type)`.
 - Emits the 12-dim structured task vector per frame using `ACT_TASK_VECTOR_LAYOUT`.
@@ -233,8 +233,8 @@ If D2 hits target:
 
 ### New
 - `my_policy/my_policy/act/__init__.py`, `my_policy/my_policy/act/labels.py` — new subpackage holding `ACT_TASK_VECTOR_LAYOUT` and the `(target_module, port_name) → 12-dim vector` builder. Imported by both training preprocessor and inference shim so they can never drift.
-- `my_policy/scripts/inspect_act_demos.py` — Phase A0 clean-vs-messy demo classifier; writes `clean_episodes.json` / `messy_episodes.json` per batch.
-- `my_policy/scripts/build_act_dataset.py` — one-shot preprocess: existing recorder dataset → ACT-augmented dataset (44-dim state with the 12-dim task vector + tcp_error included; per-episode `task` string populated; `train_episodes.json` / `val_episodes.json` written using seed=42 episode split).
+- `my_policy/scripts/act/inspect_act_demos.py` — Phase A0 clean-vs-messy demo classifier; writes `clean_episodes.json` / `messy_episodes.json` per batch.
+- `my_policy/scripts/act/build_act_dataset.py` — one-shot preprocess: existing recorder dataset → ACT-augmented dataset (44-dim state with the 12-dim task vector + tcp_error included; per-episode `task` string populated; `train_episodes.json` / `val_episodes.json` written using seed=42 episode split).
 - `my_policy/my_policy/ros/RunACT.py` — our inference shim (forked from `aic_example_policies/aic_example_policies/ros/RunACT.py`, load our checkpoint, use pose targets, add task conditioning, normalize predicted quat).
 - `my_policy/scripts/test_run_act_inference.py` — host-runnable smoke test mocking the framework, verifies action shapes / no NaNs / quat magnitude ≈ 1 after normalization.
 

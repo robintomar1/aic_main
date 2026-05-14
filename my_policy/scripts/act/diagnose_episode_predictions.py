@@ -37,7 +37,7 @@ Pick the val_episodes the dataset has so we don't evaluate on training
 frames the model memorized.
 
 Usage:
-    pixi run python my_policy/scripts/diagnose_episode_predictions.py \\
+    pixi run python my_policy/scripts/act/diagnose_episode_predictions.py \\
         --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_pl_v2/checkpoints/100000/pretrained_model \\
         --dataset-root /root/aic_data/v9_act_build/v9_port_local_merged_clean \\
         --val-episodes-file /root/aic_data/v9_act_build/v9_port_local_merged/val_episodes.json \\

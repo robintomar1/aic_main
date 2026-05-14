@@ -31,7 +31,7 @@ Pure pyarrow + numpy + json + yaml; no torch / lerobot needed at preprocess
 time. Run inside or outside pixi.
 
 Usage:
-    python3 my_policy/scripts/build_act_dataset.py \\
+    python3 my_policy/scripts/act/build_act_dataset.py \\
         --collection-dir /root/aic_data \\
         --batch batch_100_a \\
         --out-root /root/aic_data \\

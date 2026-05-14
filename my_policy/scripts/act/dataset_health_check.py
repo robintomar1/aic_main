@@ -15,9 +15,9 @@ issues that silently corrupt IL training:
   * action-z range per episode (tells us which demos descend)
 
 Run:
-    pixi run python my_policy/scripts/dataset_health_check.py
+    pixi run python my_policy/scripts/act/dataset_health_check.py
     # or, since this needs no lerobot:
-    python3 my_policy/scripts/dataset_health_check.py
+    python3 my_policy/scripts/act/dataset_health_check.py
 """
 from __future__ import annotations
 

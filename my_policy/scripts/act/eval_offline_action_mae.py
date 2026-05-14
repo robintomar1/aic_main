@@ -24,14 +24,14 @@ per-episode in ACT). Within an episode, frames are consumed in order so
 the queued action chunks remain coherent.
 
 Usage:
-    pixi run python my_policy/scripts/eval_offline_action_mae.py \\
+    pixi run python my_policy/scripts/act/eval_offline_action_mae.py \\
         --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_act_v1/checkpoints/010000/pretrained_model \\
         --dataset-root /root/aic_data/v9_act_build/v9_act_merged_clean \\
         --val-episodes-file /root/aic_data/v9_act_build/v9_act_merged_clean/val_episodes.json \\
         --json-out /tmp/v9_act_v1_step10k_val_mae.json
 
     # then for port-local:
-    pixi run python my_policy/scripts/eval_offline_action_mae.py \\
+    pixi run python my_policy/scripts/act/eval_offline_action_mae.py \\
         --checkpoint-dir /root/aic_data/v9_act_build/runs/v9_pl_v1/checkpoints/010000/pretrained_model \\
         --dataset-root /root/aic_data/v9_act_build/v9_port_local_merged \\
         --val-episodes-file /root/aic_data/v9_act_build/v9_port_local_merged/val_episodes.json \\
