@@ -3,13 +3,13 @@
 
 Input: a dataset produced by `build_act_dataset.py` or `merge_act_datasets.py`.
 Must have 44-dim `observation.state` (channels 0..6 = tcp_pose, 32..43 = task
-vec) and the three cameras `observation.images.{left,center,right}`.
+vec) and the three cameras `observation.images.{left_camera,center_camera,right_camera}`.
 
 Output: a lerobot-compatible dataset with:
   - `observation.state`  shape [19] = tcp_pose (7) + task_vec (12)
        (drops: tcp_velocity, tcp_error, joint_positions, wrench)
-  - `observation.images.center`, `observation.images.right`
-       (drops: `observation.images.left`)
+  - `observation.images.center_camera`, `observation.images.right_camera`
+       (drops: `observation.images.left_camera`)
   - `action` [7]  — unchanged
   - All episodes kept; episode_index / global index unchanged.
   - `meta/tasks.parquet`, `train_episodes.json`, `val_episodes.json`
@@ -49,7 +49,7 @@ KEEP_STATE_INDICES: list[int] = list(range(0, 7)) + list(range(32, 44))
 SLIM_STATE_DIM = len(KEEP_STATE_INDICES)
 assert SLIM_STATE_DIM == 19
 
-DROP_CAMERAS: set[str] = {"observation.images.left"}
+DROP_CAMERAS: set[str] = {"observation.images.left_camera"}
 
 
 def per_episode_stats(values: np.ndarray) -> dict:
