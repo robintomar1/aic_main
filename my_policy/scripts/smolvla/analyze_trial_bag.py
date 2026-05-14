@@ -55,7 +55,9 @@ def _ros_imports():
     from rosbag2_py import (
         SequentialReader, StorageOptions, ConverterOptions,
     )
-    return deserialize_message, get_message, SequentialReader, StorageOptions, ConverterOptions
+    import tf2_ros
+    return (deserialize_message, get_message, SequentialReader,
+            StorageOptions, ConverterOptions, tf2_ros)
 
 
 def _model_imports():
@@ -335,7 +337,8 @@ def main() -> int:
         print(f"Action norm = MEAN_STD  (mean={m:+.5f}, std={sd:+.5f})")
 
     # --- bag open ---------------------------------------------------------
-    deserialize_message, get_message, SequentialReader, StorageOptions, ConverterOptions = _ros_imports()
+    (deserialize_message, get_message, SequentialReader,
+     StorageOptions, ConverterOptions, tf2_ros) = _ros_imports()
     reader = SequentialReader()
     storage_id = "mcap" if any(args.bag.glob("*.mcap")) else "sqlite3"
     reader.open(
@@ -359,53 +362,70 @@ def main() -> int:
           + ("" if has_joint_states_topic
              else "  (no /joint_states topic; will rely on /observations.joint_states only)"))
 
-    # --- pass 1: find port pose ------------------------------------------
-    port_pose_bl = None
-    port_frame_name = args.port_frame
-    print(f"\nScanning /tf and /tf_static for port frame…")
-    # Auto-detection must mirror what RunSmolVLA picks up at inference:
-    #   `task_board/<module>/<port_name>_link`  (NOT `_link_entrance`,
-    #   which is a child frame offset by the entrance distance — using it
-    #   shifts port-local tcp_z by ~15-46 mm and the model sees the wrong
-    #   frame).
-    # Heuristic: child must START WITH task_board/, END WITH _link, and
-    # NOT contain `_link_entrance` or `_link_plug_anchor`.
-    def _is_target_port_link(child: str) -> bool:
-        if not child.startswith("task_board/"):
-            return False
-        if not child.endswith("_link"):
-            return False
-        # Defensive: reject any suffixed link variants.
-        for suffix in ("_link_entrance", "_link_plug_anchor"):
-            if suffix in child:
-                return False
-        return True
-
-    while reader.has_next() and port_pose_bl is None:
+    # --- pass 1: build TF buffer, resolve base_link → port composition ---
+    # The simple "grab first TF whose child matches *_link" approach is wrong:
+    # /tf carries PARENT→CHILD transforms in each segment's local frame, so
+    # picking one entry gives us only that segment, not the cumulative
+    # `base_link → port` we need. RunSmolVLA uses tf2_ros.Buffer.lookup_transform
+    # which walks the tree; we do the same here.
+    print(f"\nBuilding TF buffer from /tf and /tf_static…")
+    from rclpy.duration import Duration as _RclDuration
+    # Large cache so dynamic transforms recorded throughout the bag remain
+    # available when we look up at t=0 (the lookup uses latest-available
+    # behavior with Time() but the buffer still trims by cache_time).
+    tf_buffer = tf2_ros.Buffer(cache_time=_RclDuration(seconds=3600))
+    n_static = 0
+    n_dynamic = 0
+    candidate_port_frames: set[str] = set()
+    while reader.has_next():
         topic, data, t_ns = reader.read_next()
         if topic not in ("/tf", "/tf_static"):
             continue
         msg = deserialize_message(data, msg_classes[topic])
+        is_static = (topic == "/tf_static")
         for tf in msg.transforms:
-            child = tf.child_frame_id
-            if port_frame_name is not None:
-                if child != port_frame_name:
-                    continue
+            if is_static:
+                tf_buffer.set_transform_static(tf, "bag_replay")
+                n_static += 1
             else:
-                if not _is_target_port_link(child):
-                    continue
-            tr = tf.transform.translation; rot = tf.transform.rotation
-            port_pose_bl = (
-                np.array([tr.x, tr.y, tr.z]),
-                np.array([rot.x, rot.y, rot.z, rot.w]),
-            )
-            port_frame_name = child
-            print(f"  found port frame: {child} → "
-                  f"xyz=({tr.x:+.4f},{tr.y:+.4f},{tr.z:+.4f}) "
-                  f"q=({rot.x:+.3f},{rot.y:+.3f},{rot.z:+.3f},{rot.w:+.3f})")
-            break
-    if port_pose_bl is None:
-        raise SystemExit("could not find port frame in /tf or /tf_static")
+                tf_buffer.set_transform(tf, "bag_replay")
+                n_dynamic += 1
+            child = tf.child_frame_id
+            if (child.startswith("task_board/") and child.endswith("_link")
+                    and "_link_entrance" not in child
+                    and "_link_plug_anchor" not in child):
+                candidate_port_frames.add(child)
+    print(f"  ingested {n_static} static + {n_dynamic} dynamic transforms")
+    print(f"  candidate port frames: {sorted(candidate_port_frames)}")
+
+    port_frame_name = args.port_frame
+    if port_frame_name is None:
+        if not candidate_port_frames:
+            raise SystemExit("no task_board/.../<port>_link frames in TF")
+        # Prefer one matching the requested port type if obvious.
+        match = [f for f in candidate_port_frames if args.port_type in f.lower()]
+        port_frame_name = sorted(match or candidate_port_frames)[0]
+        if len(candidate_port_frames) > 1:
+            print(f"  WARN: multiple candidate ports; picked '{port_frame_name}' "
+                  f"(use --port-frame to override).")
+
+    # Look up the composed base_link → port_frame transform.
+    from rclpy.time import Time as _RclTime
+    try:
+        stamped = tf_buffer.lookup_transform(
+            "base_link", port_frame_name, _RclTime(),
+        )
+    except Exception as ex:
+        raise SystemExit(f"tf2 lookup base_link → {port_frame_name} failed: {ex}")
+    tr = stamped.transform.translation
+    rot = stamped.transform.rotation
+    port_pose_bl = (
+        np.array([tr.x, tr.y, tr.z]),
+        np.array([rot.x, rot.y, rot.z, rot.w]),
+    )
+    print(f"  composed base_link → {port_frame_name}: "
+          f"xyz=({tr.x:+.4f},{tr.y:+.4f},{tr.z:+.4f}) "
+          f"q=({rot.x:+.3f},{rot.y:+.3f},{rot.z:+.3f},{rot.w:+.3f})")
 
     # Re-open reader for full pass.
     del reader
