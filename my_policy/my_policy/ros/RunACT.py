@@ -74,10 +74,6 @@ from lerobot.processor.converters import (
 from my_policy.act.labels import encode_task_vector
 
 
-DEFAULT_CHECKPOINT = (
-    "/root/aic_data/v9_act_build/runs/v9_act_v1/checkpoints/last/pretrained_model"
-)
-DEFAULT_TIMEOUT_S = 30.0
 LOOP_HZ = 20.0
 IMAGE_SCALING = 0.25  # 1152x1024 native → 288x256 (matches dataset)
 
@@ -218,11 +214,18 @@ def _action_to_pose(action7: np.ndarray) -> Pose:
 
 
 class RunACT(Policy):
+    # Class-level defaults so subclasses (e.g. RunACTSlim) can override
+    # without duplicating the rest of __init__.
+    DEFAULT_CHECKPOINT: str = (
+        "/root/aic_data/v9_act_build/runs/v9_act_v1/checkpoints/last/pretrained_model"
+    )
+    DEFAULT_TIMEOUT_S: float = 30.0
+
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        ckpt_dir = Path(os.environ.get("AIC_ACT_CHECKPOINT", DEFAULT_CHECKPOINT))
+        ckpt_dir = Path(os.environ.get("AIC_ACT_CHECKPOINT", self.DEFAULT_CHECKPOINT))
         if not ckpt_dir.exists():
             raise FileNotFoundError(
                 f"AIC_ACT_CHECKPOINT not found: {ckpt_dir}. "
@@ -257,11 +260,11 @@ class RunACT(Policy):
             to_output=transition_to_policy_action,
         )
 
-        self.timeout_s = float(os.environ.get("AIC_ACT_TIMEOUT_S", DEFAULT_TIMEOUT_S))
+        self.timeout_s = float(os.environ.get("AIC_ACT_TIMEOUT_S", self.DEFAULT_TIMEOUT_S))
         self.loop_period_s = 1.0 / LOOP_HZ
 
         self.get_logger().info(
-            f"RunACT loaded checkpoint={ckpt_dir} device={self.device} "
+            f"{type(self).__name__} loaded checkpoint={ckpt_dir} device={self.device} "
             f"loop={LOOP_HZ}Hz timeout={self.timeout_s}s "
             f"temporal_ensemble_coeff={temporal_ensemble_coeff}"
         )

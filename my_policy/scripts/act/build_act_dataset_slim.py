@@ -241,6 +241,16 @@ def main() -> int:
             shutil.copy(src_split, out / fname)
             print(f"copied {fname}")
 
+    # --- 7. dataset-level stats.json (lerobot's make_dataset needs this)---
+    # Imported here so the rest of the script stays lerobot-free; if
+    # this import fails the per-frame data above is still on disk and
+    # the user can run aggregate_act_stats.py separately.
+    print()
+    print("aggregating per-episode stats → meta/stats.json ...")
+    from my_policy.act.stats import aggregate_stats_to_json
+    aggregate_stats_to_json(out)
+    print(f"  wrote {out/'meta'/'stats.json'}")
+
     print(f"\nslim dataset ready at: {out}")
     print(f"  state dim     : {SLIM_STATE_DIM}")
     print(f"  state names   : {slim_state_names}")
