@@ -109,12 +109,32 @@ def _compensated_wrench(obs_msg) -> tuple[float, ...]:
     )
 
 
-def _build_state_26_np(obs_msg, port_pose_baselink: np.ndarray) -> np.ndarray:
+def _build_state_26_np(
+    obs_msg, port_pose_baselink: np.ndarray,
+    joint_pos_fallback: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Build the 26-dim port-local state.
+
+    If `obs_msg.joint_states.position` has fewer than 7 elements (some bags
+    don't carry joint_states inside /observations), `joint_pos_fallback`
+    is used. Caller is responsible for sourcing the fallback from the bag's
+    separate `/joint_states` topic. We do NOT silently zero-fill — that
+    would produce a plausible but garbage state.
+    """
     from my_policy.port_local.transforms import FrameInputs, transform_frame
     cs = obs_msg.controller_state
     tcp_pose = cs.tcp_pose
     tcp_vel = cs.tcp_velocity
     js = obs_msg.joint_states
+    js_pos = list(js.position[:7]) if len(js.position) >= 7 else None
+    if js_pos is None:
+        if joint_pos_fallback is None or joint_pos_fallback.shape != (7,):
+            raise RuntimeError(
+                f"/observations.joint_states.position has "
+                f"{len(js.position)} elements (<7) and no fallback from "
+                f"/joint_states topic is available yet. State would be "
+                f"19-dim instead of 26-dim.")
+        js_pos = list(joint_pos_fallback)
     tcp_pose_bl = np.array([
         tcp_pose.position.x, tcp_pose.position.y, tcp_pose.position.z,
         tcp_pose.orientation.x, tcp_pose.orientation.y,
@@ -136,7 +156,7 @@ def _build_state_26_np(obs_msg, port_pose_baselink: np.ndarray) -> np.ndarray:
     return np.array([
         *out.tcp_pose_portframe,
         *out.tcp_velocity_portframe,
-        *list(js.position[:7]),
+        *js_pos,
         *out.wrench_portframe,
     ], dtype=np.float32)
 
@@ -155,8 +175,9 @@ def _classify_phase(depth: float, wrench_fxyz: np.ndarray) -> int:
 def _build_state_38_np(
     obs_msg, port_pose_baselink: np.ndarray,
     port_type: str, prev_action_port: np.ndarray,
+    joint_pos_fallback: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    state_26 = _build_state_26_np(obs_msg, port_pose_baselink)
+    state_26 = _build_state_26_np(obs_msg, port_pose_baselink, joint_pos_fallback)
     entrance_offset = PORT_ENTRANCE_OFFSET_M[port_type]
     tcp_z_port = float(state_26[2])
     depth = -tcp_z_port - entrance_offset
@@ -333,7 +354,10 @@ def main() -> int:
     for t in needed:
         if t not in topic_types:
             raise SystemExit(f"bag missing required topic: {t}")
-    print(f"Bag topics confirmed.")
+    has_joint_states_topic = "/joint_states" in topic_types
+    print(f"Bag topics confirmed."
+          + ("" if has_joint_states_topic
+             else "  (no /joint_states topic; will rely on /observations.joint_states only)"))
 
     # --- pass 1: find port pose ------------------------------------------
     port_pose_bl = None
@@ -398,12 +422,24 @@ def main() -> int:
     last_cmd_z_port = float("nan")
     last_obs_msg = None
     last_a_port_for_conditioning = np.zeros(7, dtype=np.float32)
+    # Fallback joint positions sourced from /joint_states topic; used only
+    # when /observations.joint_states.position is empty (some bag flavors
+    # don't carry joint_states inside /observations).
+    last_joint_pos: Optional[np.ndarray] = None
+    joint_fallback_used = 0
     n_obs = 0
 
     print(f"\nReplaying observations through model…")
     torch_mod = mod["torch"]
+    first_diag = True
     while reader.has_next():
         topic, data, t_ns = reader.read_next()
+        if topic == "/joint_states":
+            js_msg = deserialize_message(data, msg_classes[topic])
+            if len(js_msg.position) >= 7:
+                last_joint_pos = np.array(js_msg.position[:7], dtype=np.float32)
+            continue
+
         if topic == "/aic_controller/pose_commands":
             cmd = deserialize_message(data, msg_classes[topic])
             try:
@@ -431,13 +467,36 @@ def main() -> int:
         obs_msg = deserialize_message(data, msg_classes[topic])
 
         # Build state (matching model's state_dim).
-        if state_dim == STATE_DIM_BASELINE:
-            state_np = _build_state_26_np(obs_msg, np.concatenate(port_pose_bl))
-        else:
-            state_np = _build_state_38_np(
-                obs_msg, np.concatenate(port_pose_bl),
-                args.port_type, last_a_port_for_conditioning,
-            )
+        if len(obs_msg.joint_states.position) < 7:
+            if last_joint_pos is None:
+                # No fallback yet (first obs may arrive before first
+                # /joint_states msg). Skip this tick.
+                continue
+            joint_fallback_used += 1
+        try:
+            if state_dim == STATE_DIM_BASELINE:
+                state_np = _build_state_26_np(
+                    obs_msg, np.concatenate(port_pose_bl),
+                    joint_pos_fallback=last_joint_pos,
+                )
+            else:
+                state_np = _build_state_38_np(
+                    obs_msg, np.concatenate(port_pose_bl),
+                    args.port_type, last_a_port_for_conditioning,
+                    joint_pos_fallback=last_joint_pos,
+                )
+        except RuntimeError as e:
+            print(f"  skip obs {n_obs} ({e})")
+            continue
+        if first_diag:
+            first_diag = False
+            print(f"  [first obs diag] joint_states.position len="
+                  f"{len(obs_msg.joint_states.position)}  "
+                  f"state_np.shape={state_np.shape}  expected={state_dim}")
+        if state_np.shape[0] != state_dim:
+            raise RuntimeError(
+                f"composed state has {state_np.shape[0]} dims but model "
+                f"expects {state_dim}")
         state_t = torch_mod.from_numpy(state_np).unsqueeze(0).cuda()
 
         # Build images.
@@ -503,6 +562,10 @@ def main() -> int:
         })
 
     print(f"  processed {len(rows)} observation ticks")
+    if joint_fallback_used:
+        print(f"  NOTE: /observations.joint_states was empty for "
+              f"{joint_fallback_used}/{len(rows)+joint_fallback_used} ticks; "
+              f"fell back to /joint_states topic for those.")
     if not rows:
         print("nothing to write")
         return 1
