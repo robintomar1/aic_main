@@ -684,6 +684,33 @@ class RunSmolVLA(Policy):
             "task": task_str,
         }
 
+    def _hard_reset_for_new_trial(self) -> None:
+        """Flush every piece of state that could leak between trials.
+
+        `SmolVLAPolicy.reset()` only re-initialises the ACTION deque — it
+        does NOT clear observation-history queues (irrelevant for SmolVLA
+        since they're not used), nor does it touch PyTorch's RNG state,
+        the CUDA cache, or any concurrent inference threads. Without
+        flushing those, trial 2 starts with:
+          * a different RNG state than trial 1 → flow-matching draws
+            different noise → different (potentially much worse) chunks
+            on undertrained models.
+          * possibly leftover CUDA memory fragments.
+        Call this at the top of every _insert_cable_*.
+        """
+        # 1. Clear policy's internal action queue.
+        self.policy.reset()
+        # 2. Re-seed PyTorch RNG to a deterministic per-trial state so the
+        #    flow-matching noise is reproducible. Without this, trial N
+        #    sees a different noise stream than trial 1, and on an
+        #    under-trained model that can dominate output behaviour.
+        torch.manual_seed(0)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(0)
+            # Flush stale GPU memory so allocator doesn't fragment over
+            # many trials. Cheap; sub-millisecond.
+            torch.cuda.empty_cache()
+
     def insert_cable(
         self,
         task: Task,
@@ -716,8 +743,9 @@ class RunSmolVLA(Policy):
             send_feedback("aborted: port pose unavailable")
             return False
 
-        # Step 2: per-trial reset of the action queue.
-        self.policy.reset()
+        # Step 2: hard reset — action queue + RNG + CUDA cache, not just
+        # policy.reset() which leaves RNG state leaked from prior trial.
+        self._hard_reset_for_new_trial()
 
         # Step 3: 20 Hz loop.
         start_t = self.time_now()
@@ -815,8 +843,8 @@ class RunSmolVLA(Policy):
             send_feedback("aborted: port pose unavailable")
             return False
 
-        # Step 2: per-trial reset.
-        self.policy.reset()
+        # Step 2: hard reset — action queue + RNG + CUDA cache.
+        self._hard_reset_for_new_trial()
 
         # Shared state — protected by queue_lock for thread safety.
         local_queue: list[torch.Tensor] = []
@@ -986,13 +1014,29 @@ class RunSmolVLA(Policy):
                 ticks += 1
                 self.sleep_for(self.loop_period_s)
         finally:
+            # CRITICAL: do not return until the producer thread has fully
+            # exited. If we proceed while it's still alive, it will keep
+            # calling self.policy.predict_action_chunk() in the background
+            # — and the NEXT trial's producer will race with it on the
+            # same policy object, corrupting state and producing the
+            # "first trial fine, subsequent trials broken" pattern.
+            #
+            # Worst case: producer is mid-inference when stop_evt fires
+            # (~1-2 s under Gazebo contention) PLUS an autograd backward
+            # for RTC inpainting (~0.5 s extra). Use a generous timeout
+            # and warn + force-block if exceeded.
             stop_evt.set()
-            producer_thread.join(timeout=2.0)
+            join_timeout_s = 10.0
+            producer_thread.join(timeout=join_timeout_s)
             if producer_thread.is_alive():
-                self.get_logger().warn(
-                    "SKIP_CHUNK producer thread did not exit within 2 s; "
-                    "continuing trial cleanup anyway"
+                self.get_logger().error(
+                    f"SKIP_CHUNK producer thread STILL ALIVE after "
+                    f"{join_timeout_s}s — this will corrupt the next "
+                    f"trial. Blocking until it exits."
                 )
+                # Block indefinitely; the producer's outer-loop check on
+                # stop_evt will catch it once the current inference exits.
+                producer_thread.join()
 
         self.get_logger().info(
             f"RunSmolVLA.insert_cable[SKIP_CHUNK]: exit after {ticks} ticks "
