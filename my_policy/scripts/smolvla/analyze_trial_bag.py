@@ -333,6 +333,24 @@ def main() -> int:
     port_pose_bl = None
     port_frame_name = args.port_frame
     print(f"\nScanning /tf and /tf_static for port frame…")
+    # Auto-detection must mirror what RunSmolVLA picks up at inference:
+    #   `task_board/<module>/<port_name>_link`  (NOT `_link_entrance`,
+    #   which is a child frame offset by the entrance distance — using it
+    #   shifts port-local tcp_z by ~15-46 mm and the model sees the wrong
+    #   frame).
+    # Heuristic: child must START WITH task_board/, END WITH _link, and
+    # NOT contain `_link_entrance` or `_link_plug_anchor`.
+    def _is_target_port_link(child: str) -> bool:
+        if not child.startswith("task_board/"):
+            return False
+        if not child.endswith("_link"):
+            return False
+        # Defensive: reject any suffixed link variants.
+        for suffix in ("_link_entrance", "_link_plug_anchor"):
+            if suffix in child:
+                return False
+        return True
+
     while reader.has_next() and port_pose_bl is None:
         topic, data, t_ns = reader.read_next()
         if topic not in ("/tf", "/tf_static"):
@@ -344,7 +362,7 @@ def main() -> int:
                 if child != port_frame_name:
                     continue
             else:
-                if not (child.startswith("task_board/") and "_link" in child):
+                if not _is_target_port_link(child):
                     continue
             tr = tf.transform.translation; rot = tf.transform.rotation
             port_pose_bl = (
