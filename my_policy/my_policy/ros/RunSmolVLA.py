@@ -395,6 +395,18 @@ class RunSmolVLA(Policy):
     # rewritten). Values: "26" (baseline) or "38" (conditioned).
     STATE_MODE_ENV = "AIC_PL_SMOLVLA_STATE_MODE"
 
+    # Per-chunk RNG seed for flow-matching noise. Without this, every
+    # chunk inference advances the global RNG and consumes different
+    # noise samples — making trials non-reproducible and making offline
+    # replay unable to match live behaviour. Setting this to a non-empty
+    # integer seeds torch's RNG to the same value BEFORE every inference
+    # call, so identical (state, image) inputs produce identical chunks
+    # (in live AND in replay). Default 0 (always reset to seed 0 before
+    # each call). Set to empty string to disable per-chunk seeding (back
+    # to original non-deterministic behaviour).
+    PER_CHUNK_SEED_ENV = "AIC_PL_SMOLVLA_PER_CHUNK_SEED"
+    PER_CHUNK_SEED_DEFAULT = 0
+
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device(
@@ -490,6 +502,17 @@ class RunSmolVLA(Policy):
                 )
         self._uses_conditioning = self._state_dim == STATE_DIM_CONDITIONED
 
+        # Per-chunk seeding: parse the env var once. Empty string = disable
+        # (preserve legacy non-deterministic behaviour); any integer (incl.
+        # 0) = re-seed torch's RNG to that value BEFORE every inference.
+        per_chunk_seed_raw = os.environ.get(self.PER_CHUNK_SEED_ENV, "").strip()
+        if per_chunk_seed_raw == "":
+            self._per_chunk_seed: int | None = self.PER_CHUNK_SEED_DEFAULT
+        elif per_chunk_seed_raw.lower() in ("off", "none", "disable"):
+            self._per_chunk_seed = None
+        else:
+            self._per_chunk_seed = int(per_chunk_seed_raw)
+
         self.get_logger().info(
             f"RunSmolVLA loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
@@ -502,8 +525,29 @@ class RunSmolVLA(Policy):
             + f" state_dim={self._state_dim}"
             + (" (CONDITIONED: prev_action + depth + phase)"
                if self._uses_conditioning else " (baseline)")
-            + f" [source={self._state_mode_source}]"
+            + f" [source={self._state_mode_source}] "
+            + f"per_chunk_seed={self._per_chunk_seed}"
         )
+
+    def _seed_before_inference(self) -> None:
+        """Reset torch's RNG state to `self._per_chunk_seed` before every
+        policy inference, so flow-matching's noise sample is deterministic
+        given identical (state, image) inputs.
+
+        Without this, the global RNG advances on every chunk and any two
+        runs of the same trial (or live vs offline replay of the same
+        observation stream) produce different chunks. With under-trained
+        flow-matching, that noise sensitivity dominates the trial-to-trial
+        differences we've been observing.
+
+        Set AIC_PL_SMOLVLA_PER_CHUNK_SEED=off to disable and recover the
+        original stochastic behaviour.
+        """
+        if self._per_chunk_seed is None:
+            return
+        torch.manual_seed(self._per_chunk_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self._per_chunk_seed)
 
     # ------------------------------------------------------------------
     # Port-pose acquisition (mirrors RunPortLocalACT).
@@ -824,6 +868,12 @@ class RunSmolVLA(Policy):
                 prev_action_port=last_action_port,
             )
             obs = self.preprocessor(obs)
+            # Reset RNG before each select_action so flow-matching's
+            # noise is deterministic per (state, image). select_action
+            # only actually fires inference when the policy's internal
+            # action queue is empty (every n_action_steps ticks), so
+            # this seed call is a no-op on queue-pop ticks — harmless.
+            self._seed_before_inference()
             with torch.inference_mode():
                 action = self.policy.select_action(obs)
             action = self.postprocessor(action)
@@ -952,6 +1002,11 @@ class RunSmolVLA(Policy):
                     obs_wrench_mag = float(np.linalg.norm(obs_state_port[20:23]))
                     obs = self.preprocessor(obs)
                     t_inf_start = _time.perf_counter()
+                    # Reset RNG before each predict_action_chunk so the
+                    # flow-matching noise is deterministic per chunk.
+                    # (Without this, every chunk uses different noise and
+                    # trial outcomes are not reproducible.)
+                    self._seed_before_inference()
                     with torch.inference_mode():
                         actions = self.policy.predict_action_chunk(obs)
                     if torch.cuda.is_available():

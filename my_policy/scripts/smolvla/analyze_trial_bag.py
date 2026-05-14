@@ -246,6 +246,12 @@ def main() -> int:
     p.add_argument("--max-ticks", type=int, default=0,
                    help="Limit number of observation ticks to process "
                         "(0 = all). Useful for quick smoke test.")
+    p.add_argument("--per-chunk-seed", type=int, default=0,
+                   help="RNG seed reset before each predict_action_chunk "
+                        "call (default 0 — matches RunSmolVLA's "
+                        "AIC_PL_SMOLVLA_PER_CHUNK_SEED default). Set -1 "
+                        "to disable seeding and use whatever global RNG "
+                        "state happens to be active.")
     args = p.parse_args()
 
     output = args.output or (args.bag / "replay_summary.csv")
@@ -454,6 +460,14 @@ def main() -> int:
             "task": DEFAULT_TASK_STR[args.port_type],
         }
         obs = pre(raw_obs)
+        # Reset RNG before each chunk inference so flow-matching noise
+        # is deterministic per (state, image). Mirrors RunSmolVLA's
+        # _seed_before_inference; without it the replay's per-chunk
+        # outputs differ from the live trial purely due to noise drift.
+        if args.per_chunk_seed >= 0:
+            torch_mod.manual_seed(args.per_chunk_seed)
+            if torch_mod.cuda.is_available():
+                torch_mod.cuda.manual_seed_all(args.per_chunk_seed)
         with torch_mod.no_grad():
             actions = policy.predict_action_chunk(obs)
         az_raw = actions[0, :, 2].cpu().numpy()
