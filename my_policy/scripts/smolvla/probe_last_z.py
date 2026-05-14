@@ -37,7 +37,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-import cv2
 import draccus
 import numpy as np
 import torch
@@ -152,83 +151,82 @@ def discover_episodes_by_port_type(dataset_root: Path) -> dict[str, list[int]]:
     return dict(out)
 
 
-def build_video_index(dataset_root: Path) -> dict[tuple[str, int], Path]:
-    """Walk the dataset's videos/ tree once and return a
-    {(camera, episode_idx): path} map. Handles arbitrary nested layouts
-    and episode-filename conventions by matching on path components.
+def build_episode_index(dataset_root: Path) -> dict[int, dict]:
+    """Returns {episode_idx: {'from_index': int, 'length': int}} by reading
+    the per-episode meta parquet. Used to translate (ep, local_frame) into
+    the LeRobotDataset's global frame index.
 
-    Camera detection: the path contains one of {left_camera, center_camera,
-    right_camera}. Episode detection: filename matches episode_<NNNN>.mp4
-    (with or without zero-padding).
+    lerobot v3.0 stores episodes concatenated in chunked .mp4 files;
+    LeRobotDataset[i] handles the decoding correctly so we use it instead
+    of trying to parse the chunked-video layout ourselves.
     """
-    import re
-    videos = dataset_root / "videos"
-    if not videos.is_dir():
-        raise SystemExit(f"--dataset-root has no videos/ subdir: {videos}")
-    cameras = ("left_camera", "center_camera", "right_camera")
-    ep_re = re.compile(r"episode_0*(\d+)\.mp4$")
-
-    # videos may itself be a symlink — follow it.
-    videos_resolved = videos.resolve()
-
-    index: dict[tuple[str, int], Path] = {}
-    for p in videos_resolved.rglob("*.mp4"):
-        path_str = str(p)
-        # Identify the camera by looking for one of the names in the path.
-        matched_camera = None
-        for c in cameras:
-            if c in path_str:
-                matched_camera = c
-                break
-        if matched_camera is None:
-            continue
-        m = ep_re.search(p.name)
-        if not m:
-            continue
-        ep_idx = int(m.group(1))
-        index[(matched_camera, ep_idx)] = p
-    if not index:
-        raise SystemExit(
-            f"no camera-episode mp4 files found under {videos_resolved}; "
-            f"checked for {cameras} and episode_<N>.mp4 naming."
-        )
-    return index
-
-
-def find_camera_video(
-    video_index: dict[tuple[str, int], Path],
-    camera: str, episode_idx: int,
-) -> Path:
-    key = (camera, episode_idx)
-    if key not in video_index:
-        raise FileNotFoundError(
-            f"no video indexed for camera={camera} ep={episode_idx}")
-    return video_index[key]
-
-
-def load_image_chw(video_path: Path, frame_idx: int) -> torch.Tensor:
-    cap = cv2.VideoCapture(str(video_path))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        raise RuntimeError(f"failed to read frame {frame_idx} from {video_path}")
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame = cv2.resize(frame, (288, 256), interpolation=cv2.INTER_AREA)  # (W, H)
-    t = torch.from_numpy(frame.copy()).permute(2, 0, 1).float() / 255.0
-    return t.unsqueeze(0).cuda()  # (1, 3, 256, 288)
-
-
-def episode_length(dataset_root: Path, episode_idx: int) -> int:
-    """Look up an episode's frame count from the per-episode meta parquet."""
     import pyarrow.parquet as pq
-    eps = pq.read_table(
-        str(dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet")
-    ).to_pylist()
+    eps_path = dataset_root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    if not eps_path.exists():
+        raise SystemExit(f"missing episode meta: {eps_path}")
+    eps = pq.read_table(str(eps_path)).to_pylist()
+    out: dict[int, dict] = {}
     for rec in eps:
-        if int(rec["episode_index"]) == episode_idx:
-            return int(rec["length"])
-    raise KeyError(f"episode {episode_idx} not in meta")
+        ep = int(rec["episode_index"])
+        # v3.0 uses dataset_from_index / dataset_to_index — see memory
+        # feedback_lerobot_dataset_api.md.
+        from_index = rec.get("dataset_from_index")
+        if from_index is None:
+            # Older builds may store it as a single-element list.
+            df = rec.get("dataset_from_index", [None])
+            from_index = df[0] if isinstance(df, (list, tuple)) and df else None
+        if from_index is None:
+            raise RuntimeError(
+                f"episode {ep} meta is missing dataset_from_index "
+                f"(keys present: {sorted(rec.keys())[:10]}…)"
+            )
+        out[ep] = {
+            "from_index": int(from_index),
+            "length": int(rec["length"]),
+        }
+    return out
+
+
+def make_dataset_loader(dataset_root: Path):
+    """Wrap LeRobotDataset so frames can be fetched by global index."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    return LeRobotDataset(
+        repo_id="local/probe",
+        root=str(dataset_root),
+        video_backend="pyav",
+    )
+
+
+def fetch_camera_frames(
+    ds, ep_info: dict[int, dict], episode_idx: int, frame_local: int,
+) -> dict[str, torch.Tensor]:
+    """Returns {observation.images.<cam>: (1,3,H,W) cuda tensor} for one
+    (episode, frame) sample by indexing the LeRobotDataset."""
+    info = ep_info.get(episode_idx)
+    if info is None:
+        raise KeyError(f"episode {episode_idx} not in episode index")
+    if frame_local < 0 or frame_local >= info["length"]:
+        raise IndexError(
+            f"frame {frame_local} out of [0,{info['length']}) for ep {episode_idx}")
+    global_idx = info["from_index"] + frame_local
+    item = ds[global_idx]
+    out = {}
+    for cam in ("left_camera", "center_camera", "right_camera"):
+        key = f"observation.images.{cam}"
+        if key not in item:
+            raise KeyError(f"dataset item missing {key}; keys={sorted(item.keys())[:10]}…")
+        t = item[key]  # already CHW float [0,1]
+        if t.ndim == 3:
+            t = t.unsqueeze(0)
+        out[key] = t.cuda()
+    return out
+
+
+def episode_length(ep_info: dict[int, dict], episode_idx: int) -> int:
+    info = ep_info.get(episode_idx)
+    if info is None:
+        raise KeyError(f"episode {episode_idx} not in episode index")
+    return info["length"]
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +383,8 @@ def probe_one_checkpoint(
     ckpt: Path,
     dataset_root: Path,
     eps_by_port: dict[str, list[int]],
-    video_index: dict[tuple[str, int], Path],
+    ep_info: dict[int, dict],
+    ds_loader,
     tcp_z_values: list[float],
     n_images: int,
     rng: random.Random,
@@ -422,24 +421,20 @@ def probe_one_checkpoint(
         for _ in range(n_images):
             ep = rng.choice(eps_pool)
             try:
-                ep_len = episode_length(dataset_root, ep)
-            except Exception:
-                ep_len = 200  # fallback
+                ep_len = episode_length(ep_info, ep)
+            except KeyError:
+                print(f"  WARN: ep={ep} not in episode index; skipping sample")
+                continue
             frame_idx = rng.randint(0, max(0, ep_len - 1))
-            imgs = {}
-            ok_count = 0
-            for cam in ("left_camera", "center_camera", "right_camera"):
-                try:
-                    vp = find_camera_video(video_index, cam, ep)
-                    imgs[f"observation.images.{cam}"] = load_image_chw(vp, frame_idx)
-                    ok_count += 1
-                except Exception as e:
-                    print(f"  WARN: failed to load {cam} ep={ep} frame={frame_idx}: {e}")
-                    imgs[f"observation.images.{cam}"] = torch.zeros(
-                        1, 3, 256, 288, device="cuda"
-                    )
-            if ok_count < 3:
-                print(f"  NOTE: ep={ep} frame={frame_idx} loaded {ok_count}/3 cameras")
+            try:
+                imgs = fetch_camera_frames(ds_loader, ep_info, ep, frame_idx)
+            except Exception as e:
+                print(f"  WARN: failed to fetch ep={ep} frame={frame_idx}: {e}")
+                imgs = {
+                    f"observation.images.{cam}":
+                        torch.zeros(1, 3, 256, 288, device="cuda")
+                    for cam in ("left_camera", "center_camera", "right_camera")
+                }
             samples.append(imgs)
         image_samples[port_type] = samples
 
@@ -526,21 +521,20 @@ def main() -> int:
     for port, eps in eps_by_port.items():
         print(f"  {port}: {len(eps)} episodes")
 
-    print(f"\nbuilding video index from: {args.dataset_root / 'videos'}")
-    video_index = build_video_index(args.dataset_root)
-    cam_counts: dict[str, int] = {}
-    for (cam, _ep) in video_index:
-        cam_counts[cam] = cam_counts.get(cam, 0) + 1
-    print(f"  indexed {len(video_index)} (camera, episode) videos: {cam_counts}")
-    sample_keys = list(video_index)[:3]
-    if sample_keys:
-        print(f"  sample entries:")
-        for k in sample_keys:
-            print(f"    {k}: {video_index[k]}")
+    print(f"\nbuilding episode index from: {args.dataset_root / 'meta' / 'episodes'}")
+    ep_info = build_episode_index(args.dataset_root)
+    print(f"  indexed {len(ep_info)} episodes")
+    sample_eps = list(ep_info.items())[:3]
+    for ep, info in sample_eps:
+        print(f"    ep={ep}: from_index={info['from_index']} length={info['length']}")
+
+    print(f"\nloading LeRobotDataset from: {args.dataset_root}")
+    ds_loader = make_dataset_loader(args.dataset_root)
+    print(f"  total frames in dataset: {len(ds_loader)}")
 
     for ckpt in ckpts:
         probe_one_checkpoint(
-            ckpt, args.dataset_root, eps_by_port, video_index,
+            ckpt, args.dataset_root, eps_by_port, ep_info, ds_loader,
             tcp_z_values=list(args.tcp_z_values),
             n_images=args.n_images,
             rng=random.Random(args.seed),  # same images per checkpoint
