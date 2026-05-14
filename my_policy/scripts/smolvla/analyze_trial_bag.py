@@ -176,16 +176,19 @@ def _build_state_38_np(
 # ---------------------------------------------------------------------------
 
 def _ros_image_to_chw_float(ros_img, torch_mod):
-    import cv2
+    """Decode a sensor_msgs/Image and downsample to (3, 256, 288) on cuda.
+
+    Avoids cv2 because libtiff in some pixi envs throws at decode time;
+    torch.nn.functional.interpolate(mode='area') is mathematically
+    equivalent to cv2.INTER_AREA for integer downscale factors (we go
+    1152x1024 -> 288x256, exact 4x downscale), so the model sees the
+    same pixel values as during live inference.
+    """
     img_np = np.frombuffer(ros_img.data, dtype=np.uint8).reshape(
         ros_img.height, ros_img.width, 3
     )
-    if IMAGE_SCALING != 1.0:
-        img_np = cv2.resize(
-            img_np, None, fx=IMAGE_SCALING, fy=IMAGE_SCALING,
-            interpolation=cv2.INTER_AREA,
-        )
-    return (
+    # HWC uint8 -> CHW float [0,1] on cuda, then resize via torch.
+    t = (
         torch_mod.from_numpy(img_np.copy())
         .permute(2, 0, 1)
         .float()
@@ -193,6 +196,13 @@ def _ros_image_to_chw_float(ros_img, torch_mod):
         .unsqueeze(0)
         .cuda()
     )
+    if IMAGE_SCALING != 1.0:
+        target_h = int(round(ros_img.height * IMAGE_SCALING))
+        target_w = int(round(ros_img.width * IMAGE_SCALING))
+        t = torch_mod.nn.functional.interpolate(
+            t, size=(target_h, target_w), mode="area",
+        )
+    return t
 
 
 # ---------------------------------------------------------------------------
