@@ -125,10 +125,15 @@ def main() -> int:
     p.add_argument("--no-trackio", action="store_true")
     p.add_argument("--trackio-project", default="aic_v9_smolvla")
     # SmolVLA-specific knobs.
-    p.add_argument("--chunk-size", type=int, default=50,
+    p.add_argument("--scheduler-decay-steps", type=int, default=None,
+                   help="Cosine decay period in steps. Defaults to --steps so the LR "
+                        "reaches its floor at the end of training, not partway through. "
+                        "SmolVLA's built-in default is 30k (independent of --steps), "
+                        "which caused the LR to die early in v9_smolvla_baselink_v1.")
+    p.add_argument("--chunk-size", type=int, default=200,
                    help="SmolVLA action lookahead horizon (frames @ 20 Hz). "
-                        "Default 50 = 2.5 s.")
-    p.add_argument("--n-action-steps", type=int, default=50,
+                        "Default 200 = 10 s.")
+    p.add_argument("--n-action-steps", type=int, default=200,
                    help="Steps to execute before re-querying. Default = chunk_size.")
     p.add_argument("--load-vlm-weights", type=lambda s: s.lower() == "true",
                    default=True,
@@ -184,6 +189,10 @@ def main() -> int:
                         "left/center/right cameras to camera1/2/3 (the "
                         "SO-100 convention used by lerobot/smolvla_base).")
     args = p.parse_args()
+
+    # Default scheduler_decay_steps to --steps so the cosine decay finishes
+    # at the end of training rather than partway through.
+    scheduler_decay_steps = args.scheduler_decay_steps or args.steps
 
     train_episodes_path = args.train_episodes_file \
         or (args.dataset_root / "train_episodes.json")
@@ -280,6 +289,7 @@ def main() -> int:
             f"--policy.n_obs_steps={args.n_obs_steps}",
             f"--policy.max_state_dim={max_state_dim}",
             f"--policy.max_action_dim={max_action_dim}",
+            f"--policy.scheduler_decay_steps={scheduler_decay_steps}",
         ]
     cli += [
         # Trainer.
@@ -345,6 +355,7 @@ def main() -> int:
     print(f"output_dir          : {output_dir}")
     print(f"train episodes      : {len(train_episodes)} (from {train_episodes_path.name})")
     print(f"steps               : {args.steps}")
+    print(f"scheduler_decay_steps: {scheduler_decay_steps}")
     print(f"batch_size          : {args.batch_size}  (num_workers={args.num_workers})")
     if not args.pretrained_policy_path:
         print(f"chunk_size          : {args.chunk_size}  (n_action_steps={args.n_action_steps})")

@@ -172,19 +172,58 @@ def encode_task_vector(
     return out
 
 
+_MODULE_HUMAN: dict[str, str] = {
+    "nic_card_mount_0": "first nic card slot",
+    "nic_card_mount_1": "second nic card slot",
+    "nic_card_mount_2": "third nic card slot",
+    "nic_card_mount_3": "fourth nic card slot",
+    "nic_card_mount_4": "fifth nic card slot",
+    "sc_port_0": "first sc rail",
+    "sc_port_1": "second sc rail",
+}
+
+_PORT_HUMAN: dict[str, str] = {
+    "sfp_port_0": "first sfp port",
+    "sfp_port_1": "second sfp port",
+    "sc_port_base": "sc connector",
+}
+
+_TASK_TEMPLATES: dict[str, str] = {
+    "sc": (
+        "push sc plug straight down into the small blue connector"
+        " at the {module} until force feedback confirms full insertion"
+    ),
+    "sfp": (
+        "insert sfp plug straight down into the {port} of the gray network"
+        " card with green pcb located at the {module}"
+    ),
+}
+
+
 def task_string_for(
     target_module_name: str,
     port_name: str,
     port_type: str,
 ) -> str:
-    """Build the natural-language `task` string LeRobotDataset v3.0 stores
-    per-episode. Stock ACT v0.5.1 doesn't consume this field — it's used by
-    language-conditioned policies (SmolVLA, pi0). Populated as belt-and-
-    suspenders metadata so a future escalation doesn't require re-recording.
+    """Build the natural-language task string for SmolVLA / pi0 conditioning.
 
-    Example: 'insert sfp plug into sfp_port_0 on nic_card_mount_3'.
+    Uses human-readable slot/port names and port-type-specific motion
+    descriptions so the VLM can visually ground the target (color, shape)
+    and understand the required motion character (push vs slide, force feedback).
+
+    Example outputs:
+      'slide sfp plug straight down into the gray sfp cage with two openings
+       on top and green pcb on the side, first sfp port in the second nic card slot'
+      'push sc plug straight down into the small blue sc connector
+       (sc connector) on first sc port, seat fully using force feedback to confirm insertion'
     """
-    return f"insert {port_type} plug into {port_name} on {target_module_name}"
+    module_h = _MODULE_HUMAN.get(target_module_name, target_module_name)
+    port_h = _PORT_HUMAN.get(port_name, port_name)
+    template = _TASK_TEMPLATES.get(port_type)
+    if template is None:
+        # Fallback for unknown port types — keeps old behaviour.
+        return f"insert {port_type} plug into {port_name} on {target_module_name}"
+    return template.format(port=port_h, module=module_h)
 
 
 def decode_task_vector(

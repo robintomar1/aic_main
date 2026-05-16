@@ -1,46 +1,37 @@
-"""v9-port-local-smolvla inference shim — loads a port-local-trained
-SmolVLA checkpoint and runs it as an aic_model Policy against the eval
-container.
+"""v9-baselink-smolvla inference shim — loads a base_link-frame SmolVLA
+checkpoint and runs it as an aic_model Policy against the eval container.
 
-Architectural cousin of `RunPortLocalACT.py`. Differences:
+No TF lookup or port-pose estimation required — all state is composed
+directly from controller_state in base_link / sensor frame, matching the
+dataset built by make_smolvla_baselink_dataset.py.
 
-  * **State is 26-dim (not 44).** SmolVLA gets task identity from the
-    natural-language `task` string per call, not a one-hot in state.
-    AND we drop the 6-dim `tcp_error` block — it is auto-regressive on
-    the policy's commanded targets (the controller's tracking residual)
-    and the phase-trigger probe identified state[15] = tcp_error.z as
-    the channel the previously-trained model used as a hover-vs-commit
-    shortcut. `make_smolvla_dataset.py` performs the same drop on the
-    training data; the shim composes the matching 26-dim layout here.
+26-dim observation.state layout:
+    tcp_pose(7)  ||  tcp_velocity(6)  ||  joint_positions(7)  ||  wrench(6)
 
-  * **Language input.** SmolVLAPolicy expects a `task` string per call.
-    The DataProcessorPipeline runs the SmolVLANewLineProcessor +
-    TokenizerProcessorStep over `complementary_data["task"]`; the
-    pipeline converter (`batch_to_transition`) lifts the `"task"` key
-    from the obs dict into complementary_data. So we put the task
-    string directly into the obs dict.
+7-dim action: absolute TCP pose in base_link (same as RunACT).
 
-  * **SmolVLAPolicy in place of ACTPolicy** — same `select_action`
-    contract, but the queue is filled by the flow-matching action head
-    rather than the ACT decoder.
+Z-advance filter: in base_link frame the robot descends toward the port
+(Z decreases). The filter blocks any action commanding upward retreat
+(action Z > current TCP Z + tolerance).
 
-Identical to RunPortLocalACT for everything else: port-pose acquisition
-(TF or localizer), per-tick port-local frame transform, action
-round-trip back to base_link, normalized quaternion, controller
-dispatch.
+Contact detection: force-only — |F_xyz| >= threshold triggers hold.
+Depth-gate removed (no port pose → no entrance depth).
 
 Run-time configuration (env vars):
-    AIC_PL_SMOLVLA_CHECKPOINT   Path to .../checkpoints/<step>/pretrained_model/. Required.
-    AIC_PL_SMOLVLA_TIMEOUT_S    Per-trial inference budget. Default 30 s.
-    AIC_PL_SMOLVLA_N_ACTION_STEPS  If set, overrides cfg.n_action_steps at
-                                inference (default = chunk_size = 50). Smaller
-                                values force the model to re-run on fresh
-                                observations more often. Set to 1 for fully
-                                closed-loop control IF SmolVLA inference
-                                latency stays under the 50 ms / tick budget.
-    AIC_PL_LOCALIZER_CHECKPOINT If set, replaces /tf port lookup.
-    AIC_PL_LOCALIZER_QUATS_JSON Optional sidecar quats for localizer.
-    AIC_PL_LOCALIZER_DEVICE     cuda or cpu (default cuda).
+    AIC_PL_SMOLVLA_CHECKPOINT         Path to .../checkpoints/<step>/pretrained_model/. Required.
+    AIC_PL_SMOLVLA_TIMEOUT_S          Per-trial budget. Default 30 s.
+    AIC_PL_SMOLVLA_N_ACTION_STEPS     Override cfg.n_action_steps.
+    AIC_PL_SMOLVLA_SKIP_N             Async skip-chunk mode (positive int, opt-in).
+    AIC_PL_SMOLVLA_PER_CHUNK_SEED     RNG seed before each inference call. Default 0.
+    AIC_PL_SMOLVLA_Z_ADVANCE_LIMIT_M  Z-filter tolerance in metres. Default 0.002.
+    AIC_PL_SMOLVLA_CONTACT_FORCE_N    Force threshold for contact hold. Default 5.0 N.
+    AIC_PL_SMOLVLA_Z_LOCK_ENABLE      Set to "1" to enable Z-lock termination. Default off.
+    AIC_PL_SMOLVLA_Z_LOCK_SFP_M       base_link Z floor for SFP insertion (metres). Required if Z_LOCK_ENABLE=1.
+                                       Empirical value from v9_smolvla_baselink dataset: 0.192
+                                       (insertion occurs at tcp_z ≈ 0.1902; threshold is 2 mm above).
+    AIC_PL_SMOLVLA_Z_LOCK_SC_M        base_link Z floor for SC insertion (metres). Required if Z_LOCK_ENABLE=1.
+                                       Empirical value from v9_smolvla_baselink dataset: 0.036
+                                       (insertion occurs at tcp_z ≈ 0.0350; threshold is 1 mm above).
 """
 from __future__ import annotations
 
@@ -56,11 +47,8 @@ import draccus
 import numpy as np
 import torch
 from geometry_msgs.msg import Point, Pose, Quaternion
-from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.time import Time
 from safetensors.torch import load_file
-from tf2_ros import TransformException
 
 from aic_model.policy import (
     GetObservationCallback,
@@ -80,79 +68,37 @@ from lerobot.processor.converters import (
 )
 
 from my_policy.act.labels import task_string_for
-from my_policy.port_local.transforms import (
-    FrameInputs,
-    transform_frame,
-    transform_pose_back_to_baselink,
-)
 
 
 # ---------------------------------------------------------------------------
-# Constants — must match make_smolvla_dataset.py output (32-dim state).
+# Constants
 # ---------------------------------------------------------------------------
 
 DEFAULT_TIMEOUT_S = 30.0
 LOOP_HZ = 20.0
 LOOP_PERIOD_S = 1.0 / LOOP_HZ
 
-# Z-advance filter: clamp action port-local z to no more than this many metres
-# above the current TCP port-local z.  In port-local frame, negative z = closer
-# to the port, so this prevents any action that would command the arm to retreat
-# upward past the current position.  2 mm allows for noise; set the env var
-# AIC_PL_SMOLVLA_Z_ADVANCE_LIMIT_M to override.
+# Z-advance filter: base_link Z decreases as robot descends toward port.
+# Blocks any action where action_z > tcp_z + this tolerance (upward retreat).
 Z_ADVANCE_LIMIT_DEFAULT_M = 0.002
 
-IMAGE_SCALING = 0.25  # 1152x1024 → 288x256 (matches dataset).
+# Contact detection — force magnitude threshold.
+CONTACT_FORCE_DEFAULT_N = 5.0
 
-TF_LOOKUP_TIMEOUT_S = 5.0
+IMAGE_SCALING = 0.25  # 1152×1024 native → 288×256 (matches dataset)
 
-STATE_DIM = 26  # baseline (no conditioning): 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench
-STATE_DIM_CONDITIONED = 38  # 26 baseline + 7 prev_action + 1 depth + 4 phase one-hot
-
-# Port entrance offsets along port-local +z (positive distance above port_link).
-# Must match the values in my_policy/scripts/smolvla/build_conditioned_dataset.py.
-PORT_ENTRANCE_OFFSET_M = {
-    "sc": 0.01564,   # 15.64 mm — SC port entrance above port_link in port-local frame
-    "sfp": 0.0458,   # 45.8 mm — SFP port entrance above port_link in port-local frame
-}
-
-# Phase classifier thresholds (mirror build_conditioned_dataset.py defaults).
-# Override at runtime via env vars if needed.
-PHASE_D_DESCEND_THRESH_M = 0.10        # depth ≤ this = DESCEND
-PHASE_D_INSERTED_THRESH_M = 0.005      # depth ≤ this = INSERTED (overrides DESCEND)
-PHASE_F_CONTACT_THRESH_N = 8.0         # |F| ≥ this = CONTACT (overrides depth-based)
-# (Note: anything with depth > PHASE_D_DESCEND_THRESH_M is APPROACH by default.)
-
-PHASE_APPROACH = 0
-PHASE_DESCEND = 1
-PHASE_CONTACT = 2
-PHASE_INSERTED = 3
-PHASE_DIM = 4  # one-hot length
+STATE_DIM = 26  # tcp_pose(7) + tcp_velocity(6) + joint_positions(7) + wrench(6)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-
 def _load_smolvla_policy(
     ckpt_dir: Path,
     device: torch.device,
     n_action_steps_override: int | None = None,
 ) -> SmolVLAPolicy:
-    """Load SmolVLA model + config from a checkpoint dir.
-
-    `n_action_steps_override`: if set, overrides cfg.n_action_steps before
-    instantiating the policy. SmolVLA's default n_action_steps == chunk_size
-    (50 at training time) means the policy runs open-loop on its predicted
-    chunk between forward passes — at 20 Hz that's 2.5 s of stale plan.
-    Setting this to a smaller value (e.g. 1) forces SmolVLA to re-run its
-    flow-matching denoiser on fresh observations more often, at proportional
-    cost in inference latency. 1 is fully closed-loop; useful for fine
-    alignment where the plan needs to react to small motions. Be aware
-    SmolVLA-500M forward passes are not free — verify p99 < 50 ms before
-    setting to 1, or stay at 5-10 for a middle ground.
-    """
     cfg_dict = json.loads((ckpt_dir / "config.json").read_text())
     cfg_dict.pop("type", None)
     if n_action_steps_override is not None:
@@ -181,7 +127,9 @@ def _ros_image_to_chw_float(ros_img, scaling: float) -> torch.Tensor:
     )
 
 
-def _compensated_wrench(obs_msg: Observation) -> tuple[float, float, float, float, float, float]:
+def _compensated_wrench(
+    obs_msg: Observation,
+) -> tuple[float, float, float, float, float, float]:
     raw = obs_msg.wrist_wrench.wrench
     tare = obs_msg.controller_state.fts_tare_offset.wrench
     return (
@@ -194,171 +142,41 @@ def _compensated_wrench(obs_msg: Observation) -> tuple[float, float, float, floa
     )
 
 
-def _build_state_26_np(
-    obs_msg: Observation,
-    port_pose_baselink: np.ndarray,
-) -> np.ndarray:
-    """Compose the 26-channel observation.state as numpy float32.
+def _build_state_26_baselink(obs_msg: Observation) -> torch.Tensor:
+    """26-dim state in base_link/sensor frame.
 
-    Layout: [tcp_pose 7 || tcp_velocity 6 || joint_pos 7 || wrench 6].
-    Used by both _build_state_26 (returns torch tensor) and
-    _build_state_38 (extends with conditioning channels).
+    Layout matches make_smolvla_baselink_dataset.py:
+      [0..6]   tcp_pose xyz + quat xyzw  (base_link)
+      [7..12]  tcp_velocity linear + angular  (base_link)
+      [13..19] joint_positions [0..6]
+      [20..25] wrench fx,fy,fz,tx,ty,tz  (tare-compensated, sensor frame)
     """
-    if port_pose_baselink.shape != (7,):
-        raise ValueError(f"port_pose must be shape (7,), got {port_pose_baselink.shape}")
-
     cs = obs_msg.controller_state
-    tcp_pose = cs.tcp_pose
-    tcp_vel = cs.tcp_velocity
+    tcp = cs.tcp_pose
+    vel = cs.tcp_velocity
     js = obs_msg.joint_states
-
-    tcp_pose_bl = np.array(
+    fx, fy, fz, tx, ty, tz = _compensated_wrench(obs_msg)
+    state = np.array(
         [
-            tcp_pose.position.x, tcp_pose.position.y, tcp_pose.position.z,
-            tcp_pose.orientation.x, tcp_pose.orientation.y,
-            tcp_pose.orientation.z, tcp_pose.orientation.w,
-        ],
-        dtype=np.float64,
-    )
-    tcp_vel_bl = np.array(
-        [
-            tcp_vel.linear.x, tcp_vel.linear.y, tcp_vel.linear.z,
-            tcp_vel.angular.x, tcp_vel.angular.y, tcp_vel.angular.z,
-        ],
-        dtype=np.float64,
-    )
-    wrench_sensor = np.array(_compensated_wrench(obs_msg), dtype=np.float64)
-
-    inp = FrameInputs(
-        tcp_pose_baselink=tcp_pose_bl,
-        tcp_velocity_baselink=tcp_vel_bl,
-        wrench_sensorframe=wrench_sensor,
-        action_baselink=tcp_pose_bl,
-        port_pose_baselink=port_pose_baselink,
-    )
-    out = transform_frame(inp)
-
-    return np.array(
-        [
-            *out.tcp_pose_portframe,         # 7  → [0..6]
-            *out.tcp_velocity_portframe,     # 6  → [7..12]
-            *js.position[:7],                # 7  → [13..19]
-            *out.wrench_portframe,           # 6  → [20..25]
+            tcp.position.x, tcp.position.y, tcp.position.z,
+            tcp.orientation.x, tcp.orientation.y,
+            tcp.orientation.z, tcp.orientation.w,
+            vel.linear.x, vel.linear.y, vel.linear.z,
+            vel.angular.x, vel.angular.y, vel.angular.z,
+            *js.position[:7],
+            fx, fy, fz, tx, ty, tz,
         ],
         dtype=np.float32,
     )
-
-
-def _classify_phase_depth(depth_above_entrance: float, wrench_fxyz: np.ndarray) -> int:
-    """Mirror of build_conditioned_dataset.classify_phase_depth, scalar version."""
-    fmag = float(np.linalg.norm(wrench_fxyz))
-    if fmag >= PHASE_F_CONTACT_THRESH_N:
-        return PHASE_CONTACT
-    if depth_above_entrance <= PHASE_D_INSERTED_THRESH_M:
-        return PHASE_INSERTED
-    if depth_above_entrance <= PHASE_D_DESCEND_THRESH_M:
-        return PHASE_DESCEND
-    return PHASE_APPROACH
-
-
-def _build_state_26(
-    obs_msg: Observation,
-    port_pose_baselink: np.ndarray,
-) -> torch.Tensor:
-    """Wrap _build_state_26_np with debug logging + torch tensor return."""
-    state = _build_state_26_np(obs_msg, port_pose_baselink)
     assert state.shape == (STATE_DIM,), f"state must be {STATE_DIM}-dim, got {state.shape}"
-    if not getattr(_build_state_26, "_call_count", 0):
-        _build_state_26._call_count = 0  # type: ignore[attr-defined]
-    _build_state_26._call_count += 1  # type: ignore[attr-defined]
-    if _build_state_26._call_count <= 3 or _build_state_26._call_count % 50 == 0:
-        s = state
-        print(f"[state_dbg #{_build_state_26._call_count}] "
-              f"tcp=({s[0]:+.3f},{s[1]:+.3f},{s[2]:+.3f})  "
-              f"vel=({s[7]*1000:+.1f},{s[8]*1000:+.1f},{s[9]*1000:+.1f})mm/s  "
-              f"|F|={np.linalg.norm(s[20:23]):.2f}N",
-              flush=True)
     return torch.from_numpy(state)
 
 
-def _build_state_38(
-    obs_msg: Observation,
-    port_pose_baselink: np.ndarray,
-    port_type: str,
-    prev_action_port: np.ndarray,
-) -> torch.Tensor:
-    """Compose the 38-channel observation.state matching the conditioned
-    dataset built by build_conditioned_dataset.py.
-
-    Layout:
-      [ 0..25] same as _build_state_26 (port-local TCP pose/vel, joints, wrench)
-      [26..32] prev_action[1] in port-local frame (7-dim TCP pose target)
-      [33    ] tcp.depth_above_entrance (m, positive = above entrance)
-      [34..37] phase one-hot (approach / descend / contact / inserted)
-
-    Args:
-        port_type: 'sc' or 'sfp'; selects the entrance offset.
-        prev_action_port: 7-dim port-local action commanded on the
-            previous tick. Zero vector at trial start.
-    """
-    if port_type not in PORT_ENTRANCE_OFFSET_M:
-        raise ValueError(f"unknown port_type {port_type!r}")
-    if prev_action_port.shape != (7,):
-        raise ValueError(
-            f"prev_action_port must be shape (7,), got {prev_action_port.shape}")
-
-    state_26 = _build_state_26_np(obs_msg, port_pose_baselink)
-    entrance_offset = PORT_ENTRANCE_OFFSET_M[port_type]
-    tcp_z_port = float(state_26[2])
-    depth = -tcp_z_port - entrance_offset
-    wrench_fxyz = state_26[20:23]
-    phase = _classify_phase_depth(depth, wrench_fxyz)
-    phase_onehot = np.zeros(PHASE_DIM, dtype=np.float32)
-    phase_onehot[phase] = 1.0
-
-    state = np.concatenate([
-        state_26,
-        prev_action_port.astype(np.float32),
-        np.array([depth], dtype=np.float32),
-        phase_onehot,
-    ]).astype(np.float32)
-    assert state.shape == (STATE_DIM_CONDITIONED,), \
-        f"state must be {STATE_DIM_CONDITIONED}-dim, got {state.shape}"
-
-    if not getattr(_build_state_38, "_call_count", 0):
-        _build_state_38._call_count = 0  # type: ignore[attr-defined]
-    _build_state_38._call_count += 1  # type: ignore[attr-defined]
-    if _build_state_38._call_count <= 3 or _build_state_38._call_count % 50 == 0:
-        phase_name = ("approach", "descend", "contact", "inserted")[phase]
-        print(f"[state_dbg #{_build_state_38._call_count}] "
-              f"tcp=({state_26[0]:+.3f},{state_26[1]:+.3f},{state_26[2]:+.3f}) "
-              f"depth={depth*1000:+.1f}mm "
-              f"|F|={np.linalg.norm(wrench_fxyz):.2f}N "
-              f"phase={phase_name} "
-              f"prev_a_z={prev_action_port[2]:+.3f}",
-              flush=True)
-    return torch.from_numpy(state)
-
-
-def _action_port_to_baselink_pose(
-    action_port_7d: np.ndarray, port_pose_baselink: np.ndarray,
-) -> Pose:
-    if action_port_7d.shape != (7,):
-        raise ValueError(f"expected (7,), got {action_port_7d.shape}")
-    # Flow-matching's iterative denoising can emit near-zero quats early in
-    # training or under OOD inputs; transform_pose_back_to_baselink → make_se3
-    # would raise. Sub the identity quat instead so the trial degrades to
-    # "hold orientation" rather than crashing mid-trial.
-    in_q = action_port_7d[3:7]
-    in_qnorm = float(np.linalg.norm(in_q))
-    if in_qnorm < 1e-6:
-        action_port_7d = action_port_7d.copy()
-        action_port_7d[3:7] = [0.0, 0.0, 0.0, 1.0]
-    recon = transform_pose_back_to_baselink(
-        action_port_7d.astype(np.float64),
-        port_pose_baselink.astype(np.float64),
-    )
-    px, py, pz, qx, qy, qz, qw = (float(v) for v in recon)
+def _action_baselink_to_pose(action7: np.ndarray) -> Pose:
+    """7-dim base_link action → geometry_msgs/Pose with normalized quaternion."""
+    if action7.shape != (7,):
+        raise ValueError(f"expected (7,), got {action7.shape}")
+    px, py, pz, qx, qy, qz, qw = (float(v) for v in action7)
     norm = (qx * qx + qy * qy + qz * qz + qw * qw) ** 0.5
     if norm < 1e-8:
         qx, qy, qz, qw = 0.0, 0.0, 0.0, 1.0
@@ -371,59 +189,28 @@ def _action_port_to_baselink_pose(
 
 
 # ---------------------------------------------------------------------------
-# RunSmolVLA — the Policy class loaded by aic_model.
+# RunSmolVLA — Policy class loaded by aic_model.
 # ---------------------------------------------------------------------------
-
 
 class RunSmolVLA(Policy):
     CHECKPOINT_ENV = "AIC_PL_SMOLVLA_CHECKPOINT"
     TIMEOUT_ENV = "AIC_PL_SMOLVLA_TIMEOUT_S"
-
-    # If set, overrides cfg.n_action_steps at inference. See
-    # `_load_smolvla_policy` docstring for tradeoffs.
     N_ACTION_STEPS_ENV = "AIC_PL_SMOLVLA_N_ACTION_STEPS"
-
-    LOCALIZER_CKPT_ENV = "AIC_PL_LOCALIZER_CHECKPOINT"
-    LOCALIZER_QUATS_ENV = "AIC_PL_LOCALIZER_QUATS_JSON"
-    LOCALIZER_DEVICE_ENV = "AIC_PL_LOCALIZER_DEVICE"
-
-    # SKIP_CHUNK opt-in. Setting to a positive integer N routes inference
-    # through predict_action_chunk and drops the FIRST N actions of every
-    # chunk before dispatch. Purely synchronous — no async producer, no
-    # smoothing, no other side effects. Sync path is untouched when this
-    # env var is unset or 0.
     SKIP_N_ENV = "AIC_PL_SMOLVLA_SKIP_N"
-
-    # Override state-composer dispatch. Useful when fine-tuning from a
-    # pretrained policy whose config.input_features still reflects the
-    # pretrained dataset's dim (e.g. lerobot/smolvla_base has shape=[6]
-    # baked in even after fine-tuning on our 26-dim data — lerobot pads
-    # internally to max_state_dim and the input_features field is never
-    # rewritten). Values: "26" (baseline) or "38" (conditioned).
-    STATE_MODE_ENV = "AIC_PL_SMOLVLA_STATE_MODE"
-
-    # Per-chunk RNG seed for flow-matching noise. Without this, every
-    # chunk inference advances the global RNG and consumes different
-    # noise samples — making trials non-reproducible and making offline
-    # replay unable to match live behaviour. Setting this to a non-empty
-    # integer seeds torch's RNG to the same value BEFORE every inference
-    # call, so identical (state, image) inputs produce identical chunks
-    # (in live AND in replay). Default 0 (always reset to seed 0 before
-    # each call). Set to empty string to disable per-chunk seeding (back
-    # to original non-deterministic behaviour).
     PER_CHUNK_SEED_ENV = "AIC_PL_SMOLVLA_PER_CHUNK_SEED"
     PER_CHUNK_SEED_DEFAULT = 0
-
-    # Z-advance filter: prevent the policy from commanding the arm to retreat
-    # above the current TCP port-local z.  Value is the tolerance in metres
-    # (positive = allow action z up to this much above current TCP z).
     Z_ADVANCE_LIMIT_ENV = "AIC_PL_SMOLVLA_Z_ADVANCE_LIMIT_M"
+    CONTACT_FORCE_ENV = "AIC_PL_SMOLVLA_CONTACT_FORCE_N"
+    # Z-lock: terminate as soon as tcp.z (base_link) drops below the known
+    # insertion floor for the port type. base_link Z decreases as robot descends,
+    # so "below" = tcp.z < threshold.
+    Z_LOCK_ENABLE_ENV = "AIC_PL_SMOLVLA_Z_LOCK_ENABLE"   # "1" to enable
+    Z_LOCK_SFP_ENV = "AIC_PL_SMOLVLA_Z_LOCK_SFP_M"       # base_link Z floor for SFP (metres)
+    Z_LOCK_SC_ENV = "AIC_PL_SMOLVLA_Z_LOCK_SC_M"         # base_link Z floor for SC  (metres)
 
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         ckpt_dir = os.environ.get(self.CHECKPOINT_ENV, "").strip()
         if not ckpt_dir:
@@ -438,9 +225,7 @@ class RunSmolVLA(Policy):
 
         n_steps_str = os.environ.get(self.N_ACTION_STEPS_ENV, "").strip()
         n_action_steps_override = int(n_steps_str) if n_steps_str else None
-        self.policy = _load_smolvla_policy(
-            ckpt_path, self.device, n_action_steps_override,
-        )
+        self.policy = _load_smolvla_policy(ckpt_path, self.device, n_action_steps_override)
 
         self.preprocessor = DataProcessorPipeline.from_pretrained(
             str(ckpt_path), config_filename="policy_preprocessor.json"
@@ -457,13 +242,10 @@ class RunSmolVLA(Policy):
         )
         self.loop_period_s = LOOP_PERIOD_S
 
-        # ---- SKIP_CHUNK config (opt-in) -------------------------------
         skip_n_str = os.environ.get(self.SKIP_N_ENV, "").strip()
         self.skip_n_chunks = int(skip_n_str) if skip_n_str else 0
         if self.skip_n_chunks < 0:
-            raise ValueError(
-                f"{self.SKIP_N_ENV}={self.skip_n_chunks} must be >= 0"
-            )
+            raise ValueError(f"{self.SKIP_N_ENV}={self.skip_n_chunks} must be >= 0")
         chunk_size_loaded = int(self.policy.config.chunk_size)
         if self.skip_n_chunks >= chunk_size_loaded:
             raise ValueError(
@@ -472,51 +254,6 @@ class RunSmolVLA(Policy):
             )
         self.skip_chunk_enabled = self.skip_n_chunks > 0
 
-        self._localizer = None
-
-        # Determine the state composer. Two supported modes:
-        #   26 — baseline (no conditioning)
-        #   38 — conditioned dataset (prev_action + depth + phase one-hot)
-        # Detection order:
-        #   1. AIC_PL_SMOLVLA_STATE_MODE env override ("26" or "38").
-        #   2. policy.config.input_features["observation.state"].shape if
-        #      it matches one of the supported values.
-        #   3. Fallback to 26 with a warning — handles fine-tuned-from-
-        #      pretrained checkpoints whose input_features still reflects
-        #      the pretrained policy's original dataset (e.g. SO-100 with
-        #      shape=[6]). The model's preprocessor will zero-pad our
-        #      26-dim state to whatever max_state_dim is internally.
-        state_mode_env = os.environ.get(self.STATE_MODE_ENV, "").strip()
-        if state_mode_env:
-            forced = int(state_mode_env)
-            if forced not in (STATE_DIM, STATE_DIM_CONDITIONED):
-                raise ValueError(
-                    f"{self.STATE_MODE_ENV}={forced} must be "
-                    f"{STATE_DIM} or {STATE_DIM_CONDITIONED}"
-                )
-            self._state_dim = forced
-            self._state_mode_source = "env"
-        else:
-            state_feat = self.policy.config.input_features.get("observation.state")
-            cfg_dim = int(state_feat.shape[0]) if state_feat is not None else None
-            if cfg_dim in (STATE_DIM, STATE_DIM_CONDITIONED):
-                self._state_dim = cfg_dim
-                self._state_mode_source = "config"
-            else:
-                self._state_dim = STATE_DIM
-                self._state_mode_source = "fallback"
-                self.get_logger().warn(
-                    f"policy.config.input_features state dim is "
-                    f"{cfg_dim!r}, neither {STATE_DIM} nor "
-                    f"{STATE_DIM_CONDITIONED}. Defaulting to "
-                    f"{STATE_DIM} (baseline). Override via "
-                    f"{self.STATE_MODE_ENV}=26|38 if this is wrong."
-                )
-        self._uses_conditioning = self._state_dim == STATE_DIM_CONDITIONED
-
-        # Per-chunk seeding: parse the env var once. Empty string = disable
-        # (preserve legacy non-deterministic behaviour); any integer (incl.
-        # 0) = re-seed torch's RNG to that value BEFORE every inference.
         per_chunk_seed_raw = os.environ.get(self.PER_CHUNK_SEED_ENV, "").strip()
         if per_chunk_seed_raw == "":
             self._per_chunk_seed: int | None = self.PER_CHUNK_SEED_DEFAULT
@@ -528,241 +265,62 @@ class RunSmolVLA(Policy):
         z_lim_str = os.environ.get(self.Z_ADVANCE_LIMIT_ENV, "").strip()
         self._z_advance_limit_m = float(z_lim_str) if z_lim_str else Z_ADVANCE_LIMIT_DEFAULT_M
 
+        cf_str = os.environ.get(self.CONTACT_FORCE_ENV, "").strip()
+        self._contact_force_n = float(cf_str) if cf_str else CONTACT_FORCE_DEFAULT_N
+
+        self._z_lock_enabled = os.environ.get(self.Z_LOCK_ENABLE_ENV, "0").strip() == "1"
+        sfp_z_str = os.environ.get(self.Z_LOCK_SFP_ENV, "").strip()
+        sc_z_str = os.environ.get(self.Z_LOCK_SC_ENV, "").strip()
+        self._z_lock_sfp_m: float | None = float(sfp_z_str) if sfp_z_str else None
+        self._z_lock_sc_m: float | None = float(sc_z_str) if sc_z_str else None
+        if self._z_lock_enabled and (self._z_lock_sfp_m is None or self._z_lock_sc_m is None):
+            raise ValueError(
+                f"{self.Z_LOCK_ENABLE_ENV}=1 requires both "
+                f"{self.Z_LOCK_SFP_ENV} and {self.Z_LOCK_SC_ENV} to be set."
+            )
+
         self.get_logger().info(
             f"RunSmolVLA loaded checkpoint={ckpt_path} "
             f"device={self.device} loop={LOOP_HZ}Hz "
             f"timeout={self.timeout_s}s "
             f"n_action_steps={self.policy.config.n_action_steps} "
             f"chunk_size={self.policy.config.chunk_size} "
-            f"localizer_mode={self._localizer_mode()} "
             f"skip_chunk_enabled={self.skip_chunk_enabled}"
             + (f" skip_n={self.skip_n_chunks}" if self.skip_chunk_enabled else "")
-            + f" state_dim={self._state_dim}"
-            + (" (CONDITIONED: prev_action + depth + phase)"
-               if self._uses_conditioning else " (baseline)")
-            + f" [source={self._state_mode_source}] "
-            + f"per_chunk_seed={self._per_chunk_seed} "
-            + f"z_advance_limit={self._z_advance_limit_m*1000:.1f}mm"
+            + f" per_chunk_seed={self._per_chunk_seed} "
+            + f"z_advance_limit={self._z_advance_limit_m * 1000:.1f}mm "
+            + f"contact_force>={self._contact_force_n:.1f}N"
+            + (
+                f" z_lock=ON sfp<{self._z_lock_sfp_m:.4f}m sc<{self._z_lock_sc_m:.4f}m"
+                if self._z_lock_enabled else " z_lock=OFF"
+            )
         )
 
+    def _z_lock_threshold(self, port_type: str) -> float | None:
+        """Returns the base_link Z floor for the given port_type, or None if disabled."""
+        if not self._z_lock_enabled:
+            return None
+        return self._z_lock_sfp_m if port_type == "sfp" else self._z_lock_sc_m
+
     def _seed_before_inference(self) -> None:
-        """Reset torch's RNG state to `self._per_chunk_seed` before every
-        policy inference, so flow-matching's noise sample is deterministic
-        given identical (state, image) inputs.
-
-        Without this, the global RNG advances on every chunk and any two
-        runs of the same trial (or live vs offline replay of the same
-        observation stream) produce different chunks. With under-trained
-        flow-matching, that noise sensitivity dominates the trial-to-trial
-        differences we've been observing.
-
-        Set AIC_PL_SMOLVLA_PER_CHUNK_SEED=off to disable and recover the
-        original stochastic behaviour.
-        """
         if self._per_chunk_seed is None:
             return
         torch.manual_seed(self._per_chunk_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self._per_chunk_seed)
 
-    # ------------------------------------------------------------------
-    # Port-pose acquisition (mirrors RunPortLocalACT).
-    # ------------------------------------------------------------------
-
-    def _localizer_mode(self) -> bool:
-        return bool(os.environ.get(self.LOCALIZER_CKPT_ENV, "").strip())
-
-    def _ensure_localizer_loaded(self) -> None:
-        if self._localizer is not None:
-            return
-        ckpt = os.environ[self.LOCALIZER_CKPT_ENV]
-        quats = os.environ.get(self.LOCALIZER_QUATS_ENV) or None
-        device = os.environ.get(self.LOCALIZER_DEVICE_ENV, "cuda")
-        from my_policy.localizer.inference import PortLocalizer  # noqa: WPS433
-        self._localizer = PortLocalizer(
-            checkpoint_path=Path(ckpt),
-            device=device,
-            quats_json_path=Path(quats) if quats else None,
-        )
-        self.get_logger().info(
-            f"PortLocalizer loaded ckpt={ckpt} device={device} "
-            f"cameras={self._localizer.cameras}"
-        )
-
-    @staticmethod
-    def _ros_image_to_np_uint8(img_msg) -> np.ndarray:
-        if img_msg.encoding != "rgb8":
-            raise ValueError(
-                f"expected rgb8 encoding for localizer input, got "
-                f"{img_msg.encoding!r}"
-            )
-        return np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
-            img_msg.height, img_msg.width, 3,
-        )
-
-    def _wait_for_tf(
-        self, target_frame: str, source_frame: str,
-        timeout_s: float = TF_LOOKUP_TIMEOUT_S,
-    ) -> bool:
-        start = self.time_now()
-        timeout = Duration(seconds=timeout_s)
-        attempt = 0
-        while (self.time_now() - start) < timeout:
-            try:
-                self._parent_node._tf_buffer.lookup_transform(
-                    target_frame, source_frame, Time(),
-                )
-                return True
-            except TransformException:
-                if attempt % 20 == 0:
-                    self.get_logger().info(
-                        f"Waiting for transform '{source_frame}' → "
-                        f"'{target_frame}' — running with "
-                        f"ground_truth:=true?"
-                    )
-                attempt += 1
-                self.sleep_for(0.1)
-        self.get_logger().error(
-            f"transform '{source_frame}' not available after {timeout_s}s"
-        )
-        return False
-
-    @staticmethod
-    def _compose_port_tf_frame(task: Task) -> str:
-        return f"task_board/{task.target_module_name}/{task.port_name}_link"
-
-    def _acquire_port_pose_baselink(
-        self, task: Task, get_observation: GetObservationCallback,
-    ) -> np.ndarray | None:
-        if self._localizer_mode():
-            return self._predict_port_pose_via_localizer(task, get_observation)
-        return self._lookup_port_pose_via_tf(task)
-
-    def _lookup_port_pose_via_tf(self, task: Task) -> np.ndarray | None:
-        port_frame = self._compose_port_tf_frame(task)
-        if not self._wait_for_tf("base_link", port_frame):
-            return None
-        try:
-            stamped = self._parent_node._tf_buffer.lookup_transform(
-                "base_link", port_frame, Time(),
-            )
-        except TransformException as ex:
-            self.get_logger().error(f"TF lookup failed: {ex}")
-            return None
-        t = stamped.transform.translation
-        q = stamped.transform.rotation
-        pose = np.array([t.x, t.y, t.z, q.x, q.y, q.z, q.w], dtype=np.float64)
-        self.get_logger().info(
-            f"port_pose (TF lookup, {port_frame}): "
-            f"xyz=({pose[0]:+.4f},{pose[1]:+.4f},{pose[2]:+.4f}) "
-            f"q=({pose[3]:+.3f},{pose[4]:+.3f},{pose[5]:+.3f},{pose[6]:+.3f})"
-        )
-        return pose
-
-    def _predict_port_pose_via_localizer(
-        self, task: Task, get_observation: GetObservationCallback,
-    ) -> np.ndarray | None:
-        self._ensure_localizer_loaded()
-        obs = get_observation()
-        if obs is None:
-            self.get_logger().error(
-                "no observation available for localizer prediction"
-            )
-            return None
-        images = {
-            "left_camera": self._ros_image_to_np_uint8(obs.left_image),
-            "center_camera": self._ros_image_to_np_uint8(obs.center_image),
-            "right_camera": self._ros_image_to_np_uint8(obs.right_image),
-        }
-        tcp = obs.controller_state.tcp_pose
-        tcp_vec = np.array(
-            [
-                tcp.position.x, tcp.position.y, tcp.position.z,
-                tcp.orientation.x, tcp.orientation.y,
-                tcp.orientation.z, tcp.orientation.w,
-            ],
-            dtype=np.float32,
-        )
-        try:
-            pred = self._localizer.predict_port_pose(
-                images=images,
-                tcp_pose=tcp_vec,
-                target_module_name=task.target_module_name,
-                port_name=task.port_name,
-                port_type=task.port_type,
-            )
-        except Exception as ex:
-            self.get_logger().error(f"PortLocalizer prediction failed: {ex}")
-            return None
-        pose = np.array(
-            [pred.x, pred.y, pred.z, pred.qx, pred.qy, pred.qz, pred.qw],
-            dtype=np.float64,
-        )
-        self.get_logger().info(
-            f"port_pose (localizer): "
-            f"xyz=({pose[0]:+.4f},{pose[1]:+.4f},{pose[2]:+.4f}) "
-            f"q=({pose[3]:+.3f},{pose[4]:+.3f},{pose[5]:+.3f},{pose[6]:+.3f})"
-        )
-        return pose
-
-    # ------------------------------------------------------------------
-    # The trial loop.
-    # ------------------------------------------------------------------
-
-    def _build_obs_dict(
-        self,
-        obs_msg: Observation,
-        task_str: str,
-        port_pose_baselink: np.ndarray,
-        *,
-        port_type: str | None = None,
-        prev_action_port: np.ndarray | None = None,
-    ) -> dict[str, Any]:
-        # `task` is lifted into complementary_data by the pipeline's
-        # batch_to_transition, then consumed by SmolVLANewLineProcessor +
-        # TokenizerProcessorStep.
-        if self._uses_conditioning:
-            if port_type is None:
-                raise RuntimeError(
-                    "conditioned model requires port_type at inference"
-                )
-            if prev_action_port is None:
-                prev_action_port = np.zeros(7, dtype=np.float32)
-            state_tensor = _build_state_38(
-                obs_msg, port_pose_baselink, port_type, prev_action_port,
-            )
-        else:
-            state_tensor = _build_state_26(obs_msg, port_pose_baselink)
-        return {
-            "observation.images.left_camera":
-                _ros_image_to_chw_float(obs_msg.left_image, IMAGE_SCALING),
-            "observation.images.center_camera":
-                _ros_image_to_chw_float(obs_msg.center_image, IMAGE_SCALING),
-            "observation.images.right_camera":
-                _ros_image_to_chw_float(obs_msg.right_image, IMAGE_SCALING),
-            "observation.state": state_tensor,
-            "task": task_str,
-        }
+    def _hard_reset_for_new_trial(self) -> None:
+        self.policy.reset()
+        torch.manual_seed(0)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(0)
+            torch.cuda.empty_cache()
 
     def _publish_hold_current_pose(
         self,
         get_observation: GetObservationCallback,
         move_robot: MoveRobotCallback,
     ) -> bool:
-        """Read the live TCP pose and publish it as a pose-command target.
-
-        Required at the start of every trial because the aic_controller
-        keeps tracking the LAST setpoint we published — once trial N ends
-        and the engine teleports the robot home between trials, the
-        controller still has trial N's last commanded pose as its target
-        and immediately drives back to it as soon as the new scene spawns.
-        Publishing the current observed TCP as a hold target overwrites
-        that stale setpoint with "where the robot currently is."
-
-        Returns True on success, False if no observation was available.
-        """
-        # Retry a few ticks because the eval container's observation stream
-        # may briefly be empty right after a scene reset.
         obs_msg = None
         for _ in range(10):
             obs_msg = get_observation()
@@ -771,9 +329,7 @@ class RunSmolVLA(Policy):
             self.sleep_for(0.02)
         if obs_msg is None:
             self.get_logger().warn(
-                "no observation available for hold-pose at trial start; "
-                "controller setpoint will remain whatever it was from the "
-                "previous trial until the model publishes its first action"
+                "no observation available for hold-pose at trial start"
             )
             return False
         cur = obs_msg.controller_state.tcp_pose
@@ -786,38 +342,26 @@ class RunSmolVLA(Policy):
         )
         self.set_pose_target(move_robot, hold, frame_id="base_link")
         self.get_logger().info(
-            f"hold-pose published at trial start: "
-            f"({hold.position.x:+.3f}, {hold.position.y:+.3f}, "
-            f"{hold.position.z:+.3f}) — overwrites stale setpoint"
+            f"hold-pose at trial start: "
+            f"({hold.position.x:+.3f},{hold.position.y:+.3f},{hold.position.z:+.3f})"
         )
         return True
 
-    def _hard_reset_for_new_trial(self) -> None:
-        """Flush every piece of state that could leak between trials.
-
-        `SmolVLAPolicy.reset()` only re-initialises the ACTION deque — it
-        does NOT clear observation-history queues (irrelevant for SmolVLA
-        since they're not used), nor does it touch PyTorch's RNG state,
-        the CUDA cache, or any concurrent inference threads. Without
-        flushing those, trial 2 starts with:
-          * a different RNG state than trial 1 → flow-matching draws
-            different noise → different (potentially much worse) chunks
-            on undertrained models.
-          * possibly leftover CUDA memory fragments.
-        Call this at the top of every _insert_cable_*.
-        """
-        # 1. Clear policy's internal action queue.
-        self.policy.reset()
-        # 2. Re-seed PyTorch RNG to a deterministic per-trial state so the
-        #    flow-matching noise is reproducible. Without this, trial N
-        #    sees a different noise stream than trial 1, and on an
-        #    under-trained model that can dominate output behaviour.
-        torch.manual_seed(0)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(0)
-            # Flush stale GPU memory so allocator doesn't fragment over
-            # many trials. Cheap; sub-millisecond.
-            torch.cuda.empty_cache()
+    def _build_obs_dict(
+        self,
+        obs_msg: Observation,
+        task_str: str,
+    ) -> dict[str, Any]:
+        return {
+            "observation.images.left_camera":
+                _ros_image_to_chw_float(obs_msg.left_image, IMAGE_SCALING),
+            "observation.images.center_camera":
+                _ros_image_to_chw_float(obs_msg.center_image, IMAGE_SCALING),
+            "observation.images.right_camera":
+                _ros_image_to_chw_float(obs_msg.right_image, IMAGE_SCALING),
+            "observation.state": _build_state_26_baselink(obs_msg),
+            "task": task_str,
+        }
 
     def insert_cable(
         self,
@@ -838,39 +382,20 @@ class RunSmolVLA(Policy):
                 task, get_observation, move_robot, send_feedback,
             )
 
-        # Build the language instruction once per trial — same convention as
-        # the dataset's per-episode `tasks` field (task_string_for).
         task_str = task_string_for(
             task.target_module_name, task.port_name, task.port_type,
         )
-        self.get_logger().info(f"task_str: {task_str!r}")
 
-        # Step 1: port pose (cached for the whole trial).
-        port_pose = self._acquire_port_pose_baselink(task, get_observation)
-        if port_pose is None:
-            send_feedback("aborted: port pose unavailable")
-            return False
-
-        # Step 2: hard reset — action queue + RNG + CUDA cache, not just
-        # policy.reset() which leaves RNG state leaked from prior trial.
         self._hard_reset_for_new_trial()
-
-        # Step 2b: overwrite the controller's stale setpoint from the
-        # previous trial with the current (post-scene-reset) TCP pose.
-        # Without this, the engine's home-teleport happens AFTER our
-        # trial ended; the controller still has our last command in its
-        # setpoint queue and drives the robot back to that pose as soon
-        # as the new scene spawns.
         self._publish_hold_current_pose(get_observation, move_robot)
 
-        # Step 3: 20 Hz loop.
+        z_lock_threshold = self._z_lock_threshold(task.port_type)
+
         start_t = self.time_now()
         ticks = 0
         none_obs_count = 0
-        z_filter_hits = 0
         LOG_EVERY_N = 10
-        last_action_port: np.ndarray | None = None
-        max_action_delta = 0.0
+        last_pose: Pose | None = None
 
         while (self.time_now() - start_t).nanoseconds / 1e9 < self.timeout_s:
             obs_msg = get_observation()
@@ -879,68 +404,39 @@ class RunSmolVLA(Policy):
                 self.sleep_for(self.loop_period_s)
                 continue
 
-            obs = self._build_obs_dict(
-                obs_msg, task_str, port_pose,
-                port_type=task.port_type,
-                prev_action_port=last_action_port,
-            )
-            # Capture port-local TCP z before the preprocessor normalises
-            # the state — used by the Z-advance filter below.
-            tcp_z_port = float(obs["observation.state"][2])
+            fx, fy, fz, _, _, _ = _compensated_wrench(obs_msg)
+            force_n = float(np.linalg.norm([fx, fy, fz]))
+
+            tcp = obs_msg.controller_state.tcp_pose.position
+            tcp_z = float(tcp.z)
+
+            # Z-lock: tcp descended past known insertion floor → done.
+            if z_lock_threshold is not None and tcp_z < z_lock_threshold:
+                self.get_logger().info(
+                    f"*** Z-LOCK triggered at tick={ticks} "
+                    f"tcp_z={tcp_z:+.4f} < threshold={z_lock_threshold:+.4f} "
+                    f"port_type={task.port_type} — exiting as inserted ***"
+                )
+                return True
+
+            obs = self._build_obs_dict(obs_msg, task_str)
             obs = self.preprocessor(obs)
-            # Reset RNG before each select_action so flow-matching's
-            # noise is deterministic per (state, image). select_action
-            # only actually fires inference when the policy's internal
-            # action queue is empty (every n_action_steps ticks), so
-            # this seed call is a no-op on queue-pop ticks — harmless.
             self._seed_before_inference()
             with torch.inference_mode():
                 action = self.policy.select_action(obs)
             action = self.postprocessor(action)
-            a_port = action[0].cpu().numpy()[:7]  # SmolVLA pads to max_action_dim=32
+            a = action[0].cpu().numpy()[:7]
 
-            # Z-advance filter: reject any action that would command the arm to
-            # retreat upward away from the port.  The port frame is ~180° around
-            # X relative to base_link, so port-local Z is INVERTED: less negative
-            # = closer to port (arm descending), more negative = farther from port
-            # (arm retreating up).  We block actions whose port-local z is more
-            # negative than the current TCP z by more than the tolerance.
-            if a_port[2] < tcp_z_port - self._z_advance_limit_m:
-                a_port = a_port.copy()
-                raw_z = a_port[2]
-                a_port[2] = tcp_z_port
-                z_filter_hits += 1
-                if z_filter_hits <= 5 or z_filter_hits % 50 == 0:
-                    self.get_logger().info(
-                        f"Z-filter hit #{z_filter_hits}: "
-                        f"blocked retreat a_port_z={raw_z:+.4f} → {tcp_z_port:+.4f} "
-                        f"(tcp_z={tcp_z_port:+.4f}, limit={self._z_advance_limit_m*1000:.1f}mm)"
-                    )
-
-            pose = _action_port_to_baselink_pose(
-                a_port.astype(np.float64), port_pose,
-            )
+            pose = _action_baselink_to_pose(a.astype(np.float64))
             self.set_pose_target(move_robot, pose, frame_id="base_link")
-
-            tcp = obs_msg.controller_state.tcp_pose.position
-            tcp_pred_dist = float(np.linalg.norm(
-                np.array([pose.position.x, pose.position.y, pose.position.z])
-                - np.array([tcp.x, tcp.y, tcp.z])
-            ))
-            if last_action_port is not None:
-                d = float(np.linalg.norm(a_port - last_action_port))
-                max_action_delta = max(max_action_delta, d)
-            last_action_port = a_port
+            last_pose = pose
 
             if ticks % LOG_EVERY_N == 0:
                 self.get_logger().info(
                     f"tick={ticks:4d} "
-                    f"tcp=({tcp.x:.3f},{tcp.y:.3f},{tcp.z:.3f}) "
-                    f"pred_bl=({pose.position.x:.3f},"
-                    f"{pose.position.y:.3f},{pose.position.z:.3f}) "
-                    f"||pred-tcp||={tcp_pred_dist*1000:.1f}mm "
-                    f"a_port[xyz]=({a_port[0]:.3f},{a_port[1]:.3f},{a_port[2]:.3f}) "
-                    f"max_a_step_Δ={max_action_delta:.4f}"
+                    f"tcp_bl=({tcp.x:+.3f},{tcp.y:+.3f},{tcp_z:+.3f}) "
+                    f"a_z={a[2]:+.4f} |F|={force_n:.2f}N"
+                    + (f" z_lock_thresh={z_lock_threshold:+.4f}" if z_lock_threshold is not None else "")
                 )
 
             send_feedback("running")
@@ -949,19 +445,12 @@ class RunSmolVLA(Policy):
 
         self.get_logger().info(
             f"RunSmolVLA.insert_cable: exit after {ticks} ticks "
-            f"(none_obs={none_obs_count}, max_a_step_Δ={max_action_delta:.4f}, "
-            f"z_filter_hits={z_filter_hits})"
+            f"(none_obs={none_obs_count})"
         )
         return True
 
     # ------------------------------------------------------------------
-    # SKIP_CHUNK loop. Async: a producer thread runs predict_action_chunk
-    # in the background and fills a buffer with the post-processed tail
-    # (after dropping the first `skip_n_chunks` actions of each chunk).
-    # The main 20 Hz consumer pops one per tick; when the buffer is empty
-    # (i.e. producer is currently running inference), it RE-DISPATCHES the
-    # last commanded action so the robot keeps receiving pose commands at
-    # 20 Hz instead of seeing a gap.
+    # SKIP_CHUNK loop — async producer/consumer.
     # ------------------------------------------------------------------
 
     def _insert_cable_skip_chunk(
@@ -977,39 +466,24 @@ class RunSmolVLA(Policy):
         skip_n = self.skip_n_chunks
         chunk_size = int(self.policy.config.chunk_size)
         self.get_logger().info(
-            f"task_str: {task_str!r}  [SKIP_CHUNK mode "
+            f"[SKIP_CHUNK] task={task_str!r} "
             f"skip_n={skip_n} chunk_size={chunk_size} "
-            f"dispatched_per_chunk={chunk_size - skip_n}]"
+            f"dispatched_per_chunk={chunk_size - skip_n}"
         )
 
-        # Step 1: port pose (cached for the whole trial).
-        port_pose = self._acquire_port_pose_baselink(task, get_observation)
-        if port_pose is None:
-            send_feedback("aborted: port pose unavailable")
-            return False
-
-        # Step 2: hard reset — action queue + RNG + CUDA cache.
         self._hard_reset_for_new_trial()
-
-        # Step 2b: overwrite controller's stale setpoint from previous trial.
         self._publish_hold_current_pose(get_observation, move_robot)
 
-        # Shared state — protected by queue_lock for thread safety.
         local_queue: list[torch.Tensor] = []
         queue_lock = threading.Lock()
         stop_evt = threading.Event()
+        contact_evt = threading.Event()
         err_box: list[BaseException] = []
         stats = {"chunks": 0, "inference_ticks": 0, "z_filter_hits": 0}
-        # Track the last consumer-dispatched port-local action so the
-        # producer can feed it as prev_action when the model expects
-        # conditioned state. Consumer updates under last_a_port_lock.
-        last_a_port_lock = threading.Lock()
-        last_a_port_shared: list[np.ndarray | None] = [None]
 
         def producer():
             try:
                 while not stop_evt.is_set():
-                    # Refill only when the consumer has drained the buffer.
                     with queue_lock:
                         need_refill = len(local_queue) == 0
                     if not need_refill:
@@ -1022,53 +496,45 @@ class RunSmolVLA(Policy):
                         if stop_evt.wait(0.01):
                             return
                         continue
-                    with last_a_port_lock:
-                        prev_a = last_a_port_shared[0]
-                    if prev_a is not None:
-                        prev_a = prev_a.copy()
-                    obs = self._build_obs_dict(
-                        obs_msg, task_str, port_pose,
-                        port_type=task.port_type,
-                        prev_action_port=prev_a,
-                    )
-                    # Diagnostic: log the TCP-z we're feeding to inference,
-                    # so we can compare against the first commanded z of the
-                    # resulting chunk. If obs.tcp_z is low but a_port[2] of
-                    # the first dispatched action is high, the model is
-                    # ignoring current TCP (not a stale-obs bug).
-                    obs_state_port = obs["observation.state"].detach().cpu().numpy().reshape(-1)
-                    obs_tcp_port_z = float(obs_state_port[2])
-                    obs_wrench_mag = float(np.linalg.norm(obs_state_port[20:23]))
+
+                    obs = self._build_obs_dict(obs_msg, task_str)
+                    obs_state = obs["observation.state"].detach().cpu().numpy().reshape(-1)
+                    obs_tcp_z_bl = float(obs_state[2])
+                    obs_force_mag = float(np.linalg.norm(obs_state[20:23]))
+
+                    # Contact detection.
+                    if not contact_evt.is_set() and obs_force_mag >= self._contact_force_n:
+                        contact_evt.set()
+                        stop_evt.set()
+                        self.get_logger().info(
+                            f"*** [SKIP_CHUNK] CONTACT DETECTED "
+                            f"|F|={obs_force_mag:.2f}N "
+                            f"tcp_z_bl={obs_tcp_z_bl:+.4f} ***"
+                        )
+                        return
+
                     obs = self.preprocessor(obs)
-                    t_inf_start = _time.perf_counter()
-                    # Reset RNG before each predict_action_chunk so the
-                    # flow-matching noise is deterministic per chunk.
-                    # (Without this, every chunk uses different noise and
-                    # trial outcomes are not reproducible.)
+                    t0 = _time.perf_counter()
                     self._seed_before_inference()
                     with torch.inference_mode():
                         actions = self.policy.predict_action_chunk(obs)
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    inf_ms = (_time.perf_counter() - t_inf_start) * 1000.0
-                    # actions: (1, chunk_size, action_dim_padded)
+                    inf_ms = (_time.perf_counter() - t0) * 1000.0
+
                     chunk = actions.squeeze(0)
-                    # Drop the first skip_n; post-process each remaining step.
                     new_actions: list[torch.Tensor] = []
                     for t in range(skip_n, chunk_size):
-                        a_post = self.postprocessor(chunk[t : t + 1])
+                        a_post = self.postprocessor(chunk[t: t + 1])
                         new_actions.append(a_post[0].detach().cpu())
 
-                    # Z-advance filter: clamp each action's port-local z to not
-                    # be more negative than obs_tcp_port_z - limit.  Port-local Z
-                    # is inverted vs base_link Z (port frame is ~180° around X),
-                    # so more negative = farther from port = arm going up.
+                    # Z-advance filter.
                     chunk_z_hits = 0
                     for i in range(len(new_actions)):
                         a_np = new_actions[i].numpy()
-                        if a_np[2] < obs_tcp_port_z - self._z_advance_limit_m:
+                        if a_np[2] > obs_tcp_z_bl + self._z_advance_limit_m:
                             a_np = a_np.copy()
-                            a_np[2] = obs_tcp_port_z
+                            a_np[2] = obs_tcp_z_bl
                             new_actions[i] = torch.from_numpy(a_np)
                             chunk_z_hits += 1
                     stats["z_filter_hits"] += chunk_z_hits
@@ -1076,43 +542,16 @@ class RunSmolVLA(Policy):
                     with queue_lock:
                         local_queue.extend(new_actions)
                     stats["chunks"] += 1
-                    # Full-chunk diagnostic: dump every action's port-frame
-                    # z so we can see the shape of the model's chunk plan.
-                    # Includes the dropped prefix too, so we can compare
-                    # "what we threw away" vs "what we'll dispatch."
-                    chunk_np = chunk.detach().cpu().numpy()  # (chunk_size, A_padded)
-                    z_pre = chunk_np[:skip_n, 2] if skip_n > 0 else np.array([])
-                    z_post = chunk_np[skip_n:, 2]
-                    first_a_port_z = float(new_actions[0].numpy()[2]) if new_actions else float("nan")
+                    first_z = float(new_actions[0].numpy()[2]) if new_actions else float("nan")
                     self.get_logger().info(
-                        f"[SKIP_CHUNK] chunk {stats['chunks']} "
-                        f"inf={inf_ms:.1f}ms dropped={skip_n} "
-                        f"buffered={len(new_actions)} "
-                        f"obs_tcp_z={obs_tcp_port_z:+.3f} "
-                        f"|F|_obs={obs_wrench_mag:.2f}N "
-                        f"first_a_z={first_a_port_z:+.3f} "
-                        f"Δ(a-obs)={first_a_port_z - obs_tcp_port_z:+.3f} "
-                        f"z_filtered={chunk_z_hits}/{len(new_actions)}"
+                        f"[SKIP_CHUNK] chunk={stats['chunks']} "
+                        f"inf={inf_ms:.1f}ms "
+                        f"obs_tcp_z={obs_tcp_z_bl:+.4f} "
+                        f"|F|={obs_force_mag:.2f}N "
+                        f"first_a_z={first_z:+.4f} "
+                        f"z_filt={chunk_z_hits}/{len(new_actions)} "
+                        f"buf={len(new_actions)}"
                     )
-                    # Z-trajectory sampled every 10 ticks; spans the FULL
-                    # chunk (raw, before skip) so we can spot internal cycles.
-                    z_sample = chunk_np[::10, 2]
-                    sample_str = " ".join(f"{z:+.3f}" for z in z_sample)
-                    self.get_logger().info(
-                        f"[SKIP_CHUNK] chunk {stats['chunks']} "
-                        f"raw_a_z (every 10 ticks, full chunk): {sample_str}"
-                    )
-                    # Per-segment stats: pre-skip and post-skip ranges.
-                    if skip_n > 0:
-                        self.get_logger().info(
-                            f"[SKIP_CHUNK] chunk {stats['chunks']} "
-                            f"pre-skip z[min/max/Δ]="
-                            f"{z_pre.min():+.3f}/{z_pre.max():+.3f}/"
-                            f"{z_pre.max() - z_pre.min():+.3f} | "
-                            f"post-skip z[min/max/Δ]="
-                            f"{z_post.min():+.3f}/{z_post.max():+.3f}/"
-                            f"{z_post.max() - z_post.min():+.3f}"
-                        )
             except BaseException as exc:  # noqa: BLE001
                 err_box.append(exc)
 
@@ -1125,92 +564,76 @@ class RunSmolVLA(Policy):
         ticks = 0
         none_obs_count = 0
         LOG_EVERY_N = 20
-        last_a_port: np.ndarray | None = None
         last_pose: Pose | None = None
-        max_a_step_delta = 0.0
+        contact_tick_sc = -1
 
         try:
             while (self.time_now() - start_t).nanoseconds / 1e9 < self.timeout_s:
                 if err_box:
                     raise err_box[0]
 
+                if contact_evt.is_set():
+                    if contact_tick_sc < 0:
+                        contact_tick_sc = ticks
+                    if last_pose is not None:
+                        self.set_pose_target(move_robot, last_pose, frame_id="base_link")
+                    if ticks % LOG_EVERY_N == 0:
+                        self.get_logger().info(
+                            f"[SKIP_CHUNK] tick={ticks:4d} "
+                            f"[HOLDING — contact since tick {contact_tick_sc}]"
+                        )
+                    send_feedback("contact")
+                    ticks += 1
+                    self.sleep_for(self.loop_period_s)
+                    continue
+
                 with queue_lock:
                     action = local_queue.pop(0) if local_queue else None
 
                 if action is not None:
-                    # Fresh action from the producer.
-                    a_port = action.numpy()[:7]
-                    pose = _action_port_to_baselink_pose(
-                        a_port.astype(np.float64), port_pose,
-                    )
+                    a = action.numpy()[:7]
+                    pose = _action_baselink_to_pose(a.astype(np.float64))
                     self.set_pose_target(move_robot, pose, frame_id="base_link")
-                    if last_a_port is not None:
-                        d = float(np.linalg.norm(a_port - last_a_port))
-                        max_a_step_delta = max(max_a_step_delta, d)
-                    last_a_port = a_port
                     last_pose = pose
-                    # Publish for the producer thread's prev_action conditioning.
-                    with last_a_port_lock:
-                        last_a_port_shared[0] = a_port
                     if ticks % LOG_EVERY_N == 0:
                         with queue_lock:
                             qlen = len(local_queue)
                         self.get_logger().info(
-                            f"[SKIP_CHUNK skip_n={skip_n}] tick={ticks:4d} "
+                            f"[SKIP_CHUNK] tick={ticks:4d} "
                             f"chunks={stats['chunks']} buf={qlen} "
-                            f"a_port[xyz]=({a_port[0]:+.3f},{a_port[1]:+.3f},"
-                            f"{a_port[2]:+.3f}) max_a_step_Δ={max_a_step_delta:.4f}"
+                            f"a_z={a[2]:+.4f}"
                         )
                 else:
-                    # Producer is currently running inference — re-dispatch
-                    # the last commanded pose so the controller keeps
-                    # receiving 20 Hz updates.
                     stats["inference_ticks"] += 1
                     if last_pose is not None:
                         self.set_pose_target(move_robot, last_pose, frame_id="base_link")
                         if stats["inference_ticks"] % 20 == 1:
                             self.get_logger().info(
                                 f"[SKIP_CHUNK] tick={ticks:4d} re-dispatching "
-                                f"last pose (inference in flight, "
+                                f"last pose (inf in flight, "
                                 f"total inf_ticks={stats['inference_ticks']})"
                             )
                     else:
-                        # Cold start — no last action yet; producer hasn't
-                        # delivered the first chunk. Just wait.
                         none_obs_count += 1
 
                 send_feedback("running")
                 ticks += 1
                 self.sleep_for(self.loop_period_s)
         finally:
-            # CRITICAL: do not return until the producer thread has fully
-            # exited. If we proceed while it's still alive, it will keep
-            # calling self.policy.predict_action_chunk() in the background
-            # — and the NEXT trial's producer will race with it on the
-            # same policy object, corrupting state and producing the
-            # "first trial fine, subsequent trials broken" pattern.
-            #
-            # Worst case: producer is mid-inference when stop_evt fires
-            # (~1-2 s under Gazebo contention) PLUS an autograd backward
-            # for RTC inpainting (~0.5 s extra). Use a generous timeout
-            # and warn + force-block if exceeded.
             stop_evt.set()
             join_timeout_s = 10.0
             producer_thread.join(timeout=join_timeout_s)
             if producer_thread.is_alive():
                 self.get_logger().error(
-                    f"SKIP_CHUNK producer thread STILL ALIVE after "
-                    f"{join_timeout_s}s — this will corrupt the next "
-                    f"trial. Blocking until it exits."
+                    f"SKIP_CHUNK producer STILL ALIVE after {join_timeout_s}s — "
+                    f"blocking until it exits."
                 )
-                # Block indefinitely; the producer's outer-loop check on
-                # stop_evt will catch it once the current inference exits.
                 producer_thread.join()
 
         self.get_logger().info(
             f"RunSmolVLA.insert_cable[SKIP_CHUNK]: exit after {ticks} ticks "
             f"(chunks={stats['chunks']}, inf_ticks={stats['inference_ticks']}, "
-            f"cold_ticks={none_obs_count}, max_a_step_Δ={max_a_step_delta:.4f}, "
-            f"z_filter_hits={stats['z_filter_hits']})"
+            f"cold_ticks={none_obs_count}, z_filter_hits={stats['z_filter_hits']}, "
+            f"contact={'tick ' + str(contact_tick_sc) if contact_evt.is_set() else 'none'})"
         )
         return True
