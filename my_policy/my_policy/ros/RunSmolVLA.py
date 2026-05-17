@@ -101,6 +101,39 @@ TF_LOOKUP_TIMEOUT_S = 5.0
 
 STATE_DIM = 26  # 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench (no tcp_error, no task one-hot)
 
+# Joint order the dataset was recorded in (alphabetical, as the sim's
+# /joint_states publisher emitted during collection). Inference-time
+# /joint_states arrives in URDF-kinematic order
+# (shoulder_pan, shoulder_lift, elbow, wrist_1..3, gripper), so we must
+# look up by name and reorder before composing the state vector.
+RECORDED_JOINT_ORDER = (
+    "elbow_joint",
+    "gripper",
+    "shoulder_lift_joint",
+    "shoulder_pan_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+)
+
+
+def _joint_positions_in_recorded_order(js) -> np.ndarray:
+    """Map sensor_msgs/JointState (any name order) → 7-vec in dataset order.
+
+    Raises if any expected joint is missing — silent fallback would feed the
+    policy a wrong-channel state and produce subtle action errors.
+    """
+    name_to_pos = dict(zip(js.name, js.position))
+    missing = [n for n in RECORDED_JOINT_ORDER if n not in name_to_pos]
+    if missing:
+        raise ValueError(
+            f"/joint_states missing expected joints {missing}; "
+            f"got names={list(js.name)}"
+        )
+    return np.array(
+        [name_to_pos[n] for n in RECORDED_JOINT_ORDER], dtype=np.float64,
+    )
+
 # RTC (Real-Time Chunking) defaults — see lerobot/policies/rtc.
 # RTC overlaps chunk generation with dispatch and inpaints the leading
 # steps of each new chunk against the executed tail of the previous chunk.
@@ -236,11 +269,12 @@ def _build_state_26(
     )
     out = transform_frame(inp)
 
+    joint_positions = _joint_positions_in_recorded_order(js)
     state = np.array(
         [
             *out.tcp_pose_portframe,         # 7  → [0..6]
             *out.tcp_velocity_portframe,     # 6  → [7..12]
-            *js.position[:7],                # 7  → [13..19]
+            *joint_positions,                # 7  → [13..19]
             *out.wrench_portframe,           # 6  → [20..25]
         ],
         dtype=np.float32,

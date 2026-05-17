@@ -57,6 +57,7 @@ _PACKAGE_PARENT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PACKAGE_PARENT))
 
 from my_policy.act.labels import task_string_for  # noqa: E402
+from my_policy.ros.RunSmolVLA import RECORDED_JOINT_ORDER as _RECORDED_JOINT_ORDER  # noqa: E402
 from my_policy.localizer.labels import match_episodes_to_trials  # noqa: E402
 from my_policy.port_local.dataset_io import (  # noqa: E402
     SRC_PORT_POSE_SLICE,
@@ -110,7 +111,13 @@ def _make_fake_observation(state_47: np.ndarray, raw_action: np.ndarray):
     return SimpleNamespace(
         controller_state=cs,
         joint_states=SimpleNamespace(
-            position=[float(state_47[19 + i]) for i in range(7)]
+            # The raw dataset's joint_positions.0..6 (indices 19..25 in the
+            # 47-channel pre-drop state) were written in alphabetical
+            # /joint_states order at recording time. The shim now requires
+            # `name` so it can reorder live URDF-order publishes — pair the
+            # names with positions one-for-one here.
+            name=list(_RECORDED_JOINT_ORDER),
+            position=[float(state_47[19 + i]) for i in range(7)],
         ),
         wrist_wrench=SimpleNamespace(
             wrench=SimpleNamespace(
