@@ -107,13 +107,13 @@ STATE_DIM = 26  # 7 tcp_pose + 6 tcp_velocity + 7 joints + 6 wrench (no tcp_erro
 # (shoulder_pan, shoulder_lift, elbow, wrist_1..3, gripper), so we must
 # look up by name and reorder before composing the state vector.
 RECORDED_JOINT_ORDER = (
-    "elbow_joint",
-    "gripper",
-    "shoulder_lift_joint",
-    "shoulder_pan_joint",
-    "wrist_1_joint",
-    "wrist_2_joint",
-    "wrist_3_joint",
+    "wrist_1_joint",        # dataset joint_positions.0
+    "gripper",              # dataset joint_positions.1
+    "shoulder_lift_joint",  # dataset joint_positions.2
+    "shoulder_pan_joint",   # dataset joint_positions.3
+    "elbow_joint",          # dataset joint_positions.4
+    "wrist_2_joint",        # dataset joint_positions.5
+    "wrist_3_joint",        # dataset joint_positions.6
 )
 
 
